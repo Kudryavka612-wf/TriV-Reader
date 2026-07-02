@@ -312,27 +312,83 @@ class _PageLabel(QLabel):
         color = self._view.color
         tool = self._view.tool
         rect = QRect(self._start, self._cur).normalized()
+        qt_dash = {"solid": Qt.PenStyle.SolidLine, "dashed": Qt.PenStyle.DashLine,
+                   "dotted": Qt.PenStyle.DotLine}.get(self._view.line_style, Qt.PenStyle.SolidLine)
         if tool in (TOOL_HIGHLIGHT, TOOL_UNDERLINE, TOOL_STRIKEOUT):
             fill = QColor(color)
-            fill.setAlpha(70)
+            fill.setAlpha(round(70 * self._view.opacity))
             painter.fillRect(rect, fill)
         elif tool == TOOL_PEN:
-            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width), Qt.PenStyle.SolidLine,
+            pen_color = QColor(color)
+            pen_color.setAlphaF(self._view.opacity)
+            painter.setPen(QPen(pen_color, max(1, self._view.pen_width), Qt.PenStyle.SolidLine,
                                 Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
             for i in range(1, len(self._stroke)):
                 painter.drawLine(self._stroke[i - 1], self._stroke[i])
         elif tool in (TOOL_LINE, TOOL_ARROW):
-            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width)))
+            painter.setOpacity(self._view.opacity)
+            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width), qt_dash))
             painter.drawLine(self._start, self._cur)
+            end_key = self._view.line_end
+            if end_key == "none" and tool == TOOL_ARROW:
+                end_key = "closed_arrow"
+            self._draw_arrowhead(painter, self._start, self._cur, end_key, color)
+            self._draw_arrowhead(painter, self._cur, self._start, self._view.line_start, color)
         elif tool == TOOL_CIRCLE:
-            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width)))
+            painter.setOpacity(self._view.opacity)
+            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width), qt_dash))
+            fill_rgb = self._view._fill_rgb()
+            if fill_rgb is not None:
+                painter.setBrush(self._view.fill_color)
             painter.drawEllipse(rect)
         elif tool == TOOL_REDACT:
             painter.fillRect(rect, QColor(0, 0, 0, 160))
-        else:  # rect / text の枠プレビュー
+        elif tool == TOOL_RECT:
+            painter.setOpacity(self._view.opacity)
+            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width), qt_dash))
+            fill_rgb = self._view._fill_rgb()
+            if fill_rgb is not None:
+                painter.setBrush(self._view.fill_color)
+            painter.drawRect(rect)
+        else:  # テキスト枠等のプレビュー
             painter.setPen(QPen(QColor(color), 1, Qt.PenStyle.DashLine))
             painter.drawRect(rect)
         painter.end()
+
+    @staticmethod
+    def _draw_arrowhead(painter: QPainter, tail: QPoint, tip: QPoint, style: str, color) -> None:
+        """tail→tip 方向の終端に、style に応じた簡易的な線端記号を描く（ドラッグ中プレビュー用）。"""
+        if style in ("none", None):
+            return
+        import math
+        dx, dy = tip.x() - tail.x(), tip.y() - tail.y()
+        length = math.hypot(dx, dy)
+        if length < 1:
+            return
+        ux, uy = dx / length, dy / length
+        size = 10
+        if style in ("open_arrow", "closed_arrow", "r_open_arrow", "r_closed_arrow"):
+            spread = 0.5
+            back = -ux if style.startswith("r_") else ux
+            backy = -uy if style.startswith("r_") else uy
+            p1 = QPoint(int(tip.x() - size * (back + spread * -uy)),
+                        int(tip.y() - size * (backy + spread * ux)))
+            p2 = QPoint(int(tip.x() - size * (back - spread * -uy)),
+                        int(tip.y() - size * (backy - spread * ux)))
+            poly = QPolygon([tip, p1, p2])
+            if "closed" in style:
+                painter.setBrush(QColor(color))
+            else:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolygon(poly)
+        elif style == "square":
+            painter.drawRect(tip.x() - size // 2, tip.y() - size // 2, size, size)
+        elif style == "circle":
+            painter.drawEllipse(tip, size // 2, size // 2)
+        elif style == "diamond":
+            pts = [QPoint(tip.x(), tip.y() - size // 2), QPoint(tip.x() + size // 2, tip.y()),
+                   QPoint(tip.x(), tip.y() + size // 2), QPoint(tip.x() - size // 2, tip.y())]
+            painter.drawPolygon(QPolygon(pts))
 
 
 class PageView(QScrollArea):
@@ -375,6 +431,12 @@ class PageView(QScrollArea):
         self.tool = TOOL_NONE
         self.color = QColor(255, 219, 46)   # 既定はハイライト用の黄
         self.pen_width = 2
+        self.line_style = "solid"    # solid / dashed / dotted
+        self.line_start = "none"     # 直線・矢印の始点スタイル（LINE_END_STYLES のキー）
+        self.line_end = "none"       # 直線・矢印の終点スタイル
+        self.fill_enabled = False    # 四角/円の塗りつぶし
+        self.fill_color = QColor(255, 255, 255)
+        self.opacity = 1.0           # 0.0-1.0
         self._sel_index = -1
         self._sel_xref = None
         # 検索
@@ -460,9 +522,40 @@ class PageView(QScrollArea):
     def set_pen_width(self, width: int) -> None:
         self.pen_width = max(1, int(width))
 
+    def set_line_style(self, style: str) -> None:
+        self.line_style = style
+
+    def set_line_start(self, key: str) -> None:
+        self.line_start = key
+
+    def set_line_end(self, key: str) -> None:
+        self.line_end = key
+
+    def set_fill_enabled(self, on: bool) -> None:
+        self.fill_enabled = bool(on)
+
+    def set_fill_color(self, qcolor: QColor) -> None:
+        self.fill_color = qcolor
+
+    def set_opacity(self, opacity: float) -> None:
+        self.opacity = max(0.05, min(1.0, float(opacity)))
+
     def _rgb(self) -> tuple:
         c = self.color
         return (c.redF(), c.greenF(), c.blueF())
+
+    def _fill_rgb(self):
+        if not self.fill_enabled:
+            return None
+        c = self.fill_color
+        return (c.redF(), c.greenF(), c.blueF())
+
+    def _dashes(self):
+        from .document import LINE_DASH_PATTERNS
+        pattern = LINE_DASH_PATTERNS.get(self.line_style)
+        if not pattern:
+            return None
+        return [max(1, round(v * self.pen_width / 2)) for v in pattern]
 
     def commit_drag(self, index: int, p0: QPoint, p1: QPoint, tool: str) -> None:
         if not self._doc:
@@ -474,8 +567,10 @@ class PageView(QScrollArea):
         if tool in (TOOL_LINE, TOOL_ARROW):
             if (p1 - p0).manhattanLength() < 3:
                 return
-            self._doc.add_line(index, a, b, color=self._rgb(),
-                               width=self.pen_width, arrow=(tool == TOOL_ARROW))
+            self._doc.add_line(index, a, b, color=self._rgb(), width=self.pen_width,
+                               arrow=(tool == TOOL_ARROW),
+                               start=self.line_start, end=self.line_end,
+                               dashes=self._dashes(), opacity=self.opacity)
             self._after_annot(index)
             return
         if tool == TOOL_UNDERLINE:
@@ -496,9 +591,13 @@ class PageView(QScrollArea):
             if not self._doc.add_text_highlight(index, a, b, color=self._rgb()):
                 self._doc.add_highlight(index, rect, color=self._rgb())
         elif tool == TOOL_RECT:
-            self._doc.add_rect(index, rect, color=self._rgb(), width=self.pen_width)
+            self._doc.add_rect(index, rect, color=self._rgb(), width=self.pen_width,
+                               fill=self._fill_rgb(), dashes=self._dashes(),
+                               opacity=self.opacity)
         elif tool == TOOL_CIRCLE:
-            self._doc.add_circle(index, rect, color=self._rgb(), width=self.pen_width)
+            self._doc.add_circle(index, rect, color=self._rgb(), width=self.pen_width,
+                                 fill=self._fill_rgb(), dashes=self._dashes(),
+                                 opacity=self.opacity)
         elif tool == TOOL_REDACT:
             self._doc.add_redaction(index, rect)
         elif tool == TOOL_CROP:
@@ -518,7 +617,8 @@ class PageView(QScrollArea):
             return
         stroke = [self._doc.label_to_pdf_point(index, p.x(), p.y(), self._zoom)
                   for p in points]
-        self._doc.add_ink(index, [stroke], color=self._rgb(), width=self.pen_width)
+        self._doc.add_ink(index, [stroke], color=self._rgb(), width=self.pen_width,
+                          opacity=self.opacity)
         self._after_annot(index)
 
     def commit_point(self, index: int, tool: str, p: QPoint) -> None:

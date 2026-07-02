@@ -144,6 +144,56 @@ def main() -> int:
     for f in (src, out):
         if os.path.exists(f):
             os.remove(f)
+
+    # --- 線種・矢印の線端・塗り・不透明度 ---------------------------
+    src4 = os.path.join(TMP, "_annot_style_src.pdf")
+    s = fitz.open(); s.new_page(width=595, height=842); s.save(src4); s.close()
+    doc5 = PdfDocument()
+    doc5.open(src4)
+
+    doc5.add_line(0, fitz.Point(50, 100), fitz.Point(250, 100), width=3,
+                  start="diamond", end="open_arrow", dashes=[6, 3], opacity=0.6)
+    doc5.add_circle(0, R(50, 150, 150, 250), fill=(0.0, 1.0, 0.0),
+                    dashes=[2, 2], opacity=0.8)
+    doc5.add_rect(0, R(200, 150, 300, 250), fill=(0.0, 0.0, 1.0))
+
+    page0 = doc5._doc.load_page(0)
+    xref_line = next(a.xref for a in page0.annots() if a.type[1] == "Line")
+    xref_circle = next(a.xref for a in page0.annots() if a.type[1] == "Circle")
+
+    # 移動・リサイズ・色変更で Line/Circle が消えない（線端/塗り/線種を保持）こと
+    nx_line = doc5.move_annot(0, xref_line, 5, 5)
+    assert nx_line is not None, "直線が move で消えた"
+    page1 = doc5._doc.load_page(0)
+    line_annot = doc5._find_on(page1, nx_line)
+    assert line_annot.line_ends == (3, 4), line_annot.line_ends  # diamond, open_arrow
+    assert line_annot.border.get("dashes") == (6, 3), line_annot.border
+    print("OK: 直線の移動後も線端(始点/終点)・線種を保持")
+
+    nx_circle = doc5.resize_annot(0, xref_circle, R(50, 150, 250, 400))
+    assert nx_circle is not None, "円が resize で消えた"
+    page2 = doc5._doc.load_page(0)
+    circle_annot = doc5._find_on(page2, nx_circle)
+    assert circle_annot.colors.get("fill"), "円のリサイズで塗りが消えた"
+    print("OK: 円のリサイズ後も塗りつぶしを保持")
+
+    nx_line2 = doc5.recolor_annot(0, nx_line, (0.0, 0.0, 0.0))
+    page3 = doc5._doc.load_page(0)
+    line_annot2 = doc5._find_on(page3, nx_line2)
+    assert line_annot2.line_ends == (3, 4), "直線の色変更で線端が消えた"
+    print("OK: 直線の色変更後も線端を保持")
+
+    out4 = os.path.join(TMP, "_annot_style_out.pdf")
+    doc5.save_as(out4)
+    doc5.close()
+    kinds = annot_names(out4)
+    assert kinds.count("Line") == 1 and kinds.count("Circle") == 1 and "Square" in kinds
+    print("OK: 線種/矢印/塗り/不透明度つき注釈が保存後も正しい種類で残る ->", kinds)
+
+    for f in (src4, out4):
+        if os.path.exists(f):
+            os.remove(f)
+
     print("ALL OK: 注釈")
     return 0
 

@@ -15,6 +15,28 @@ def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
+# 直線・矢印の線端スタイル（キー名 → PyMuPDF の PDF_ANNOT_LE_* 定数）。
+# UI側（main_window.py）はこのキー名でコンボボックスの選択肢を組み立てる。
+LINE_END_STYLES = {
+    "none": fitz.PDF_ANNOT_LE_NONE,
+    "open_arrow": fitz.PDF_ANNOT_LE_OPEN_ARROW,
+    "closed_arrow": fitz.PDF_ANNOT_LE_CLOSED_ARROW,
+    "r_open_arrow": fitz.PDF_ANNOT_LE_R_OPEN_ARROW,
+    "r_closed_arrow": fitz.PDF_ANNOT_LE_R_CLOSED_ARROW,
+    "square": fitz.PDF_ANNOT_LE_SQUARE,
+    "circle": fitz.PDF_ANNOT_LE_CIRCLE,
+    "diamond": fitz.PDF_ANNOT_LE_DIAMOND,
+    "butt": fitz.PDF_ANNOT_LE_BUTT,
+    "slash": fitz.PDF_ANNOT_LE_SLASH,
+}
+# 線種（キー名 → PDF の dash 配列）。None（実線）は set_border に渡さない。
+LINE_DASH_PATTERNS = {
+    "solid": None,
+    "dashed": [6, 3],
+    "dotted": [1, 3],
+}
+
+
 class PdfDocument:
     """PyMuPDF の Document を薄くラップしたクラス。"""
 
@@ -160,10 +182,12 @@ class PdfDocument:
         r.normalize()
         return r
 
-    def add_highlight(self, index, rect, color=(1.0, 0.86, 0.18)) -> None:
+    def add_highlight(self, index, rect, color=(1.0, 0.86, 0.18), opacity=1.0) -> None:
         page = self._doc.load_page(index)
         annot = page.add_highlight_annot(rect)
         annot.set_colors(stroke=color)
+        if opacity < 1.0:
+            annot.set_opacity(opacity)
         annot.update()
         self.modified = True
 
@@ -201,15 +225,18 @@ class PdfDocument:
         self.modified = True
         return True
 
-    def add_rect(self, index, rect, color=(0.9, 0.1, 0.1), width=1.5) -> None:
+    def add_rect(self, index, rect, color=(0.9, 0.1, 0.1), width=1.5,
+                 fill=None, dashes=None, opacity=1.0) -> None:
         page = self._doc.load_page(index)
         annot = page.add_rect_annot(rect)
-        annot.set_colors(stroke=color)
-        annot.set_border(width=width)
+        annot.set_colors(stroke=color, fill=fill)
+        annot.set_border(width=width, dashes=dashes)
+        if opacity < 1.0:
+            annot.set_opacity(opacity)
         annot.update()
         self.modified = True
 
-    def add_ink(self, index, strokes, color=(0.9, 0.1, 0.1), width=2.0) -> None:
+    def add_ink(self, index, strokes, color=(0.9, 0.1, 0.1), width=2.0, opacity=1.0) -> None:
         """strokes: PDF 座標の点列のリスト（[[Point or (x,y), ...], ...]）。"""
         page = self._doc.load_page(index)
         # add_ink_annot は「float ペアの列の列」を要求するため変換する
@@ -218,6 +245,8 @@ class PdfDocument:
         annot = page.add_ink_annot(norm)
         annot.set_colors(stroke=color)
         annot.set_border(width=width)
+        if opacity < 1.0:
+            annot.set_opacity(opacity)
         annot.update()
         self.modified = True
 
@@ -262,23 +291,37 @@ class PdfDocument:
         return True
 
     def add_line(self, index, p0, p1, color=(0.9, 0.1, 0.1), width=2.0,
-                 arrow=False) -> None:
-        """直線（arrow=True で終端を矢印に）。p0,p1 は PDF 座標。"""
+                 arrow=False, start="none", end="none", dashes=None,
+                 opacity=1.0) -> None:
+        """直線／矢印。p0,p1 は PDF 座標。
+
+        start・end は LINE_END_STYLES のキー名で線端の形状を指定する。
+        arrow=True は後方互換のショートカットで、end が未指定（"none"）の
+        場合に限り end="closed_arrow" として扱う。
+        """
         page = self._doc.load_page(index)
         annot = page.add_line_annot(p0, p1)
         annot.set_colors(stroke=color)
-        annot.set_border(width=width)
-        if arrow:
-            annot.set_line_ends(fitz.PDF_ANNOT_LE_NONE, fitz.PDF_ANNOT_LE_CLOSED_ARROW)
+        annot.set_border(width=width, dashes=dashes)
+        end_key = end if end != "none" else ("closed_arrow" if arrow else "none")
+        s = LINE_END_STYLES.get(start, fitz.PDF_ANNOT_LE_NONE)
+        e = LINE_END_STYLES.get(end_key, fitz.PDF_ANNOT_LE_NONE)
+        if s or e:
+            annot.set_line_ends(s, e)
+        if opacity < 1.0:
+            annot.set_opacity(opacity)
         annot.update()
         self.modified = True
 
-    def add_circle(self, index, rect, color=(0.9, 0.1, 0.1), width=2.0) -> None:
+    def add_circle(self, index, rect, color=(0.9, 0.1, 0.1), width=2.0,
+                    fill=None, dashes=None, opacity=1.0) -> None:
         """楕円/円の注釈。"""
         page = self._doc.load_page(index)
         annot = page.add_circle_annot(rect)
-        annot.set_colors(stroke=color)
-        annot.set_border(width=width)
+        annot.set_colors(stroke=color, fill=fill)
+        annot.set_border(width=width, dashes=dashes)
+        if opacity < 1.0:
+            annot.set_opacity(opacity)
         annot.update()
         self.modified = True
 
@@ -569,12 +612,17 @@ class PdfDocument:
 
     def _describe(self, annot) -> dict:
         colors = annot.colors or {}
+        border = annot.border or {}
         return {
             "kind": annot.type[1],
             "rect": fitz.Rect(annot.rect),
             "vertices": annot.vertices,
             "stroke": colors.get("stroke") or (0.0, 0.0, 0.0),
-            "width": (annot.border or {}).get("width", 1.5) or 1.5,
+            "fill": colors.get("fill"),
+            "width": border.get("width", 1.5) or 1.5,
+            "dashes": list(border["dashes"]) if border.get("dashes") else None,
+            "line_ends": annot.line_ends,
+            "opacity": annot.opacity,
             "content": annot.info.get("content", ""),
         }
 
@@ -584,13 +632,17 @@ class PdfDocument:
 
         page は呼び出し側が delete に使ったのと同一の Page オブジェクトを渡す
         （別インスタンスを混在させると PyMuPDF がクラッシュするため）。
-        new_rect 指定時はリサイズ（Ink は点列を旧矩形→新矩形へスケール）。
+        new_rect 指定時はリサイズ（Ink/Line/下線/取消線は点列を旧矩形→新矩形へ
+        スケール）。塗り色・線種・矢印の線端・不透明度は元の注釈から引き継ぐ。
         """
         kind = desc["kind"]
         stroke = color if color is not None else desc["stroke"]
         w = width if width is not None else desc["width"]
         content = text if text is not None else desc["content"]
         old = desc["rect"]
+        fill = desc.get("fill")
+        dashes = desc.get("dashes")
+        opacity = desc.get("opacity")
         if new_rect is not None:
             target = fitz.Rect(new_rect)
         else:
@@ -601,8 +653,12 @@ class PdfDocument:
             annot.set_colors(stroke=stroke)
         elif kind == "Square":
             annot = page.add_rect_annot(target)
-            annot.set_colors(stroke=stroke)
-            annot.set_border(width=w)
+            annot.set_colors(stroke=stroke, fill=fill)
+            annot.set_border(width=w, dashes=dashes)
+        elif kind == "Circle":
+            annot = page.add_circle_annot(target)
+            annot.set_colors(stroke=stroke, fill=fill)
+            annot.set_border(width=w, dashes=dashes)
         elif kind == "FreeText":
             annot = page.add_freetext_annot(target, content, fontsize=12, text_color=stroke)
         elif kind == "Text":
@@ -611,15 +667,33 @@ class PdfDocument:
             annot = page.add_ink_annot(self._map_ink(desc["vertices"], old, target))
             annot.set_colors(stroke=stroke)
             annot.set_border(width=w)
+        elif kind == "Line":
+            v = desc["vertices"] or [(old.x0, old.y0), (old.x1, old.y1)]
+            p0, p1 = self._map_ink([v], old, target)[0]
+            annot = page.add_line_annot(p0, p1)
+            annot.set_colors(stroke=stroke)
+            annot.set_border(width=w, dashes=dashes)
+            ends = desc.get("line_ends")
+            if ends:
+                annot.set_line_ends(ends[0], ends[1])
+        elif kind in ("Underline", "StrikeOut"):
+            quads = self._map_quads(desc["vertices"], old, target)
+            if not quads:
+                return None
+            annot = (page.add_underline_annot(quads) if kind == "Underline"
+                     else page.add_strikeout_annot(quads))
+            annot.set_colors(stroke=stroke)
         else:
             return None
+        if opacity is not None and 0 <= opacity < 1.0:
+            annot.set_opacity(opacity)
         annot.update()
         self.modified = True
         return annot.xref
 
     @staticmethod
     def _map_ink(vertices, old, target):
-        """Ink の点列を旧矩形 old から新矩形 target へ平行移動＋スケールする。"""
+        """点列を旧矩形 old から新矩形 target へ平行移動＋スケールする。"""
         ow = old.width or 1.0
         oh = old.height or 1.0
         sx = target.width / ow
@@ -631,6 +705,23 @@ class PdfDocument:
                 for p in stroke_pts
             ])
         return out
+
+    @staticmethod
+    def _map_quads(vertices, old, target):
+        """下線/取消線の quad 点列（4点区切り）を旧矩形→新矩形へ変換する。"""
+        ow = old.width or 1.0
+        oh = old.height or 1.0
+        sx = target.width / ow
+        sy = target.height / oh
+        pts = [(target.x0 + (p[0] - old.x0) * sx, target.y0 + (p[1] - old.y0) * sy)
+               for p in (vertices or [])]
+        quads = []
+        for i in range(0, len(pts) - 3, 4):
+            grp = pts[i:i + 4]
+            xs = [q[0] for q in grp]
+            ys = [q[1] for q in grp]
+            quads.append(fitz.Rect(min(xs), min(ys), max(xs), max(ys)).quad)
+        return quads
 
     def _edit_annot(self, index, xref, **kwargs):
         """同一 Page 上で注釈を捕捉→削除→再作成する共通処理。"""

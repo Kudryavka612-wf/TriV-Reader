@@ -346,7 +346,57 @@ class MainWindow(QMainWindow):
         self.width_spin = QSpinBox()
         self.width_spin.setRange(1, 20)
         self.width_spin.setValue(2)
+        self.width_spin.setToolTip("線の太さ（ペン・四角・円・直線・矢印）")
         tb.addWidget(self.width_spin)
+        tb.addSeparator()
+
+        # 線種（実線/破線/点線）
+        tb.addWidget(QLabel(" 線種 "))
+        self.line_style_combo = QComboBox()
+        for key, label in (("solid", "実線"), ("dashed", "破線"), ("dotted", "点線")):
+            self.line_style_combo.addItem(label, key)
+        self.line_style_combo.setToolTip("線種（四角・円・直線・矢印の枠線）")
+        tb.addWidget(self.line_style_combo)
+
+        # 矢印の始点/終点スタイル（直線・矢印ツール用）
+        line_end_items = [
+            ("none", "なし"), ("open_arrow", "矢印(開き)"), ("closed_arrow", "矢印(塗り)"),
+            ("r_open_arrow", "矢印(開き・逆)"), ("r_closed_arrow", "矢印(塗り・逆)"),
+            ("square", "四角"), ("circle", "丸"), ("diamond", "ひし形"),
+            ("butt", "バット"), ("slash", "スラッシュ"),
+        ]
+        tb.addWidget(QLabel(" 始点 "))
+        self.line_start_combo = QComboBox()
+        for key, label in line_end_items:
+            self.line_start_combo.addItem(label, key)
+        self.line_start_combo.setToolTip("直線・矢印の始点の形状")
+        tb.addWidget(self.line_start_combo)
+
+        tb.addWidget(QLabel(" 終点 "))
+        self.line_end_combo = QComboBox()
+        for key, label in line_end_items:
+            self.line_end_combo.addItem(label, key)
+        self.line_end_combo.setToolTip("直線・矢印の終点の形状")
+        tb.addWidget(self.line_end_combo)
+        tb.addSeparator()
+
+        # 塗りつぶし（四角/円用）
+        self.act_fill_enabled = QAction("塗り", self)
+        self.act_fill_enabled.setCheckable(True)
+        tb.addAction(self.act_fill_enabled)
+        self.act_fill_color = QAction("塗り色", self)
+        tb.addAction(self.act_fill_color)
+        self._fill_color = QColor(255, 255, 255)
+        self._refresh_fill_icon()
+
+        # 不透明度
+        tb.addWidget(QLabel(" 不透明度 "))
+        self.opacity_spin = QSpinBox()
+        self.opacity_spin.setRange(10, 100)
+        self.opacity_spin.setValue(100)
+        self.opacity_spin.setSuffix("%")
+        self.opacity_spin.setToolTip("新しく描く注釈の不透明度")
+        tb.addWidget(self.opacity_spin)
         tb.addSeparator()
 
         self.act_apply_redact = QAction("墨消しを適用", self)
@@ -564,6 +614,18 @@ class MainWindow(QMainWindow):
         g.add_action(self.act_color, big=True)
         g.add_label(" 太さ ")
         g.add_widget(self.width_spin)
+        g.add_label(" 線種 ")
+        g.add_widget(self.line_style_combo)
+        g = r.add_group(p, "矢印")
+        g.add_label(" 始点 ")
+        g.add_widget(self.line_start_combo)
+        g.add_label(" 終点 ")
+        g.add_widget(self.line_end_combo)
+        g = r.add_group(p, "塗り・不透明度")
+        g.add_action(self.act_fill_enabled, big=True)
+        g.add_action(self.act_fill_color, big=True)
+        g.add_label(" 不透明度 ")
+        g.add_widget(self.opacity_spin)
         g = r.add_group(p, "編集")
         g.add_stack([self.act_apply_redact, self.act_clear_annots, self.act_copy])
         r.end_page(p)
@@ -665,6 +727,8 @@ class MainWindow(QMainWindow):
             self.act_copy: "選択したテキストをコピー",
             self.act_dark: "ダークモードの切り替え",
             self.act_color: "注釈の色を選択",
+            self.act_fill_enabled: "四角/円を塗りつぶす（オフ＝枠線のみ）",
+            self.act_fill_color: "塗りつぶしの色を選択",
             self.act_apply_redact: "登録した墨消しを適用して内容を完全削除",
             self.act_ocr: "画像/スキャンPDFを文字認識して検索可能にする",
             self.act_deskew: "スキャンの傾きを自動補正",
@@ -741,6 +805,7 @@ class MainWindow(QMainWindow):
             self.act_edit_toc: "📇", self.act_check_update: "🔄",
             self.act_set_update_url: "⚙", self.act_about: "ℹ",
             self.act_toggle_pagedock: "▤",
+            self.act_fill_enabled: "🪣", self.act_fill_color: "🎨",
         }
         for act, g in glyphs.items():
             act.setIcon(self._glyph_icon(g))
@@ -800,6 +865,14 @@ class MainWindow(QMainWindow):
         pm.fill(self._annot_color)
         self.act_color.setIcon(pm)
 
+    def _refresh_fill_icon(self) -> None:
+        """塗り色ボタンに現在の塗り色のアイコンを表示する。"""
+        from PySide6.QtGui import QPixmap
+
+        pm = QPixmap(18, 18)
+        pm.fill(self._fill_color)
+        self.act_fill_color.setIcon(pm)
+
     def _connect(self) -> None:
         self.act_open.triggered.connect(self.open_file)
         self.act_prev.triggered.connect(lambda: self._goto(self.page_view.index - 1))
@@ -829,6 +902,22 @@ class MainWindow(QMainWindow):
         self.tool_group.triggered.connect(self._on_tool_changed)
         self.act_color.triggered.connect(self._pick_color)
         self.width_spin.valueChanged.connect(lambda v: self.page_view.set_pen_width(v))
+        self.line_style_combo.currentIndexChanged.connect(
+            lambda: self.page_view.set_line_style(self.line_style_combo.currentData())
+        )
+        self.line_start_combo.currentIndexChanged.connect(
+            lambda: self.page_view.set_line_start(self.line_start_combo.currentData())
+        )
+        self.line_end_combo.currentIndexChanged.connect(
+            lambda: self.page_view.set_line_end(self.line_end_combo.currentData())
+        )
+        self.act_fill_enabled.toggled.connect(
+            lambda on: self.page_view.set_fill_enabled(on)
+        )
+        self.act_fill_color.triggered.connect(self._pick_fill_color)
+        self.opacity_spin.valueChanged.connect(
+            lambda v: self.page_view.set_opacity(v / 100.0)
+        )
         self.act_clear_annots.triggered.connect(self._clear_annots)
         # しおり / 最適化 / PDF-A
         self.act_add_bookmark.triggered.connect(self._add_bookmark)
@@ -1183,12 +1272,24 @@ class MainWindow(QMainWindow):
     def _on_tool_changed(self, action) -> None:
         self.page_view.set_tool(action.data())
         tool = action.data()
+        # 直線/矢印ツールを選んだ時は終点スタイルを分かりやすい既定値にする
+        # （ユーザーがコンボボックスで手動変更した後は、その値を尊重する）
+        if tool == page_view.TOOL_ARROW:
+            self._set_combo_data(self.line_end_combo, "closed_arrow")
+        elif tool == page_view.TOOL_LINE:
+            self._set_combo_data(self.line_end_combo, "none")
         if tool == page_view.TOOL_NONE:
             self.statusBar().clearMessage()
         else:
             self.statusBar().showMessage(
                 f"注釈ツール: {action.text()}（ページ上でドラッグ/クリック）", 0
             )
+
+    @staticmethod
+    def _set_combo_data(combo: QComboBox, data) -> None:
+        i = combo.findData(data)
+        if i >= 0:
+            combo.setCurrentIndex(i)
 
     def _pick_color(self) -> None:
         col = QColorDialog.getColor(self._annot_color, self, "注釈の色")
@@ -1200,6 +1301,14 @@ class MainWindow(QMainWindow):
         # 注釈を選択中なら、その色を変更する
         if self.page_view.has_selection():
             self.page_view.recolor_selection(col)
+
+    def _pick_fill_color(self) -> None:
+        col = QColorDialog.getColor(self._fill_color, self, "塗りつぶしの色")
+        if not col.isValid():
+            return
+        self._fill_color = col
+        self.page_view.set_fill_color(col)
+        self._refresh_fill_icon()
 
     def _on_selection_changed(self, has: bool) -> None:
         if has:
