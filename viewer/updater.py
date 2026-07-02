@@ -149,10 +149,11 @@ del "%~f0"
         f.write(script)
 
     import subprocess
-    # 新しいコンソールでデタッチ起動（親終了後も生存）
+    # 新しいコンソールで起動（親終了後も生存する）。
+    # CREATE_NEW_CONSOLE と DETACHED_PROCESS は排他で、併用すると
+    # CreateProcess が WinError 87 (パラメーターが間違っています) になる。
     subprocess.Popen(
         ["cmd", "/c", helper],
-        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-        | getattr(subprocess, "DETACHED_PROCESS", 0),
+        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
         close_fds=True,
     )
