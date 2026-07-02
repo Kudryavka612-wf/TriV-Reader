@@ -71,6 +71,43 @@ def _parse_ranges(text: str, page_count: int) -> list[int]:
     return indices
 
 
+def _find_acrobat() -> str | None:
+    """Adobe Acrobat / Acrobat Reader の実行ファイルを探す（無ければ None）。
+
+    レジストリの App Paths（インストーラが登録する正規の場所）を優先し、
+    見つからなければ既定のインストール先を直接あたる。
+    """
+    import winreg
+
+    for exe in ("Acrobat.exe", "AcroRd32.exe"):
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                key = winreg.OpenKey(
+                    root,
+                    rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}",
+                )
+                path, _type = winreg.QueryValueEx(key, None)
+                winreg.CloseKey(key)
+                path = os.path.expandvars(str(path)).strip('"')
+                if path and os.path.exists(path):
+                    return path
+            except OSError:
+                continue
+
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    candidates = [
+        rf"{pf}\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
+        rf"{pf86}\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
+        rf"{pf}\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
+        rf"{pf86}\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
 class DocTab(QStackedWidget):
     """1 つの PDF を表すタブ。自前の文書・ビューワー・整理画面を持つ。"""
 
@@ -222,6 +259,8 @@ class MainWindow(QMainWindow):
         self.act_print = QAction("印刷", self)
         self.act_print.setShortcut(QKeySequence.StandardKey.Print)
         tb.addAction(self.act_print)
+        self.act_open_acrobat = QAction("Acrobatで開く", self)
+        tb.addAction(self.act_open_acrobat)
         tb.addSeparator()
 
         self.act_rotate_left = QAction("⟲ 左回転", self)
@@ -457,6 +496,7 @@ class MainWindow(QMainWindow):
         m_file.addAction(self.act_save_as)
         m_file.addSeparator()
         m_file.addAction(self.act_print)
+        m_file.addAction(self.act_open_acrobat)
         m_file.addSeparator()
         m_file.addAction(self.act_compress)
         m_file.addAction(self.act_export_pdfa)
@@ -560,6 +600,7 @@ class MainWindow(QMainWindow):
         # リボン用の短縮ラベル（長い action 名は iconText で短く表示。見切れ防止）
         short = {
             self.act_save: "保存", self.act_save_as: "別名保存",
+            self.act_open_acrobat: "Acrobat",
             self.act_copy: "コピー", self.act_clear_annots: "注釈を全消去",
             self.act_page_numbers: "ページ番号", self.act_toggle_pagedock: "ページ一覧",
             self.act_prev: "前へ", self.act_next: "次へ",
@@ -577,7 +618,8 @@ class MainWindow(QMainWindow):
         p = r.add_page("ホーム")
         g = r.add_group(p, "ファイル")
         g.add_action(self.act_open, big=True)
-        g.add_stack([self.act_save, self.act_save_as, self.act_print])
+        g.add_stack([self.act_save, self.act_save_as,
+                     self.act_print, self.act_open_acrobat])
         recent_btn = QToolButton()
         recent_btn.setText("最近 ▾")
         recent_btn.setAutoRaise(True)
@@ -729,6 +771,7 @@ class MainWindow(QMainWindow):
             self.act_color: "注釈の色を選択",
             self.act_fill_enabled: "四角/円を塗りつぶす（オフ＝枠線のみ）",
             self.act_fill_color: "塗りつぶしの色を選択",
+            self.act_open_acrobat: "このPDFを Adobe Acrobat で開く（表示がおかしい時などの予備手段）",
             self.act_apply_redact: "登録した墨消しを適用して内容を完全削除",
             self.act_ocr: "画像/スキャンPDFを文字認識して検索可能にする",
             self.act_deskew: "スキャンの傾きを自動補正",
@@ -806,6 +849,7 @@ class MainWindow(QMainWindow):
             self.act_set_update_url: "⚙", self.act_about: "ℹ",
             self.act_toggle_pagedock: "▤",
             self.act_fill_enabled: "🪣", self.act_fill_color: "🎨",
+            self.act_open_acrobat: "🅐",
         }
         for act, g in glyphs.items():
             act.setIcon(self._glyph_icon(g))
@@ -954,6 +998,7 @@ class MainWindow(QMainWindow):
         )
         self.zoom_combo.activated.connect(self._on_zoom_preset)
         self.act_print.triggered.connect(self.print_document)
+        self.act_open_acrobat.triggered.connect(self.open_in_acrobat)
         self.act_facing.toggled.connect(self._toggle_facing)
         self.act_batch.triggered.connect(self.batch_dialog)
         self.act_diff.triggered.connect(self.diff_dialog)
@@ -1875,6 +1920,63 @@ class MainWindow(QMainWindow):
                 painter.end()
         self.statusBar().showMessage("印刷ジョブを送信しました", 3000)
 
+    # --- 外部アプリで開く（Acrobat） -----------------------------------
+    def open_in_acrobat(self) -> None:
+        """表示中の PDF を Adobe Acrobat（無ければ既定アプリ選択）で開く。
+
+        このアプリはファイルをメモリに読み込んで表示している（ロックしない）
+        ため、同じファイルを他のアプリで同時に開ける。
+        """
+        if not self.doc.is_open:
+            return
+        path = self.doc.path
+        if not path or not os.path.exists(path):
+            QMessageBox.information(
+                self, "Acrobatで開く",
+                "このドキュメントはまだファイルとして保存されていません。\n"
+                "先に「名前を付けて保存」してから開いてください。",
+            )
+            return
+        # 未保存の変更は Acrobat 側には見えない（ディスク上の最終保存状態が開く）
+        if self.doc.modified:
+            ret = QMessageBox.question(
+                self, "Acrobatで開く",
+                "保存していない変更があります。\n"
+                "保存してから開きますか？（「いいえ」の場合、最後に保存した"
+                "状態が Acrobat で開きます）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+            )
+            if ret == QMessageBox.StandardButton.Cancel:
+                return
+            if ret == QMessageBox.StandardButton.Yes:
+                self.save()
+                if self.doc.modified:  # 保存がキャンセル/失敗した場合は中止
+                    return
+
+        import subprocess
+        exe = _find_acrobat()
+        if exe:
+            try:
+                subprocess.Popen([exe, path], close_fds=True)
+                self.statusBar().showMessage("Adobe Acrobat で開きました", 3000)
+                return
+            except OSError as exc:
+                QMessageBox.warning(
+                    self, "Acrobatで開く", f"Acrobat の起動に失敗しました:\n{exc}"
+                )
+                return
+        # Acrobat が見つからない → Windows の「プログラムから開く」で代替
+        ret = QMessageBox.question(
+            self, "Acrobatで開く",
+            "Adobe Acrobat が見つかりませんでした。\n"
+            "Windows の「プログラムから開く」ダイアログで開くアプリを選びますか？",
+        )
+        if ret == QMessageBox.StandardButton.Yes:
+            subprocess.Popen(
+                ["rundll32.exe", "shell32.dll,OpenAs_RunDLL", path], close_fds=True
+            )
+
     # --- 設定の永続化 / 最近のファイル / D&D --------------------------
     def _last_dir(self) -> str:
         return self.settings.value("last_dir", "", str)
@@ -2625,6 +2727,7 @@ class MainWindow(QMainWindow):
             self.act_export_text,
             self.act_export_html,
             self.act_print,
+            self.act_open_acrobat,
             self.act_facing,
             self.act_deskew,
             *self.tool_group.actions(),
