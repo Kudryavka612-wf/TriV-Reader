@@ -127,21 +127,34 @@ def apply_and_restart(zip_path: str) -> None:
     src_dir = _extract(zip_path)
     app_dir = storage.base_dir()
     exe_path = sys.executable
+    exe_name = os.path.basename(exe_path)
     pid = os.getpid()
     helper = os.path.join(tempfile.gettempdir(), "trivreader_update.cmd")
 
+    # 終了待ちは PID だけで判定すると、終了後に別プロセスへ同じ PID が
+    # 再利用された場合に「まだ起動中」と誤認し、永久に待ち続けてしまう。
+    # IMAGENAME も併せて確認し、万一に備え最大30秒で強制的に先へ進める。
+    #
     # robocopy /E: 上書きコピー（/MIR と違い既存のユーザーデータを消さない）
     # /XD: ユーザーデータフォルダ除外、 /XF: マーカー/設定の保持
+    # tasklist/find/robocopy/timeout はフルパス指定にする。開発機などで
+    # Git for Windows 等の Unix 版コマンド（find 等）が PATH 上で標準の
+    # System32 版より手前に来ていると、動作が変わって既定の判定が壊れるため。
+    sysdir = r"%SystemRoot%\System32"
     script = f"""@echo off
-chcp 65001 >nul
+setlocal enabledelayedexpansion
+{sysdir}\\chcp.com 65001 >nul
 echo 更新を適用しています。しばらくお待ちください...
+set _wait=0
 :waitloop
-tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul
-if not errorlevel 1 (
-  timeout /t 1 /nobreak >nul
-  goto waitloop
-)
-robocopy "{src_dir}" "{app_dir}" /E /NFL /NDL /NJH /NJS /NP /R:3 /W:1 /XD "TriVReader_data" /XF "portable.ini" "lite.ini" "TriVReader.ini" >nul
+{sysdir}\\tasklist.exe /FI "PID eq {pid}" /FI "IMAGENAME eq {exe_name}" 2>nul | {sysdir}\\find.exe /I "{exe_name}" >nul
+if errorlevel 1 goto docopy
+set /a _wait+=1
+if !_wait! GEQ 30 goto docopy
+{sysdir}\\timeout.exe /t 1 /nobreak >nul
+goto waitloop
+:docopy
+{sysdir}\\robocopy.exe "{src_dir}" "{app_dir}" /E /NFL /NDL /NJH /NJS /NP /R:3 /W:1 /XD "TriVReader_data" /XF "portable.ini" "lite.ini" "TriVReader.ini" >nul
 start "" "{exe_path}"
 del "%~f0"
 """
