@@ -261,6 +261,8 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_print)
         self.act_open_acrobat = QAction("Acrobatで開く", self)
         tb.addAction(self.act_open_acrobat)
+        self.act_set_default_pdf = QAction("既定のPDFアプリに設定", self)
+        tb.addAction(self.act_set_default_pdf)
         tb.addSeparator()
 
         self.act_rotate_left = QAction("⟲ 左回転", self)
@@ -497,6 +499,7 @@ class MainWindow(QMainWindow):
         m_file.addSeparator()
         m_file.addAction(self.act_print)
         m_file.addAction(self.act_open_acrobat)
+        m_file.addAction(self.act_set_default_pdf)
         m_file.addSeparator()
         m_file.addAction(self.act_compress)
         m_file.addAction(self.act_export_pdfa)
@@ -600,7 +603,7 @@ class MainWindow(QMainWindow):
         # リボン用の短縮ラベル（長い action 名は iconText で短く表示。見切れ防止）
         short = {
             self.act_save: "保存", self.act_save_as: "別名保存",
-            self.act_open_acrobat: "Acrobat",
+            self.act_open_acrobat: "Acrobat", self.act_set_default_pdf: "既定に設定",
             self.act_copy: "コピー", self.act_clear_annots: "注釈を全消去",
             self.act_page_numbers: "ページ番号", self.act_toggle_pagedock: "ページ一覧",
             self.act_prev: "前へ", self.act_next: "次へ",
@@ -618,8 +621,8 @@ class MainWindow(QMainWindow):
         p = r.add_page("ホーム")
         g = r.add_group(p, "ファイル")
         g.add_action(self.act_open, big=True)
-        g.add_stack([self.act_save, self.act_save_as,
-                     self.act_print, self.act_open_acrobat])
+        g.add_stack([self.act_save, self.act_save_as, self.act_print,
+                     self.act_open_acrobat, self.act_set_default_pdf])
         recent_btn = QToolButton()
         recent_btn.setText("最近 ▾")
         recent_btn.setAutoRaise(True)
@@ -772,6 +775,7 @@ class MainWindow(QMainWindow):
             self.act_fill_enabled: "四角/円を塗りつぶす（オフ＝枠線のみ）",
             self.act_fill_color: "塗りつぶしの色を選択",
             self.act_open_acrobat: "このPDFを Adobe Acrobat で開く（表示がおかしい時などの予備手段）",
+            self.act_set_default_pdf: "TriV-Reader をPDFの候補アプリに登録し、Windowsの既定アプリ設定を開く",
             self.act_apply_redact: "登録した墨消しを適用して内容を完全削除",
             self.act_ocr: "画像/スキャンPDFを文字認識して検索可能にする",
             self.act_deskew: "スキャンの傾きを自動補正",
@@ -849,7 +853,7 @@ class MainWindow(QMainWindow):
             self.act_set_update_url: "⚙", self.act_about: "ℹ",
             self.act_toggle_pagedock: "▤",
             self.act_fill_enabled: "🪣", self.act_fill_color: "🎨",
-            self.act_open_acrobat: "🅐",
+            self.act_open_acrobat: "🅐", self.act_set_default_pdf: "⭐",
         }
         for act, g in glyphs.items():
             act.setIcon(self._glyph_icon(g))
@@ -999,6 +1003,7 @@ class MainWindow(QMainWindow):
         self.zoom_combo.activated.connect(self._on_zoom_preset)
         self.act_print.triggered.connect(self.print_document)
         self.act_open_acrobat.triggered.connect(self.open_in_acrobat)
+        self.act_set_default_pdf.triggered.connect(self.set_as_default_pdf_app)
         self.act_facing.toggled.connect(self._toggle_facing)
         self.act_batch.triggered.connect(self.batch_dialog)
         self.act_diff.triggered.connect(self.diff_dialog)
@@ -1975,6 +1980,48 @@ class MainWindow(QMainWindow):
         if ret == QMessageBox.StandardButton.Yes:
             subprocess.Popen(
                 ["rundll32.exe", "shell32.dll,OpenAs_RunDLL", path], close_fds=True
+            )
+
+    def set_as_default_pdf_app(self) -> None:
+        """TriV-Reader を .pdf の候補アプリとして登録し、既定アプリ設定を開く。
+
+        Windows 10/11 は既定アプリの乗っ取り防止のため、レジストリ登録だけでは
+        既定にできない（UserChoice はハッシュ保護されており OS のみが書ける）。
+        ここでは「開くアプリの候補」への登録までを行い、実際に既定へ選ぶのは
+        Windows の設定画面でユーザー自身に行ってもらう。
+        """
+        from . import associate
+
+        exe = associate.current_exe()
+        if not exe:
+            QMessageBox.information(
+                self, "既定のPDFアプリに設定",
+                "ソース実行では利用できません。\n"
+                "ビルド済み(インストール済み)の TriV-Reader から実行してください。",
+            )
+            return
+        try:
+            associate.register(exe)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "既定のPDFアプリに設定",
+                f"関連付けの登録に失敗しました:\n{exc}",
+            )
+            return
+        QMessageBox.information(
+            self, "既定のPDFアプリに設定",
+            "TriV-Reader をPDFの候補アプリとして登録しました。\n\n"
+            "続けて開く「既定のアプリ」設定で、.pdf の項目から\n"
+            "「TriV-Reader」を選んでください。\n"
+            "（Windowsの仕様上、既定への変更はユーザー操作が必要です）",
+        )
+        try:
+            associate.open_default_apps_settings()
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "既定のPDFアプリに設定",
+                f"設定画面を開けませんでした:\n{exc}\n\n"
+                "手動で［設定 > アプリ > 既定のアプリ］を開いてください。",
             )
 
     # --- 設定の永続化 / 最近のファイル / D&D --------------------------
