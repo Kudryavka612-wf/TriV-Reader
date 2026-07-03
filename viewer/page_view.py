@@ -43,6 +43,89 @@ class _FormTextArea(QPlainTextEdit):
         super().focusOutEvent(event)
         self.committed.emit()
 
+
+class _CombLineEdit(QLineEdit):
+    """コム欄（1文字1マス）の入力欄。各文字をマスの中央に自前描画する。
+
+    字間（letter-spacing）でのマス目再現は半角基準の均等割りになり、
+    全角文字（かな・カナ・漢字）でマスからズレるため、Acrobat と同じく
+    文字ごとにマス中央へ配置して描画する。IME の未確定文字（プリエディット）
+    もカーソル位置のマスに下線付きで表示する。
+    """
+
+    def __init__(self, maxlen: int, parent=None) -> None:
+        super().__init__(parent)
+        self._cells = max(1, int(maxlen))
+        self._preedit = ""
+        self.setMaxLength(self._cells)
+        self.setFrame(False)
+        # ネイティブ描画は使わない（paintEvent を完全に置き換える）
+        self.setStyleSheet("QLineEdit { background: transparent; color: transparent; }")
+
+    def inputMethodEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        super().inputMethodEvent(event)
+        self._preedit = event.preeditString()
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        # ネイティブのヒットテストは字間前提でズレるため、マス単位で決める
+        cell = self.width() / self._cells
+        pos = int(event.position().x() / cell + 0.5) if cell > 0 else 0
+        self.setCursorPosition(max(0, min(pos, len(self.text()))))
+        event.accept()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        p = QPainter(self)
+        r = self.rect()
+        cell = r.width() / self._cells
+        # 背景と枠（Adobe 風の薄青ハイライト）
+        p.fillRect(r, QColor(204, 221, 255, 150))
+        p.setPen(QPen(QColor(0x70, 0x96, 0xD8)))
+        p.drawRect(r.adjusted(0, 0, -1, -1))
+        # マスの区切り線（薄く）
+        sep = QColor(0x70, 0x96, 0xD8)
+        sep.setAlpha(80)
+        p.setPen(QPen(sep))
+        for i in range(1, self._cells):
+            x = round(i * cell)
+            p.drawLine(x, 2, x, r.height() - 3)
+
+        text = self.text()
+        cur = self.cursorPosition()
+        disp = text[:cur] + self._preedit + text[cur:]
+        fm = p.fontMetrics()
+        baseline = (r.height() + fm.ascent() - fm.descent()) / 2
+
+        # 選択範囲のマスを強調
+        if self.hasSelectedText():
+            s = self.selectionStart()
+            e = s + len(self.selectedText())
+            p.fillRect(QRect(round(s * cell), 1,
+                             round((e - s) * cell), r.height() - 2),
+                       QColor(120, 160, 230, 120))
+
+        p.setPen(QColor(0x11, 0x11, 0x11))
+        for i, ch in enumerate(disp[:self._cells]):
+            w_ch = fm.horizontalAdvance(ch)
+            x = i * cell + (cell - w_ch) / 2
+            p.drawText(int(x), int(baseline), ch)
+            # プリエディット（未確定文字）には下線
+            if self._preedit and cur <= i < cur + len(self._preedit):
+                y = min(int(baseline) + 2, r.height() - 3)
+                p.drawLine(int(x), y, int(x + w_ch), y)
+
+        # カーソル（フォーカス時のみ・マスの左端に描く）
+        if self.hasFocus() and not self.hasSelectedText():
+            cpos = min(cur + len(self._preedit), self._cells)
+            if cpos < self._cells:
+                cx = round(cpos * cell) + 2
+            else:
+                cx = r.width() - 3
+            p.setPen(QPen(QColor(0x11, 0x11, 0x11), 1))
+            p.drawLine(cx, 3, cx, r.height() - 4)
+        p.end()
+
+
 # 注釈ツール
 TOOL_NONE = "none"
 TOOL_HIGHLIGHT = "highlight"
@@ -953,10 +1036,14 @@ class PageView(QScrollArea):
                 lambda i=index, x=xref, c=ctl: self._commit_field(
                     i, x, c.toPlainText()))
         else:  # text / radio / その他 → テキスト入力
-            ctl = QLineEdit(label)
+            if field.get("comb") and field.get("maxlen"):
+                # コム欄: 1文字1マス。全角/半角が混ざってもマス中央に描画する
+                ctl = _CombLineEdit(field["maxlen"], label)
+            else:
+                ctl = QLineEdit(label)
+                if field.get("maxlen"):
+                    ctl.setMaxLength(field["maxlen"])
             ctl.setText(str(value))
-            if field.get("maxlen"):
-                ctl.setMaxLength(field["maxlen"])
             ctl.editingFinished.connect(
                 lambda i=index, x=xref, c=ctl: self._commit_field(i, x, c.text()))
         ctl.setGeometry(int(x0), int(y0), w, h)
@@ -970,18 +1057,14 @@ class PageView(QScrollArea):
         f = ctl.font()
         f.setPixelSize(base_px)
 
-        if field.get("comb") and field.get("maxlen"):
-            # コム欄: 1文字ずつマス目に均等配置（字間で再現）
+        if isinstance(ctl, _CombLineEdit):
+            # コム欄はマス幅に収まるよう上限をかける（全角の横幅を基準に）
             cell = w / field["maxlen"]
-            fm = QFontMetrics(f)
-            spacing = max(0.0, cell - fm.averageCharWidth())
-            f.setLetterSpacing(f.SpacingType.AbsoluteSpacing, spacing)
+            size = base_px
+            while size > 7 and QFontMetrics(f).horizontalAdvance("あ") > cell - 2:
+                size -= 1
+                f.setPixelSize(size)
             ctl.setFont(f)
-            pad_left = max(0, int((cell - fm.averageCharWidth()) / 2))
-            ctl.setStyleSheet(
-                "QLineEdit { background: rgba(204,221,255,150);"
-                " border: 1px solid #7096d8;"
-                f" padding: 0px 0px 0px {pad_left}px; color: #111; }}")
         else:
             ctl.setFont(f)
             # Adobe 風の薄青ハイライト
