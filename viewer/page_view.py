@@ -78,8 +78,9 @@ class _CombLineEdit(QLineEdit):
         p = QPainter(self)
         r = self.rect()
         cell = r.width() / self._cells
-        # 背景と枠（Adobe 風の薄青ハイライト）
-        p.fillRect(r, QColor(204, 221, 255, 150))
+        # 背景と枠（Adobe 風の薄青ハイライト）。下に描画済みの PDF 側の文字が
+        # 透けて二重に見えないよう不透明にする
+        p.fillRect(r, QColor(225, 235, 255))
         p.setPen(QPen(QColor(0x70, 0x96, 0xD8)))
         p.drawRect(r.adjusted(0, 0, -1, -1))
         # マスの区切り線（薄く）
@@ -1007,8 +1008,9 @@ class PageView(QScrollArea):
 
     def _make_form_control(self, index, field, label):
         x0, y0, x1, y1 = self._doc.pdf_rect_to_label(index, field["rect"], self._zoom)
-        w = max(int(x1 - x0), 14)
-        h = max(int(y1 - y0), 14)
+        # 切り捨てだとマス目が最大1px ずれるため四捨五入で合わせる
+        w = max(round(x1 - x0), 14)
+        h = max(round(y1 - y0), 14)
         xref = field["xref"]
         kind = field["kind"]
         value = field["value"]
@@ -1046,7 +1048,7 @@ class PageView(QScrollArea):
             ctl.setText(str(value))
             ctl.editingFinished.connect(
                 lambda i=index, x=xref, c=ctl: self._commit_field(i, x, c.text()))
-        ctl.setGeometry(int(x0), int(y0), w, h)
+        ctl.setGeometry(round(x0), round(y0), w, h)
 
         # --- 文字サイズ: PDF 指定サイズ（pt）を尊重。0 は自動（枠に収める） ---
         pdf_fs = float(field.get("fontsize", 0) or 0)
@@ -1067,12 +1069,13 @@ class PageView(QScrollArea):
             ctl.setFont(f)
         else:
             ctl.setFont(f)
-            # Adobe 風の薄青ハイライト
+            # Adobe 風の薄青ハイライト。半透明だと下に描画済みの PDF 側の
+            # 文字が透けて二重に見えるため不透明にする
             ctl.setStyleSheet(
                 "QLineEdit, QComboBox, QPlainTextEdit {"
-                " background: rgba(204,221,255,150);"
+                " background: #e1ebff;"
                 " border: 1px solid #7096d8; padding: 0px 2px; color: #111; }"
-                "QCheckBox { background: rgba(204,221,255,150); }")
+                "QCheckBox { background: #e1ebff; }")
             # 自動サイズの1行欄: 入力に応じて縮小し、枠からはみ出さない（Adobe同等）
             if pdf_fs == 0 and isinstance(ctl, QLineEdit):
                 def _fit_font(text, c=ctl, base=base_px):

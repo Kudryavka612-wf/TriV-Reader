@@ -596,12 +596,44 @@ class PdfDocument:
                         w.field_value = bool(value)
                     else:
                         w.field_value = "" if value is None else str(value)
+                    self._fit_text_fontsize(w)
                     w.update()
                     self.modified = True
                     return True
                 except Exception:  # noqa: BLE001
                     return False
         return False
+
+    @staticmethod
+    def _fit_text_fontsize(w) -> None:
+        """1行テキスト欄の文字サイズを枠の幅にも収める（Adobe の自動縮小相当）。
+
+        MuPDF の外観生成は高さ基準でしかサイズを決めないため、長い文字列が
+        枠の右へあふれて描画される。自動サイズ（0）の欄と、指定サイズでは
+        収まらない欄は、実測幅から収まるサイズに詰める。
+        """
+        COMB = 1 << 24
+        MULTILINE = 1 << 12
+        if w.field_type != fitz.PDF_WIDGET_TYPE_TEXT:
+            return
+        flags = int(getattr(w, "field_flags", 0) or 0)
+        if flags & (COMB | MULTILINE):  # コム欄・複数行は MuPDF 側の配置に任せる
+            return
+        text = str(w.field_value or "")
+        if not text:
+            return
+        rect = w.rect
+        avail_w = max(4.0, rect.width - 4)
+        avail_h = max(4.0, rect.height)
+        # 「japan」フォントで実測（ASCII は半角幅・かな漢字は全角幅で測れる）
+        unit = fitz.get_text_length(text, fontname="japan", fontsize=1)
+        cur = float(getattr(w, "text_fontsize", 0) or 0)
+        base = cur if cur > 0 else avail_h * 0.75
+        if unit <= 0:
+            return
+        fit = min(base, avail_w / unit, avail_h * 0.9)
+        if cur == 0 or unit * cur > avail_w:
+            w.text_fontsize = max(4.0, fit)
 
     @staticmethod
     def _find_on(page, xref):
