@@ -104,6 +104,9 @@ def main() -> int:
     ]
     for mod in excludes:
         args += ["--exclude-module", mod]
+    # py_mini_racer はネイティブ V8 バイナリをパッケージデータとして同梱しており、
+    # PyInstaller の自動解析では拾われないため collect-all で明示的に含める。
+    args += ["--collect-all", "py_mini_racer"]
     # アイコン画像を同梱（実行時のウィンドウ/タスクバーアイコン用）
     assets_dir = os.path.join(HERE, "assets")
     if os.path.isdir(assets_dir):

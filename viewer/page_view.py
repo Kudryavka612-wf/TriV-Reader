@@ -25,13 +25,32 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QPlainTextEdit,
+    QPushButton,
     QScrollArea,
     QWidget,
 )
 
 from .document import PdfDocument
+from .govform_js import SIMPLE_CALL_RE
 
 PAGE_SPACING = 12  # ページ間の余白(px)
+
+
+class _GovFormClickOverlay(QPushButton):
+    """官公庁フォームの「丸で選択」JS トグル用の透明クリック領域。
+
+    PDF 側の外観（選択中/非選択の2枚のうち見えている方）がそのまま
+    透けて見えるよう、枠なし・背景なしのボタンをかぶせるだけにする。
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFlat(True)
+        self.setStyleSheet(
+            "QPushButton { background: transparent; border: none; }"
+            "QPushButton:hover { background: rgba(112, 150, 216, 60); }")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("クリックして選択")
 
 
 class _FormTextArea(QPlainTextEdit):
@@ -1047,7 +1066,14 @@ class PageView(QScrollArea):
         xref = field["xref"]
         kind = field["kind"]
         value = field["value"]
-        if kind == "checkbox":
+        if kind == "radio" and self._is_govform_click_field(field):
+            # 官公庁フォームの「丸で選択」JS トグル。対象外（非対応文書や
+            # 想定外のスクリプト形）の場合は下の通常の text 分岐にフォール
+            # バックする（file 冒頭の分岐コメント参照）。
+            ctl = _GovFormClickOverlay(label)
+            ctl.clicked.connect(
+                lambda checked=False, i=index, x=xref: self._click_govform(i, x))
+        elif kind == "checkbox":
             ctl = QCheckBox(label)
             checked = str(value) not in ("", "Off", "/Off", "No", "false", "False", "0")
             ctl.setChecked(checked)
@@ -1070,7 +1096,7 @@ class PageView(QScrollArea):
             ctl.committed.connect(
                 lambda i=index, x=xref, c=ctl: self._commit_field(
                     i, x, c.toPlainText()))
-        else:  # text / radio / その他 → テキスト入力
+        else:  # text / その他 → テキスト入力（radio は上の govform 分岐かここに来る）
             if field.get("comb") and field.get("maxlen"):
                 # コム欄: 1文字1マス。全角/半角が混ざってもマス中央に描画する
                 ctl = _CombLineEdit(field["maxlen"], label)
@@ -1082,6 +1108,12 @@ class PageView(QScrollArea):
             ctl.editingFinished.connect(
                 lambda i=index, x=xref, c=ctl: self._commit_field(i, x, c.text()))
         ctl.setGeometry(round(x0), round(y0), w, h)
+
+        if isinstance(ctl, _GovFormClickOverlay):
+            # クリック領域のみ。PDF 側の見た目を透かすため文字サイズ調整や
+            # ハイライト用スタイルシートの適用は不要（下の共通処理をスキップ）。
+            ctl.show()
+            return ctl
 
         # --- 文字サイズ: PDF 指定サイズ（pt）を尊重。0 は自動（枠に収める） ---
         pdf_fs = float(field.get("fontsize", 0) or 0)
@@ -1133,6 +1165,37 @@ class PageView(QScrollArea):
     def _commit_field(self, index, xref, value) -> None:
         if self._doc and self._doc.set_field_value(index, xref, value):
             self.form_changed.emit()
+
+    def _is_govform_click_field(self, field) -> bool:
+        """kind=="radio" の欄が、官公庁フォームJSトグルの対象として妥当そうか。
+
+        文書自体が対応ヘルパーを定義している（is_govform_js_eligible）ことに
+        加え、「単純な identifier(event) 呼び出し」という形だけを見る
+        （実行可否の最終判断は govform_js 側。ここでは overlay を出すか
+        どうかの UI 判定）。
+        """
+        if not self._doc or not self._doc.is_govform_js_eligible():
+            return False
+        script = (field.get("script") or "").strip()
+        return bool(script) and bool(SIMPLE_CALL_RE.match(script))
+
+    def _click_govform(self, index: int, xref: int) -> None:
+        """官公庁フォームの選択ウィジェットをクリックしたときの処理。
+
+        表示状態（Hidden フラグ）が変わり、同じページの他ウィジェット
+        （ペア相手など）も見え方が変わり得るため、フォームオーバーレイ
+        一式を作り直す（_after_annot 等と同じ「変更後に作り直す」方針）。
+        """
+        if not self._doc:
+            return
+        if not self._doc.is_govform_js_eligible():
+            return
+        if self._doc.click_govform_widget(index, xref):
+            self.form_changed.emit()
+            # 同じページ内の別ウィジェット（ペア相手や他の選択肢）も表示が
+            # 変わり得るため、オーバーレイ一式を作り直す。
+            self._build_form_overlays()
+            self._after_annot(index)
 
     # --- 構築・レイアウト ----------------------------------------------
     def _rebuild(self, fit: bool, target: int) -> None:

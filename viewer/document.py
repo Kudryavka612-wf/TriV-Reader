@@ -10,6 +10,8 @@ import os
 import fitz  # PyMuPDF
 from PySide6.QtGui import QImage, QPixmap
 
+from . import govform_js
+
 
 def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
@@ -45,6 +47,7 @@ class PdfDocument:
         self.path: str | None = None
         self.modified: bool = False
         self._authenticated: bool = True
+        self._doc_scripts_cache: dict[str, str] | None = None
 
     # --- ライフサイクル -------------------------------------------------
     def open(self, path: str, password: str | None = None) -> None:
@@ -57,6 +60,7 @@ class PdfDocument:
         self.path = path
         self.modified = False
         self._authenticated = not self._doc.needs_pass
+        self._doc_scripts_cache = None
         # 保持する doc には「正しいパスワードでのみ」authenticate する。
         # 誤パスワードの照合は check_password（使い捨て）で行うこと。
         if self._doc.needs_pass and password:
@@ -103,6 +107,7 @@ class PdfDocument:
             self._doc = None
             self.path = None
             self.modified = False
+            self._doc_scripts_cache = None
 
     @property
     def is_open(self) -> bool:
@@ -548,6 +553,11 @@ class PdfDocument:
             fitz.PDF_WIDGET_TYPE_COMBOBOX: "combo",
             fitz.PDF_WIDGET_TYPE_LISTBOX: "list",
             fitz.PDF_WIDGET_TYPE_RADIOBUTTON: "radio",
+            # 官公庁フォームの「丸で選択」は素の RADIOBUTTON ではなく BUTTON
+            # 型のペア（同じ rect・別名の "選択中/非選択" 外観）で作られている
+            # ことが多い（実サンプルで確認済み）。UI 側では radio と同様に
+            # 「クリックで選択する」ものとして扱いたいので radio 扱いにする。
+            fitz.PDF_WIDGET_TYPE_BUTTON: "radio",
         }.get(field_type, "text")
 
     def page_fields(self, index: int) -> list:
@@ -581,6 +591,8 @@ class PdfDocument:
                 "multiline": bool(is_text and (flags & MULTILINE)),
                 # 0 は「自動（枠に合わせて縮小）」の意味（Adobe と同じ）
                 "fontsize": float(getattr(w, "text_fontsize", 0) or 0),
+                # 官公庁フォームの JS トグル判定用（クリックハンドラの有無）。
+                "script": getattr(w, "script", None) or "",
             })
         return out
 
@@ -603,6 +615,33 @@ class PdfDocument:
                 except Exception:  # noqa: BLE001
                     return False
         return False
+
+    # --- 官公庁フォームの「丸で選択」 JS トグル（限定対応） -------------
+    def doc_scripts(self) -> dict[str, str]:
+        """文書レベル JavaScript（Names/JavaScript）を遅延取得してキャッシュする。"""
+        if self._doc_scripts_cache is None:
+            self._doc_scripts_cache = (
+                govform_js.extract_doc_scripts(self._doc) if self._doc else {}
+            )
+        return self._doc_scripts_cache
+
+    def is_govform_js_eligible(self) -> bool:
+        """GroupButtonClick/KinmuButtonClick 等、既知の安全なヘルパーを
+        この文書自身が定義しているか（= 対応スコープ内のフォームか）。"""
+        return govform_js.is_eligible(self.doc_scripts())
+
+    def click_govform_widget(self, index: int, xref: int) -> bool:
+        """官公庁フォームの選択ウィジェットをクリックした効果を再現する。
+
+        表示状態（/F の Hidden ビット）が実際に変化すれば True を返し、
+        modified フラグを立てる。対象外・失敗時は何も変えず False。
+        """
+        if not self._doc:
+            return False
+        changed = govform_js.run_click(self._doc, index, xref, self.doc_scripts())
+        if changed:
+            self.modified = True
+        return changed
 
     @staticmethod
     def _fit_text_fontsize(w) -> None:
