@@ -130,6 +130,61 @@ class _FormComboBox(QComboBox):
         p.end()
 
 
+class _TextAnnotEditor(QPlainTextEdit):
+    """テキスト注釈を「その場で」入力する編集ボックス。
+
+    入力した文字をそのまま見ながら打てる（モーダルのポップアップではない）。
+    確定＝ページ上をクリックして離れる / Ctrl+Enter。取消＝Esc または空のまま離脱。
+    ツールバー（サイズ・色）を触ったときは確定させず編集を続けられるようにする。
+    """
+
+    committed = Signal()
+    cancelled = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._done = False
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Escape:
+            self._done = True
+            self.cancelled.emit()
+            return
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self._finish()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        super().focusOutEvent(event)
+        # フォーカスがツールバー（サイズ/色の調整）へ移っただけなら確定しない。
+        # イベント確定後に判定するため次のループへ回す。
+        QTimer.singleShot(0, self._finish_if_left)
+
+    def _finish_if_left(self) -> None:
+        from PySide6.QtWidgets import (QAbstractButton, QAbstractSpinBox,
+                                       QComboBox)
+        from PySide6.QtWidgets import QApplication as _App
+        if self._done or self.hasFocus():
+            return
+        fw = _App.focusWidget()
+        if isinstance(fw, (QAbstractSpinBox, QComboBox, QAbstractButton)):
+            return  # ツールバーで設定調整中 → 編集を続ける
+        self._finish()
+
+    def _finish(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        if self.toPlainText().strip():
+            self.committed.emit()
+        else:
+            self.cancelled.emit()
+
+
 class _CombLineEdit(QLineEdit):
     """コム欄（1文字1マス）の入力欄。各文字をマスの中央に自前描画する。
 
@@ -654,6 +709,9 @@ class PageView(QScrollArea):
         self.fill_enabled = False    # 四角/円の塗りつぶし
         self.fill_color = QColor(255, 255, 255)
         self.opacity = 1.0           # 0.0-1.0
+        self.text_size = 14          # テキスト注釈の文字サイズ(pt)
+        self._text_editor = None     # その場入力中の _TextAnnotEditor（1個だけ）
+        self._text_ctx = None        # (page_index, pdf_rect)
         self._sel_index = -1
         self._sel_xref = None
         # 検索
@@ -718,6 +776,9 @@ class PageView(QScrollArea):
 
     # --- 注釈ツール -----------------------------------------------------
     def set_tool(self, tool: str) -> None:
+        # 入力中のテキスト注釈があれば、まず確定させてからツールを切り替える。
+        if self._text_editor is not None:
+            self._text_editor._finish()
         self.tool = tool
         if tool != TOOL_NONE:
             self.clear_selection()       # 描画ツール中は注釈選択を解除
@@ -735,6 +796,14 @@ class PageView(QScrollArea):
 
     def set_color(self, qcolor: QColor) -> None:
         self.color = qcolor
+        # その場入力中なら文字色を即反映（「入力しながら色を変える」）。
+        if self._text_editor is not None:
+            self._apply_text_editor_style()
+
+    def set_text_size(self, size: int) -> None:
+        self.text_size = max(6, int(size))
+        if self._text_editor is not None:
+            self._apply_text_editor_style()
 
     def set_pen_width(self, width: int) -> None:
         self.pen_width = max(1, int(width))
@@ -829,12 +898,61 @@ class PageView(QScrollArea):
             self.reload(index)  # ページサイズが変わるので再構築
             return
         elif tool == TOOL_TEXT:
-            from PySide6.QtWidgets import QInputDialog
-            text, ok = QInputDialog.getMultiLineText(self, "テキスト注釈", "本文:")
-            if not ok or not text.strip():
-                return
-            self._doc.add_freetext(index, rect, text, color=self._rgb())
+            # モーダルではなく、その場で打てる編集ボックスを重ねる。
+            self._begin_text_edit(index, rect, p0, p1)
+            return
         self._after_annot(index)
+
+    # --- テキスト注釈のその場入力 --------------------------------------
+    def _begin_text_edit(self, index: int, pdf_rect, p0: QPoint, p1: QPoint) -> None:
+        """ドラッグした矩形の位置に編集ボックスを出し、打った文字をそのまま
+        見ながら入力できるようにする。確定で FreeText 注釈にする。"""
+        self._discard_text_editor()
+        label = self._labels[index]
+        ed = _TextAnnotEditor(label)
+        x0, y0 = min(p0.x(), p1.x()), min(p0.y(), p1.y())
+        x1, y1 = max(p0.x(), p1.x()), max(p0.y(), p1.y())
+        ed.setGeometry(int(x0), int(y0), max(40, int(x1 - x0)), max(24, int(y1 - y0)))
+        self._text_editor = ed
+        self._text_ctx = (index, pdf_rect)
+        self._apply_text_editor_style()
+        ed.committed.connect(self._commit_text_edit)
+        ed.cancelled.connect(self._discard_text_editor)
+        ed.show()
+        ed.setFocus()
+
+    def _apply_text_editor_style(self) -> None:
+        ed = self._text_editor
+        if ed is None:
+            return
+        c = self.color
+        px = max(8, int(self.text_size * self._zoom))
+        f = ed.font()
+        f.setPixelSize(px)
+        ed.setFont(f)
+        ed.setStyleSheet(
+            "QPlainTextEdit { background: rgba(255,255,255,235);"
+            " border: 1px dashed #1a73e8;"
+            " color: rgb(%d,%d,%d); }" % (c.red(), c.green(), c.blue()))
+
+    def _commit_text_edit(self) -> None:
+        if self._text_editor is None or self._text_ctx is None:
+            return
+        text = self._text_editor.toPlainText()
+        index, pdf_rect = self._text_ctx
+        self._discard_text_editor()
+        if text.strip() and self._doc:
+            self._doc.add_freetext(index, pdf_rect, text,
+                                   color=self._rgb(), fontsize=self.text_size)
+            self._after_annot(index)
+
+    def _discard_text_editor(self) -> None:
+        ed = self._text_editor
+        self._text_editor = None
+        self._text_ctx = None
+        if ed is not None:
+            ed.setParent(None)
+            ed.deleteLater()
 
     def commit_stroke(self, index: int, points: list) -> None:
         if not self._doc or len(points) < 2:
@@ -1376,6 +1494,7 @@ class PageView(QScrollArea):
 
     # --- 構築・レイアウト ----------------------------------------------
     def _rebuild(self, fit: bool, target: int) -> None:
+        self._discard_text_editor()  # 入力中の編集ボックスはページ再構築で捨てる
         # 既存ラベルを破棄
         while self._layout.count():
             item = self._layout.takeAt(0)

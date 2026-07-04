@@ -19,7 +19,8 @@ from PySide6.QtWidgets import QApplication
 
 from viewer import theme
 from viewer.document import PdfDocument
-from viewer.page_view import PageView, TOOL_LINE, TOOL_NONE, TOOL_RECT
+from viewer.page_view import (PageView, TOOL_LINE, TOOL_NONE, TOOL_RECT,
+                              TOOL_TEXT, _TextAnnotEditor)
 
 
 def main() -> int:
@@ -109,6 +110,30 @@ def main() -> int:
     pv.set_fill_color(QColor(200, 0, 0))
     check("restyle selected: fill", last().get("fill") is not None)
     check("restyle keeps width through later edits", last().get("w") == 12.0, str(last()))
+
+    # --- in-place text annotation (type live, size + colour) ---
+    from PySide6.QtGui import QColor as _QC
+    pv.set_tool(TOOL_TEXT)
+    pv.set_color(_QC(200, 0, 0))
+    pv.set_text_size(24)
+    drag(QPoint(40, 460), QPoint(300, 500))
+    ed = pv._text_editor
+    check("text tool opens an in-place editor", isinstance(ed, _TextAnnotEditor))
+    check("editor font follows text size", ed is not None and ed.font().pixelSize() == 24)
+    ed.setPlainText("メモ テスト")
+    pv.set_text_size(30)   # live change while editing must not commit
+    check("size change mid-edit keeps editing", pv._text_editor is ed
+          and ed.font().pixelSize() == 30)
+    ed._finish()
+    app.processEvents()
+    ft = None
+    for a in doc._doc.load_page(0).annots():
+        if a.type[1] == "FreeText":
+            ft = a
+    check("text commits to a FreeText annot", ft is not None)
+    check("FreeText holds the typed text",
+          ft is not None and ft.info.get("content") == "メモ テスト")
+    check("editor is gone after commit", pv._text_editor is None)
 
     # --- round-trip persistence ---
     out = os.path.join(tmp, "_annot_restyled.pdf")

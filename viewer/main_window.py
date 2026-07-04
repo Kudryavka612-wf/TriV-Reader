@@ -444,6 +444,16 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.opacity_spin)
         tb.addSeparator()
 
+        # 文字サイズ（テキスト注釈用）
+        tb.addWidget(QLabel(" 文字サイズ "))
+        self.text_size_spin = QSpinBox()
+        self.text_size_spin.setRange(6, 96)
+        self.text_size_spin.setValue(14)
+        self.text_size_spin.setSuffix("pt")
+        self.text_size_spin.setToolTip("テキスト注釈の文字サイズ（入力中も変更可）")
+        tb.addWidget(self.text_size_spin)
+        tb.addSeparator()
+
         self.act_apply_redact = QAction("墨消しを適用", self)
         tb.addAction(self.act_apply_redact)
         self.act_clear_annots = QAction("このページの注釈を全消去", self)
@@ -729,6 +739,8 @@ class MainWindow(QMainWindow):
         g.add_action(self.act_fill_color, big=True)
         g.add_label(" 不透明度 ")
         g.add_widget(self.opacity_spin)
+        g.add_label(" 文字サイズ ")
+        g.add_widget(self.text_size_spin)
         g = r.add_group(p, "編集")
         g.add_stack([self.act_apply_redact, self.act_clear_annots, self.act_copy])
         r.end_page(p)
@@ -1025,6 +1037,9 @@ class MainWindow(QMainWindow):
         self.act_fill_color.triggered.connect(self._pick_fill_color)
         self.opacity_spin.valueChanged.connect(
             lambda v: self.page_view.set_opacity(v / 100.0)
+        )
+        self.text_size_spin.valueChanged.connect(
+            lambda v: self.page_view.set_text_size(v)
         )
         self.act_clear_annots.triggered.connect(self._clear_annots)
         # しおり / 最適化 / PDF-A
