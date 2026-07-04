@@ -318,6 +318,13 @@ def widget_keystroke_js(doc: "fitz.Document", xref: int) -> str:
 _GROUP_BUTTON_CALL_RE = re.compile(
     r"GroupButtonClick\s*\(\s*event\s*,\s*(\[[^\]]*\])\s*\)")
 
+# KinmuButtonClick(event, "BASE") は、同じ rect に重なる _01（選択＝〇）と _OFF
+# （非選択）の2枚を二値トグルするだけ（_02.._04 はこのフォームでは未使用）。
+# GroupButtonClick と同じく V8 なしで Python 完全再現できるので、凍結ビルドで
+# V8 DLL が読めない環境でも勤務状況の〇選択が動く。
+_KINMU_BUTTON_CALL_RE = re.compile(
+    r'KinmuButtonClick\s*\(\s*event\s*,\s*"([^"]+)"\s*\)')
+
 
 def _native_group_button_click(doc: "fitz.Document", page_index: int,
                                clicked_name: str, entry_source: str,
@@ -372,6 +379,57 @@ def _native_group_button_click(doc: "fitz.Document", page_index: int,
     return changed
 
 
+def _native_kinmu_button_click(doc: "fitz.Document", page_index: int,
+                               clicked_name: str, entry_source: str,
+                               combined: str) -> bool | None:
+    """KinmuButtonClick の「〇選択」二値トグルを V8 なしで再現する。
+
+    entry_source が実質 KinmuButtonClick(event, "BASE") を呼ぶだけで、クリック欄
+    が base の "_01"（選択）/"_OFF"（非選択）のいずれかなら、その2枚の表示
+    （/F Hidden ビット）を JS と同じ規則でトグルする。
+
+    返り値: 変化を適用したら True／変化なしなら False／このパターンに当て
+    はまらず処理していない場合は None（呼び出し側は V8 実行へフォールバック）。
+    """
+    # 文書が KinmuButtonClick を実際に定義していること（安全確認）
+    if _find_function_source(combined, "KinmuButtonClick") is None:
+        return None
+    m = _KINMU_BUTTON_CALL_RE.search(entry_source or "")
+    if not m:
+        return None
+    base = m.group(1)
+    on_name, off_name = base + "_01", base + "_OFF"
+    # JS の KinmuButtonClick と同じ規則：
+    #  ・_OFF を押した → 選択（_01 表示 / _OFF 非表示）
+    #  ・_01  を押した → 選択解除（_01 非表示 / _OFF 表示）
+    #  ・それ以外（_02.._04 等）→ 何もしない（このフォームでは発生しない）
+    if clicked_name == off_name:
+        select = True
+    elif clicked_name == on_name:
+        select = False
+    else:
+        return None  # 想定外（_02.._04 等）は V8 に委ねる
+
+    name_to_xref: dict[str, int] = {}
+    for w in (doc.load_page(page_index).widgets() or []):
+        if w.field_name:
+            name_to_xref[w.field_name] = w.xref
+
+    changed = False
+    targets = ((on_name, DISPLAY_VISIBLE if select else DISPLAY_HIDDEN),
+               (off_name, DISPLAY_HIDDEN if select else DISPLAY_VISIBLE))
+    for name, disp in targets:
+        xref = name_to_xref.get(name)
+        if xref is not None and _apply_display(doc, xref, disp):
+            changed = True
+    return changed
+
+
+# クリックで表示状態を変える「〇選択」系ヘルパーの V8 非依存ネイティブ実装。
+# run_click はこの順に試し、いずれかが None 以外を返せばそれを使う（V8 不要）。
+_NATIVE_CLICK_HANDLERS = (_native_group_button_click, _native_kinmu_button_click)
+
+
 def run_click(doc: "fitz.Document", page_index: int, widget_xref: int,
               doc_scripts: dict[str, str]) -> bool:
     """widget_xref のウィジェットをクリックしたとして /A スクリプトを実行する。
@@ -401,10 +459,11 @@ def run_click(doc: "fitz.Document", page_index: int, widget_xref: int,
             combined = "\n".join(doc_scripts.values())
             entry_source = _find_function_source(combined, m.group(1))
             if entry_source is not None:
-                native = _native_group_button_click(
-                    doc, page_index, clicked_name, entry_source, combined)
-                if native is not None:
-                    return native  # ネイティブで処理済み（V8 不要）
+                for handler in _NATIVE_CLICK_HANDLERS:
+                    native = handler(doc, page_index, clicked_name,
+                                     entry_source, combined)
+                    if native is not None:
+                        return native  # ネイティブで処理済み（V8 不要）
         return _run_action_impl(doc, page_index, widget_xref, doc_scripts,
                                 clicked_script, change_value=None)
     except Exception:  # noqa: BLE001
@@ -423,10 +482,134 @@ def run_keystroke(doc: "fitz.Document", page_index: int, widget_xref: int,
         entry_script = widget_keystroke_js(doc, widget_xref)
         if not entry_script:
             return False
+        native = _native_keystroke(doc, page_index, widget_xref, doc_scripts,
+                                   entry_script, change_value)
+        if native is not None:
+            return native  # ネイティブで処理済み（V8 不要）
         return _run_action_impl(doc, page_index, widget_xref, doc_scripts,
                                 entry_script, change_value=change_value)
     except Exception:  # noqa: BLE001
         return False
+
+
+# コンボ選択の Keystroke アクションが呼ぶヘルパー呼び出しの検出。DropDownSelect は
+# 引数なし（event のみ）、StateNameSelect は event＋4つの枝ボタン名を取る。
+_DROPDOWN_CALL_RE = re.compile(r"DropDownSelect\s*\(\s*event\s*\)")
+_STATENAME_CALL_RE = re.compile(
+    r'StateNameSelect\s*\(\s*event\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,'
+    r'\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)')
+
+
+def _parse_state_lists(state_src: str) -> dict[str, list[str]]:
+    """StateNameSelect 内の toLst/douLst/fuLst/kenLst を「代入」「+= 追記」の
+    両方から集めて {リスト名: [エクスポート値...]} を返す。"""
+    lists: dict[str, list[str]] = {}
+    for var in ("toLst", "douLst", "fuLst", "kenLst"):
+        vals: list[str] = []
+        for m in re.finditer(
+                re.escape(var) + r"\s*(?:=|\+=)\s*\[([^\]]*)\]", state_src):
+            vals += re.findall(r'"([^"]*)"', m.group(1))
+        lists[var] = vals
+    return lists
+
+
+def _native_dropdown_select(doc: "fitz.Document", page_index: int,
+                            target_name: str, change_value: str) -> bool:
+    """DropDownSelect: 選択エクスポート値を <target>_PRINT 欄へ転写する。"""
+    print_name = target_name + "_PRINT"
+    for w in (doc.load_page(page_index).widgets() or []):
+        if w.field_name == print_name:
+            return _apply_value(w, "" if change_value is None else str(change_value))
+    return False
+
+
+def _native_state_name_select(doc: "fitz.Document", page_index: int,
+                              state_src: str, btns: tuple,
+                              change_value: str) -> bool:
+    """StateNameSelect: 4枝ボタン(都/道/府/県)を一旦すべて非表示にし、選択した
+    都道府県の分類に一致する1枚だけを表示する（JS と同じ規則）。"""
+    to_btn, dou_btn, fu_btn, ken_btn = btns
+    lists = _parse_state_lists(state_src)
+    name_to_xref: dict[str, int] = {}
+    for w in (doc.load_page(page_index).widgets() or []):
+        if w.field_name:
+            name_to_xref[w.field_name] = w.xref
+
+    changed = False
+    # まず4枝すべて非表示
+    for name in (to_btn, dou_btn, fu_btn, ken_btn):
+        xref = name_to_xref.get(name)
+        if xref is not None and _apply_display(doc, xref, DISPLAY_HIDDEN):
+            changed = True
+
+    state = "" if change_value is None else str(change_value)
+    if state == "" or state == " ":
+        return changed  # 未選択なら全非表示のまま（JS と同じ）
+
+    # 分類に一致する枝を表示（複数該当は JS 同様すべて表示するが実データでは排他）
+    show = ((to_btn, lists.get("toLst", [])),
+            (dou_btn, lists.get("douLst", [])),
+            (fu_btn, lists.get("fuLst", [])),
+            (ken_btn, lists.get("kenLst", [])))
+    for name, values in show:
+        if state in values:
+            xref = name_to_xref.get(name)
+            if xref is not None and _apply_display(doc, xref, DISPLAY_VISIBLE):
+                changed = True
+    return changed
+
+
+def _native_keystroke(doc: "fitz.Document", page_index: int, widget_xref: int,
+                      doc_scripts: dict[str, str], entry_script: str,
+                      change_value) -> bool | None:
+    """コンボ選択の Keystroke を V8 なしで再現する（DropDownSelect / StateNameSelect）。
+
+    entry_script のラッパー本体が DropDownSelect / StateNameSelect を呼ぶだけ
+    （＋入力チェックの CHK*/AlertError。これらは表示/値を変えない）の場合に限り、
+    その効果を Python で適用する。当てはまらなければ None（V8 へフォールバック）。
+    """
+    if change_value is None:      # コンボ以外（クリック）は対象外
+        return None
+    if not is_eligible(doc_scripts):
+        return None
+
+    m = SIMPLE_CALL_RE.match((entry_script or "").strip())
+    if not m:
+        return None
+    entry_name = m.group(1)
+    combined = "\n".join(doc_scripts.values())
+
+    # entry がヘルパーそのものか、それを呼ぶラッパーかを解決して本体を得る
+    entry_source = _find_function_source(combined, entry_name)
+    if entry_source is None:
+        return None
+
+    has_dropdown = (_DROPDOWN_CALL_RE.search(entry_source) is not None
+                    and _find_function_source(combined, "DropDownSelect") is not None)
+    sm = _STATENAME_CALL_RE.search(entry_source)
+    has_state = (sm is not None
+                 and _find_function_source(combined, "StateNameSelect") is not None)
+    if not (has_dropdown or has_state):
+        return None  # 既知の2ヘルパー以外を呼ぶなら V8 に委ねる
+
+    target_name = None
+    for w in (doc.load_page(page_index).widgets() or []):
+        if w.xref == widget_xref:
+            target_name = w.field_name
+            break
+    if not target_name:
+        return None
+
+    changed = False
+    if has_dropdown and _native_dropdown_select(
+            doc, page_index, target_name, change_value):
+        changed = True
+    if has_state:
+        state_src = _find_function_source(combined, "StateNameSelect") or ""
+        if _native_state_name_select(
+                doc, page_index, state_src, sm.groups(), change_value):
+            changed = True
+    return changed
 
 
 def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
