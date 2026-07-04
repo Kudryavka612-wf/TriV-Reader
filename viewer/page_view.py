@@ -37,20 +37,52 @@ PAGE_SPACING = 12  # ページ間の余白(px)
 
 
 class _GovFormClickOverlay(QPushButton):
-    """官公庁フォームの「丸で選択」JS トグル用の透明クリック領域。
+    """官公庁フォームの「丸で選択」JS トグル用のクリック領域。
 
-    PDF 側の外観（選択中/非選択の2枚のうち見えている方）がそのまま
-    透けて見えるよう、枠なし・背景なしのボタンをかぶせるだけにする。
+    「ここはクリックで選べる欄」だと分かるよう、ごく薄い塗り＋点線枠を常時
+    表示する（Adobe の「フィールドを強調表示」に相当）。PDF 側の見た目
+    （選択中の〇/非選択）は薄塗り越しに透けて見え、ホバーで少し濃くなる。
+
+    マウス操作の注意点:
+    - フォーカスを取らない（NoFocus）。取ると QScrollArea が「フォーカス欄を
+      見せよう」として、選択のたびに画面が勝手にスクロールしてしまう。
+    - 左クリックのみ選択に使う。中/右ボタンやオートスクロール中は親（ページ）
+      へ流し、欄の上でも中クリックのスクロール開始/停止が効くようにする。
+    - ホイールは飲み込まず下のスクロール領域へ流す。
     """
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFlat(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setStyleSheet(
-            "QPushButton { background: transparent; border: none; }"
-            "QPushButton:hover { background: rgba(112, 150, 216, 60); }")
+            "QPushButton { background: rgba(112, 150, 216, 45);"
+            " border: 1px dashed rgba(112, 150, 216, 170); }"
+            "QPushButton:hover { background: rgba(112, 150, 216, 95); }")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("クリックして選択")
+
+    def _autoscrolling(self) -> bool:
+        """親ページ経由で、オートスクロール（中クリック）中かを見る。"""
+        view = getattr(self.parent(), "_view", None)
+        return bool(view is not None and getattr(view, "_auto_active", False))
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        event.ignore()  # 欄の上でもホイールでページをスクロールできるように
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        if (event.button() != Qt.MouseButton.LeftButton
+                or self._autoscrolling()):
+            event.ignore()   # 親へ流す（中クリック/オートスクロールを優先）
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        if (event.button() != Qt.MouseButton.LeftButton
+                or self._autoscrolling()):
+            event.ignore()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class _FormTextArea(QPlainTextEdit):
@@ -1068,28 +1100,6 @@ class PageView(QScrollArea):
         for index in range(min(self._doc.page_count, len(self._labels))):
             self._build_page_overlays(index)
 
-    def _rebuild_page_overlays(self, index: int) -> None:
-        """1ページ分の overlay だけを作り直す。
-
-        全ページ再構築（このフォームで約270個・~0.5秒）の代わりに使う。
-        govform のコンボ連動（枝ラベル表示切替・_PRINT 転写）など「その
-        ページ内でしか見た目が変わらない」操作の後始末に用いる。
-        """
-        if not self._form_mode or not self._doc or not self._doc.is_open:
-            return
-        if not (0 <= index < len(self._labels)):
-            return
-        label = self._labels[index]
-        kept = []
-        for w in self._form_overlays:
-            if w.parent() is label:
-                w.setParent(None)
-                w.deleteLater()
-            else:
-                kept.append(w)
-        self._form_overlays = kept
-        self._build_page_overlays(index)
-
     def _build_page_overlays(self, index: int) -> None:
         """指定ページの overlay を作って self._form_overlays に足す。
 
@@ -1236,9 +1246,11 @@ class PageView(QScrollArea):
         if committed or js_changed:
             self.form_changed.emit()
         if js_changed:
-            # 枝ラベルの表示切替や _PRINT の値が変わり得るので、そのページの
-            # overlay だけ作り直して再描画する（全ページ再構築の ~0.5 秒を避ける）。
-            self._rebuild_page_overlays(index)
+            # 枝ラベル(都/道/府/県)の表示切替や _PRINT の値変化はページ再描画で
+            # 反映される。overlay は作り直さない――作り直すと、ユーザーが今まさに
+            # 操作しているコンボ自体を破棄・再生成してしまい、選択が確定しない
+            # （＝「都道府県が選べない」）。枝ラベルはクリック対象ではないので
+            # overlay の増減は不要。
             self._after_annot(index)
 
     def _is_govform_click_field(self, field) -> bool:
