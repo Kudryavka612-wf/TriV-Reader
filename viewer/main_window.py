@@ -332,6 +332,8 @@ class MainWindow(QMainWindow):
         self.act_check_update = QAction("更新を確認…", self)
         self.act_about = QAction("バージョン情報", self)
         self.act_set_update_url = QAction("更新元URLを設定…", self)
+        self.act_report_govform = QAction("未対応フォーム機能を報告用に保存…", self)
+        self.act_report_govform.setEnabled(False)
         self.act_dark = QAction("ダークモード", self)
         self.act_dark.setCheckable(True)
         self.act_compact = QAction("コンパクト表示（アイコンのみ）", self)
@@ -589,6 +591,8 @@ class MainWindow(QMainWindow):
         m_help.addAction(self.act_check_update)
         m_help.addAction(self.act_set_update_url)
         m_help.addSeparator()
+        m_help.addAction(self.act_report_govform)
+        m_help.addSeparator()
         m_help.addAction(self.act_about)
 
     # 開いた時の表示倍率のプリセット（設定値の文字列 → 表示ラベル）
@@ -771,7 +775,8 @@ class MainWindow(QMainWindow):
         g = r.add_group(p, "しおり")
         g.add_stack([self.act_add_bookmark, self.act_edit_toc])
         g = r.add_group(p, "ヘルプ")
-        g.add_stack([self.act_check_update, self.act_set_update_url, self.act_about])
+        g.add_stack([self.act_check_update, self.act_set_update_url,
+                     self.act_report_govform, self.act_about])
         r.end_page(p)
 
         # リボンを最上部に据え、従来のメニューバー/ツールバーは隠す
@@ -902,6 +907,7 @@ class MainWindow(QMainWindow):
             self.act_find: "🔍",
             self.act_edit_toc: "📇", self.act_check_update: "🔄",
             self.act_set_update_url: "⚙", self.act_about: "ℹ",
+            self.act_report_govform: "📮",
             self.act_toggle_pagedock: "▤",
             self.act_fill_enabled: "🪣", self.act_fill_color: "🎨",
             self.act_open_acrobat: "🅐", self.act_set_default_pdf: "⭐",
@@ -1062,6 +1068,7 @@ class MainWindow(QMainWindow):
         self.act_check_update.triggered.connect(self.check_for_update)
         self.act_set_update_url.triggered.connect(self.set_update_url)
         self.act_about.triggered.connect(self.show_about)
+        self.act_report_govform.triggered.connect(self.report_govform_unsupported)
         # 共有ドック（アクティブタブに対して動作）
         self.thumbnails.page_selected.connect(self._goto)
         self.thumbnails.pages_reordered.connect(self._reorder)
@@ -1207,6 +1214,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "入力欄のある PDF です。欄をクリックしてそのまま入力できます"
                 "（リボン「ページ > フォーム入力」でオフ）", 6000)
+            self._check_unsupported_govform(doc)
 
     def activate_and_open(self, path: str) -> None:
         """別インスタンスから渡されたパスを開き、ウィンドウを前面化する。"""
@@ -2038,6 +2046,61 @@ class MainWindow(QMainWindow):
             subprocess.Popen(
                 ["rundll32.exe", "shell32.dll,OpenAs_RunDLL", path], close_fds=True
             )
+
+    # --- 未対応フォーム機能の検知・報告 --------------------------------
+    def _check_unsupported_govform(self, doc) -> None:
+        """開いたフォームに未対応の入力補助があれば、そっと知らせる。
+
+        官公庁フォームは共有 JS ライブラリで作られており、稀にこのアプリが
+        まだ対応していない補助関数を使う。その場合は「選べない/丸がつかない」
+        欄が出るため、ユーザーが気づけるよう通知し、報告用に書き出せるように
+        アクションを有効化する。
+        """
+        self._unsupported_helpers = []
+        try:
+            names = doc.govform_unsupported_helpers()
+        except Exception:  # noqa: BLE001
+            names = []
+        self._unsupported_helpers = names
+        self.act_report_govform.setEnabled(bool(names))
+        if names:
+            self.statusBar().showMessage(
+                f"このフォームには未対応の入力補助が {len(names)} 件あります。"
+                "［ヘルプ > 未対応フォーム機能を報告用に保存］で書き出せます。", 8000)
+
+    def report_govform_unsupported(self) -> None:
+        """未対応ヘルパーの診断テキストを保存する（報告用）。
+
+        ネットワークへは送らない。書き出したファイルをユーザーが開発元へ
+        送ることで対応追加できる、という導線。
+        """
+        if not self.doc.is_open:
+            return
+        names = getattr(self, "_unsupported_helpers", []) or []
+        if not names:
+            QMessageBox.information(
+                self, "未対応フォーム機能の報告",
+                "このフォームに未対応の入力補助は見つかりませんでした。")
+            return
+        base = "TriVReader_未対応フォーム機能.txt"
+        if self.doc.path:
+            base = os.path.splitext(os.path.basename(self.doc.path))[0] + "_未対応機能.txt"
+        out, _ = QFileDialog.getSaveFileName(
+            self, "報告用に保存", os.path.join(self._last_dir(), base),
+            "テキスト (*.txt)")
+        if not out:
+            return
+        try:
+            from .version import APP_VERSION
+            written = self.doc.write_govform_diagnostic(out, app_version=APP_VERSION)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "報告用に保存", f"書き出しに失敗しました:\n{exc}")
+            return
+        QMessageBox.information(
+            self, "報告用に保存",
+            f"未対応の入力補助 {len(written)} 件を書き出しました:\n{out}\n\n"
+            "このファイルを開発元へお送りいただくと、対応追加を検討できます。\n"
+            "（フォーム側の定義のみを含み、入力した値は含まれません）")
 
     def set_as_default_pdf_app(self) -> None:
         """TriV-Reader を .pdf の候補アプリとして登録し、既定アプリ設定を開く。

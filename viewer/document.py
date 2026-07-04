@@ -686,6 +686,41 @@ class PdfDocument:
             self.modified = True
         return changed
 
+    def govform_unsupported_helpers(self) -> list[str]:
+        """このフォームが使う入力補助のうち、まだ未対応のヘルパー名一覧。
+
+        空でなければ「未対応の入力補助あり」＝ユーザーに知らせ、報告用に
+        書き出せるようにする対象。
+        """
+        if not self._doc:
+            return []
+        return govform_js.unsupported_helpers(self._doc, self.doc_scripts())
+
+    def write_govform_diagnostic(self, out_path: str,
+                                 app_version: str = "") -> list[str]:
+        """未対応ヘルパーの報告用テキストを out_path に書き出す。
+
+        書き出した未対応ヘルパー名一覧を返す（空なら何も書かない）。
+        含めるのはフォーム側のスクリプト定義のみで、ユーザー入力値は含めない。
+        """
+        if not self._doc:
+            return []
+        names = self.govform_unsupported_helpers()
+        if not names:
+            return []
+        import fitz as _fitz
+        header = {
+            "ファイル名": os.path.basename(self.path) if self.path else "(不明)",
+            "ページ数": self.page_count,
+            "アプリ版": app_version or "(不明)",
+            "PyMuPDF": getattr(_fitz, "__version__", "(不明)"),
+        }
+        text = govform_js.build_diagnostic(
+            self._doc, self.doc_scripts(), names, header)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return names
+
     @staticmethod
     def _fit_text_fontsize(w) -> None:
         """1行テキスト欄の文字サイズを枠の幅にも収める（Adobe の自動縮小相当）。

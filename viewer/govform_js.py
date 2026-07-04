@@ -138,6 +138,124 @@ def _find_function_source(combined: str, name: str) -> str | None:
     return None  # 対応する閉じ括弧が見つからない（壊れた/想定外の構造）
 
 
+# 「入力補助」を担うアクション種別。ここに絞ることで、ツールチップ(Focus)や
+# 入力チェック(Blur)は「未対応」として拾わない（それらは方針として対象外で、
+# 報告対象にしても実装しないため）。クリックとコンボ選択のみを見る。
+_INTERACTION_ACTION_KEYS = ("A", "AA/K")
+
+# フィールドの表示か値を変える＝「操作結果に効く」ヘルパーの目印。
+_STATE_CHANGE_RE = re.compile(r"\.(?:display|value)\s*=(?!=)")
+_CALL_RE = re.compile(r"([A-Za-z_]\w*)\s*\(")
+
+# 「見たことはあるが、方針として対応しない」共有ヘルパー（装飾＝ツールチップ、
+# 検証＝赤枠/必須、書式整形、日付範囲制約）。未対応検知ではこれらを除外し、
+# “本当に未知の入力補助”だけをユーザーに知らせる。ここに無い新種ヘルパーが
+# クリック/コンボから呼ばれていたら、それが報告対象になる。
+KNOWN_UNSUPPORTED_HELPERS = frozenset({
+    "ShowToolTip", "HideToolTip",                       # 装飾（ツールチップ）
+    "AlertError", "AlertError2", "AlertSuccess", "AlertSuccess2",  # 検証の通知
+    "SetRedBorder", "SetEnable",                        # 検証（赤枠・活性制御）
+    "SetDateComb",                                      # 日付の範囲制約
+    "FormatYearMonthDay", "FormatSingleByteNumber",     # 書式整形
+})
+
+
+def _widget_action_entries(doc: "fitz.Document") -> set[str]:
+    """全ウィジェットのクリック/コンボ選択アクションが呼ぶ入口関数名を集める。"""
+    entries: set[str] = set()
+    try:
+        for pno in range(doc.page_count):
+            for w in (doc.load_page(pno).widgets() or []):
+                for key in _INTERACTION_ACTION_KEYS:
+                    try:
+                        js = doc.xref_get_key(w.xref, key + "/JS")
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if js and js[0] == "string":
+                        m = SIMPLE_CALL_RE.match(js[1].strip())
+                        if m:
+                            entries.add(m.group(1))
+    except Exception:  # noqa: BLE001
+        return set()
+    return entries
+
+
+def unsupported_helpers(doc: "fitz.Document",
+                        doc_scripts: dict[str, str]) -> list[str]:
+    """クリック/コンボ選択から到達する「表示/値を変えるヘルパー」のうち、
+    まだ対応（ALLOWED_HELPERS）していないものの名前一覧を返す。
+
+    これが空でなければ「このフォームには未対応の入力補助がある」＝
+    ユーザーに知らせ、報告用に書き出せるようにする対象。
+    """
+    if not doc_scripts:
+        return []
+    combined = "\n".join(doc_scripts.values())
+    fns = _all_function_bodies(combined)
+    entries = _widget_action_entries(doc)
+
+    # 入口から推移的に呼ぶ関数名を辿る（3段まで＝実フォームには十分）
+    reached = set(entries)
+    for _ in range(3):
+        new = set()
+        for n in list(reached):
+            if n in fns:
+                new |= set(_CALL_RE.findall(fns[n]))
+        reached |= new
+
+    unsupported = set()
+    for name in reached:
+        if name in ALLOWED_HELPERS:
+            continue                 # 対応済み
+        if name in KNOWN_UNSUPPORTED_HELPERS:
+            continue                 # 方針として対象外（既知）
+        if name in entries:
+            continue                 # ウィジェット直結の入口ラッパー（実行はする）
+        body = fns.get(name)
+        if body and _STATE_CHANGE_RE.search(body):
+            unsupported.add(name)    # 未知の“操作結果に効く”ヘルパー＝報告対象
+    return sorted(unsupported)
+
+
+def _all_function_bodies(combined: str) -> dict[str, str]:
+    """combined 中の全 `function name(...){...}` を名前→本体で返す。"""
+    out: dict[str, str] = {}
+    for m in re.finditer(r"function\s+([A-Za-z0-9_]+)\s*\([^)]*\)\s*\{", combined):
+        name = m.group(1)
+        brace = combined.find("{", m.start())
+        depth = 0
+        for i in range(brace, len(combined)):
+            if combined[i] == "{":
+                depth += 1
+            elif combined[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    out[name] = combined[m.start():i + 1]
+                    break
+    return out
+
+
+def build_diagnostic(doc: "fitz.Document", doc_scripts: dict[str, str],
+                     helper_names: list[str], header: dict) -> str:
+    """未対応ヘルパーの実装に必要な情報をまとめた報告用テキストを作る。
+
+    含めるのはフォーム由来のスクリプト定義（テンプレート側のコード）のみで、
+    ユーザーが入力した値は含めない。
+    """
+    fns = _all_function_bodies("\n".join(doc_scripts.values()))
+    lines = ["# TriV-Reader 未対応フォーム機能レポート", ""]
+    for k, v in header.items():
+        lines.append(f"{k}: {v}")
+    lines.append("")
+    lines.append(f"未対応ヘルパー ({len(helper_names)}件): " + ", ".join(helper_names))
+    lines.append("")
+    lines.append("---- 該当関数のソース（フォーム定義。入力値は含みません） ----")
+    for name in helper_names:
+        lines.append(f"\n// ===== {name} =====")
+        lines.append(fns.get(name, "// (ソースが見つかりませんでした)"))
+    return "\n".join(lines)
+
+
 class FieldBridge:
     """JS の getField() が返すオブジェクトの元になる、ウィジェット1個分のスナップショット。
 
