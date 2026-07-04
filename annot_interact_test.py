@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QApplication
 from viewer import theme
 from viewer.document import PdfDocument
 from viewer.page_view import (PageView, TOOL_LINE, TOOL_NONE, TOOL_RECT,
-                              TOOL_TEXT, _TextAnnotEditor)
+                              TOOL_STAMP, TOOL_TEXT, _TextAnnotEditor)
 
 
 def main() -> int:
@@ -201,6 +201,26 @@ def main() -> int:
     check("pasted copy is selected", pv._sel_xref is not None and pv._sel_xref != src_xref)
     pv.undo_annot()
     check("undo removes the pasted copy", count_annots() == n0)
+
+    # --- stamp: pick a preset, click to place a boxed FreeText ---
+    from PySide6.QtGui import QColor as _QC3
+    pv.set_stamp("承認", _QC3(210, 30, 30), 22)
+    check("set_stamp switches to the stamp tool", pv.tool == TOOL_STAMP)
+    n0 = count_annots()
+    click = QPoint(200, 380)
+    app.sendEvent(lbl, QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPointF(click), QPointF(lbl.mapToGlobal(click)),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    app.processEvents()
+    check("clicking places a stamp annotation", count_annots() == n0 + 1)
+    st = None
+    for a in doc._doc.load_page(0).annots():
+        if a.type[1] == "FreeText" and a.info.get("content") == "承認":
+            st = a
+    check("stamp is a FreeText holding the label", st is not None)
+    pv.undo_annot()
+    check("undo removes the stamp", count_annots() == n0)
 
     # --- round-trip persistence ---
     out = os.path.join(tmp, "_annot_restyled.pdf")

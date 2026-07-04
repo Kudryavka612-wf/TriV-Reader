@@ -288,6 +288,27 @@ class PdfDocument:
         annot.update()
         self.modified = True
 
+    def add_stamp(self, index, point, text, color=(0.85, 0.1, 0.1),
+                  fontsize=20) -> int:
+        """枠付きテキストスタンプ（承認・済・日付など）を point に置く。
+
+        文字幅からボックスサイズを見積もり、中央寄せの枠付き FreeText にする。
+        枠の色は文字色に一致する（PyMuPDF の border_width 指定の挙動）。
+        """
+        self._push_undo(index)
+        page = self._doc.load_page(index)
+        tw = fitz.get_text_length(text or " ", fontname="japan", fontsize=fontsize)
+        w = max(28.0, tw + fontsize * 0.9)
+        h = fontsize + fontsize * 0.7
+        x, y = float(point.x), float(point.y)
+        rect = fitz.Rect(x, y, x + w, y + h)
+        annot = page.add_freetext_annot(
+            rect, text, fontsize=fontsize, text_color=color,
+            border_width=2, align=1)  # align=1: 中央寄せ
+        annot.update()
+        self.modified = True
+        return annot.xref
+
     # --- 追加の注釈種類（下線・取消線・直線・矢印・円） ---------------
     def add_underline(self, index, p0, p1, color=(0.1, 0.3, 0.9)) -> bool:
         """p0→p1 の文字に下線を引く（文字が無ければ False）。"""

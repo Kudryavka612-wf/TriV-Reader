@@ -459,6 +459,26 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.text_size_spin)
         tb.addSeparator()
 
+        # スタンプ（承認・済・日付など。選ぶとクリックした位置に置く）
+        from PySide6.QtWidgets import QMenu, QToolButton
+        R, G, B = (0.85, 0.12, 0.12), (0.10, 0.55, 0.15), (0.12, 0.30, 0.78)
+        self._stamp_presets = [
+            ("承認", R), ("確認", R), ("済", G), ("重要", R),
+            ("㊙", R), ("✓", G), ("日付", B),
+        ]
+        self.stamp_btn = QToolButton()
+        self.stamp_btn.setText("スタンプ ▾")
+        self.stamp_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.stamp_btn.setToolTip("スタンプを選んで、ページ上のクリックした位置に配置")
+        stamp_menu = QMenu(self.stamp_btn)
+        for label, rgb in self._stamp_presets:
+            act = stamp_menu.addAction(label)
+            act.triggered.connect(
+                lambda checked=False, t=label, c=rgb: self._place_stamp(t, c))
+        self.stamp_btn.setMenu(stamp_menu)
+        tb.addWidget(self.stamp_btn)
+        tb.addSeparator()
+
         self.act_apply_redact = QAction("墨消しを適用", self)
         tb.addAction(self.act_apply_redact)
         self.act_clear_annots = QAction("このページの注釈を全消去", self)
@@ -758,6 +778,8 @@ class MainWindow(QMainWindow):
         g.add_widget(self.opacity_spin)
         g.add_label(" 文字サイズ ")
         g.add_widget(self.text_size_spin)
+        g = r.add_group(p, "スタンプ")
+        g.add_widget(self.stamp_btn)
         g = r.add_group(p, "編集")
         g.add_stack([self.act_undo, self.act_redo])
         g.add_stack([self.act_copy, self.act_paste])
@@ -1524,6 +1546,18 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{n} 件の注釈を消去しました", 3000)
         else:
             self.statusBar().showMessage("このページに注釈はありません", 3000)
+
+    def _place_stamp(self, label: str, rgb) -> None:
+        """スタンプ配置モードに入る。日付は今日の日付を文字にする。"""
+        from datetime import date
+        if label == "日付":
+            text = date.today().strftime("%Y/%m/%d")
+        else:
+            text = label
+        color = QColor(int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255))
+        self.page_view.set_stamp(text, color)
+        self.statusBar().showMessage(
+            f"スタンプ「{text}」：ページ上のクリックした位置に配置します", 0)
 
     def _undo_annot(self) -> None:
         if self.doc.is_open:

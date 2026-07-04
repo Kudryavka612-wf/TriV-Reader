@@ -322,6 +322,7 @@ TOOL_ARROW = "arrow"
 TOOL_CIRCLE = "circle"
 TOOL_REDACT = "redact"
 TOOL_CROP = "crop"
+TOOL_STAMP = "stamp"    # クリックで枠付きテキストスタンプを置く
 
 # ドラッグ矩形系（始点・終点で矩形を作る）
 _RECT_TOOLS = {TOOL_HIGHLIGHT, TOOL_RECT, TOOL_TEXT, TOOL_CIRCLE, TOOL_REDACT, TOOL_CROP}
@@ -425,7 +426,7 @@ class _PageLabel(QLabel):
                 self._start = pos
                 self._view.clear_text_selection()
             return
-        if tool in (TOOL_NOTE, TOOL_ERASE):
+        if tool in (TOOL_NOTE, TOOL_ERASE, TOOL_STAMP):
             self._view.commit_point(self._index, tool, pos)
             return
         self._drawing = True
@@ -712,6 +713,7 @@ class PageView(QScrollArea):
         self.text_size = 14          # テキスト注釈の文字サイズ(pt)
         self._text_editor = None     # その場入力中の _TextAnnotEditor（1個だけ）
         self._text_ctx = None        # (page_index, pdf_rect)
+        self.pending_stamp = None    # 配置待ちスタンプ {text, color(QColor), fontsize}
         self._sel_index = -1
         self._sel_xref = None
         # 検索
@@ -804,6 +806,11 @@ class PageView(QScrollArea):
         self.text_size = max(6, int(size))
         if self._text_editor is not None:
             self._apply_text_editor_style()
+
+    def set_stamp(self, text: str, qcolor: QColor, fontsize: int = 22) -> None:
+        """スタンプ配置モードにする。以後クリックした位置に text を置く。"""
+        self.pending_stamp = {"text": text, "color": qcolor, "fontsize": fontsize}
+        self.set_tool(TOOL_STAMP)
 
     def set_pen_width(self, width: int) -> None:
         self.pen_width = max(1, int(width))
@@ -977,6 +984,13 @@ class PageView(QScrollArea):
         elif tool == TOOL_ERASE:
             if self._doc.delete_annot_at(index, pt):
                 self._after_annot(index)
+        elif tool == TOOL_STAMP and self.pending_stamp:
+            s = self.pending_stamp
+            c = s["color"]
+            self._doc.add_stamp(index, pt, s["text"],
+                                color=(c.redF(), c.greenF(), c.blueF()),
+                                fontsize=s["fontsize"])
+            self._after_annot(index)
 
     def _after_annot(self, index: int) -> None:
         self._rendered.discard(index)
