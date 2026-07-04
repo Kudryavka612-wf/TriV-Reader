@@ -1050,6 +1050,21 @@ class PdfDocument:
     def set_annot_text(self, index, xref, text):
         return self._edit_annot(index, xref, text=text)
 
+    def describe_annot(self, index, xref):
+        """注釈の内容を dict で取り出す（コピー用）。無ければ None。"""
+        page = self._doc.load_page(index)
+        annot = self._find_on(page, xref)
+        return self._describe(annot) if annot else None
+
+    def paste_annot(self, index, desc, dx=12.0, dy=12.0):
+        """describe_annot で取った内容を、少しずらして新しい注釈として貼り付ける。
+        新しい xref を返す。"""
+        if not desc or not self._doc:
+            return None
+        self._push_undo(index)
+        page = self._doc.load_page(index)
+        return self._recreate(page, desc, dx=dx, dy=dy)
+
     def delete_annot_at(self, index, point) -> bool:
         """指定 PDF 座標を含む最前面の注釈を1つ削除する。"""
         page = self._doc.load_page(index)

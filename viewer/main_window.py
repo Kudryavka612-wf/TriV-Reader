@@ -340,9 +340,14 @@ class MainWindow(QMainWindow):
         self.act_dark.setCheckable(True)
         self.act_compact = QAction("コンパクト表示（アイコンのみ）", self)
         self.act_compact.setCheckable(True)
-        self.act_copy = QAction("選択テキストをコピー", self)
+        self.act_copy = QAction("コピー", self)
         self.act_copy.setShortcut(QKeySequence.StandardKey.Copy)
+        self.act_copy.setToolTip("選択したテキスト、または選択した注釈をコピー (Ctrl+C)")
         self.act_copy.setEnabled(False)
+        self.act_paste = QAction("注釈を貼り付け", self)
+        self.act_paste.setShortcut(QKeySequence.StandardKey.Paste)
+        self.act_paste.setToolTip("コピーした注釈をこのページに貼り付け (Ctrl+V)")
+        self._annot_clip = None  # コピーした注釈の内容（dict）
         self.addAction(self.act_copy)  # ショートカットを有効化
 
     def _build_annotation_toolbar(self) -> None:
@@ -755,7 +760,8 @@ class MainWindow(QMainWindow):
         g.add_widget(self.text_size_spin)
         g = r.add_group(p, "編集")
         g.add_stack([self.act_undo, self.act_redo])
-        g.add_stack([self.act_apply_redact, self.act_clear_annots, self.act_copy])
+        g.add_stack([self.act_copy, self.act_paste])
+        g.add_stack([self.act_apply_redact, self.act_clear_annots])
         r.end_page(p)
 
         # ── ページ ──────────────────────────────────────────────
@@ -1075,7 +1081,9 @@ class MainWindow(QMainWindow):
         self.act_unlock.triggered.connect(self.unlock_save)
         self.act_dark.toggled.connect(self._toggle_dark)
         self.act_compact.toggled.connect(self._set_compact)
-        self.act_copy.triggered.connect(self._copy_text)
+        self.act_copy.triggered.connect(self._copy)
+        self.act_paste.triggered.connect(self._paste_annot)
+        self.act_paste.setEnabled(False)
         # 墨消し適用・ページ操作・透かし・メタ・抽出
         self.act_apply_redact.triggered.connect(self._apply_redactions)
         self.act_blank_page.triggered.connect(self._insert_blank_page)
@@ -1458,13 +1466,52 @@ class MainWindow(QMainWindow):
         self._refresh_fill_icon()
 
     def _on_selection_changed(self, has: bool) -> None:
+        self._refresh_copy_enabled()
         if has:
             self.statusBar().showMessage(
                 "注釈を選択中：ドラッグで移動 / ダブルクリックで本文編集 / "
-                "色ボタンで色変更 / Delete で削除", 0
+                "太さ・線種・色・不透明度・塗りで書式変更 / Ctrl+C コピー / "
+                "Delete で削除", 0
             )
         else:
             self.statusBar().clearMessage()
+
+    def _refresh_copy_enabled(self) -> None:
+        pv = self.page_view
+        self.act_copy.setEnabled(pv.has_selection() or pv.has_text_selection())
+
+    @staticmethod
+    def _focused_text_widget():
+        """入力欄（テキスト系）にフォーカスがあればそれを返す（Ctrl+C/V の振り分け用）。"""
+        from PySide6.QtWidgets import (QLineEdit, QPlainTextEdit, QTextEdit)
+        fw = QApplication.focusWidget()
+        return fw if isinstance(fw, (QLineEdit, QPlainTextEdit, QTextEdit)) else None
+
+    def _copy(self) -> None:
+        """入力欄フォーカス中はその選択文字を、注釈選択中はその注釈を、
+        いずれでもなければ選択テキストをコピー。"""
+        tw = self._focused_text_widget()
+        if tw is not None:
+            tw.copy()
+            return
+        desc = self.page_view.selected_annot_desc()
+        if desc is not None:
+            self._annot_clip = desc
+            self.act_paste.setEnabled(True)
+            self.statusBar().showMessage(
+                "注釈をコピーしました（Ctrl+V で貼り付け）", 2500)
+        else:
+            self._copy_text()
+
+    def _paste_annot(self) -> None:
+        # 入力欄で編集中なら通常のテキスト貼り付けにする（注釈は貼らない）。
+        tw = self._focused_text_widget()
+        if tw is not None:
+            tw.paste()
+            return
+        if self._annot_clip is not None and self.doc.is_open:
+            if self.page_view.paste_annot(self._annot_clip):
+                self.statusBar().showMessage("注釈を貼り付けました", 2000)
 
     def _clear_annots(self) -> None:
         if not self.doc.is_open:
@@ -1758,7 +1805,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("選択テキストをコピーしました", 2000)
 
     def _on_text_selection_changed(self, has: bool) -> None:
-        self.act_copy.setEnabled(has)
+        self._refresh_copy_enabled()
         if has:
             self.statusBar().showMessage(
                 "テキスト選択中：Ctrl+C または右クリック→コピー", 0

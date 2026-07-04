@@ -183,6 +183,25 @@ def main() -> int:
     check("FreeText keeps blue text colour through edit",
           tc1[2] > 0.5 and tc1[0] < 0.3, f"({tc1})")
 
+    # --- copy / paste an annotation ---
+    pv.set_tool(TOOL_RECT)
+    pv.set_pen_width(7)
+    pv.set_fill_enabled(False)
+    drag(QPoint(150, 250), QPoint(230, 300))
+    src_xref = last()["xref"]
+    pv.set_tool(TOOL_NONE)
+    pv.set_selection(0, src_xref)
+    desc = pv.selected_annot_desc()
+    check("can copy selected annotation", desc is not None)
+    n0 = count_annots()
+    ok_paste = pv.paste_annot(desc)
+    check("paste creates a new annotation", ok_paste and count_annots() == n0 + 1)
+    # pasted copy keeps the width (7) and is offset (new xref selected)
+    check("pasted copy keeps width 7", last().get("w") == 7.0, str(last()))
+    check("pasted copy is selected", pv._sel_xref is not None and pv._sel_xref != src_xref)
+    pv.undo_annot()
+    check("undo removes the pasted copy", count_annots() == n0)
+
     # --- round-trip persistence ---
     out = os.path.join(tmp, "_annot_restyled.pdf")
     doc.save_as(out)
