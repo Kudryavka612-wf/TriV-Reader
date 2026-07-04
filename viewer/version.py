@@ -18,7 +18,7 @@ UPDATE_MANIFEST_URL = ""
 # その URL をここに設定したときだけ、同意したユーザーから匿名レポート
 # （未対応の関数名＋フォーム側定義＋アプリ/ライブラリ版＋フォーム指紋）が
 # 送られる。利用者の入力値・氏名・ファイル名などの個人情報は送らない。
-TELEMETRY_URL = ""
+TELEMETRY_URL = "https://script.google.com/macros/s/AKfycbyIbgNNsIu6IhZxkGUuYekSTt3cQm_fyXzgP3OPURcmrolx8ztMGFdgaCRNzKvcQ5f9/exec"
 
 
 def github_manifest_url() -> str:
