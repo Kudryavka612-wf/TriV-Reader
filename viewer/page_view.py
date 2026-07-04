@@ -1066,23 +1066,52 @@ class PageView(QScrollArea):
         if not self._form_mode or not self._doc or not self._doc.is_open:
             return
         for index in range(min(self._doc.page_count, len(self._labels))):
-            label = self._labels[index]
-            try:
-                fields = self._doc.page_fields(index)
-            except Exception:  # noqa: BLE001
-                fields = []
-            for field in fields:
-                # 画面に出ない欄（PDF の Hidden=1 / 印刷のみ=3）は編集オーバー
-                # レイを作らない。官公庁フォームの相棒 _PRINT 欄（印刷のみ）や
-                # 選択ペアの隠れている側がこれに当たり、重なりや誤入力を防ぐ。
-                # ただしコンボ/リストは「選択できる部品を消さない」ため常に描く
-                # （都道府県コンボのように稀に Hidden 指定でも操作が要る欄がある）。
-                if (int(field.get("display", 0)) in (1, 3)
-                        and field.get("kind") not in ("combo", "list")):
-                    continue
-                ctl = self._make_form_control(index, field, label)
-                if ctl is not None:
-                    self._form_overlays.append(ctl)
+            self._build_page_overlays(index)
+
+    def _rebuild_page_overlays(self, index: int) -> None:
+        """1ページ分の overlay だけを作り直す。
+
+        全ページ再構築（このフォームで約270個・~0.5秒）の代わりに使う。
+        govform のコンボ連動（枝ラベル表示切替・_PRINT 転写）など「その
+        ページ内でしか見た目が変わらない」操作の後始末に用いる。
+        """
+        if not self._form_mode or not self._doc or not self._doc.is_open:
+            return
+        if not (0 <= index < len(self._labels)):
+            return
+        label = self._labels[index]
+        kept = []
+        for w in self._form_overlays:
+            if w.parent() is label:
+                w.setParent(None)
+                w.deleteLater()
+            else:
+                kept.append(w)
+        self._form_overlays = kept
+        self._build_page_overlays(index)
+
+    def _build_page_overlays(self, index: int) -> None:
+        """指定ページの overlay を作って self._form_overlays に足す。
+
+        （このページの既存 overlay の掃除は呼び出し側の責務。）
+        """
+        label = self._labels[index]
+        try:
+            fields = self._doc.page_fields(index)
+        except Exception:  # noqa: BLE001
+            fields = []
+        for field in fields:
+            # 画面に出ない欄（PDF の Hidden=1 / 印刷のみ=3）は編集オーバー
+            # レイを作らない。官公庁フォームの相棒 _PRINT 欄（印刷のみ）や
+            # 選択ペアの隠れている側がこれに当たり、重なりや誤入力を防ぐ。
+            # ただしコンボ/リストは「選択できる部品を消さない」ため常に描く
+            # （都道府県コンボのように稀に Hidden 指定でも操作が要る欄がある）。
+            if (int(field.get("display", 0)) in (1, 3)
+                    and field.get("kind") not in ("combo", "list")):
+                continue
+            ctl = self._make_form_control(index, field, label)
+            if ctl is not None:
+                self._form_overlays.append(ctl)
 
     def _make_form_control(self, index, field, label):
         x0, y0, x1, y1 = self._doc.pdf_rect_to_label(index, field["rect"], self._zoom)
@@ -1097,8 +1126,11 @@ class PageView(QScrollArea):
             # 想定外のスクリプト形）の場合は下の通常の text 分岐にフォール
             # バックする（file 冒頭の分岐コメント参照）。
             ctl = _GovFormClickOverlay(label)
+            # xref ではなく矩形で束ねる。クリック時に「その矩形で今表示中の
+            # 対象」を引き直すので、選択/解除で overlay を作り直さずに済む。
             ctl.clicked.connect(
-                lambda checked=False, i=index, x=xref: self._click_govform(i, x))
+                lambda checked=False, i=index, r=field["rect"]:
+                self._click_govform_cell(i, r))
         elif kind == "checkbox":
             ctl = QCheckBox(label)
             checked = str(value) not in ("", "Off", "/Off", "No", "false", "False", "0")
@@ -1204,8 +1236,9 @@ class PageView(QScrollArea):
         if committed or js_changed:
             self.form_changed.emit()
         if js_changed:
-            # 枝ラベルの表示切替や _PRINT の値が変わり得るので描画を作り直す
-            self._build_form_overlays()
+            # 枝ラベルの表示切替や _PRINT の値が変わり得るので、そのページの
+            # overlay だけ作り直して再描画する（全ページ再構築の ~0.5 秒を避ける）。
+            self._rebuild_page_overlays(index)
             self._after_annot(index)
 
     def _is_govform_click_field(self, field) -> bool:
@@ -1221,23 +1254,28 @@ class PageView(QScrollArea):
         script = (field.get("script") or "").strip()
         return bool(script) and bool(SIMPLE_CALL_RE.match(script))
 
-    def _click_govform(self, index: int, xref: int) -> None:
-        """官公庁フォームの選択ウィジェットをクリックしたときの処理。
+    def _click_govform_cell(self, index: int, pdf_rect) -> None:
+        """官公庁フォームの「〇で選択」セルをクリックしたときの処理。
 
-        表示状態（Hidden フラグ）が変わり、同じページの他ウィジェット
-        （ペア相手など）も見え方が変わり得るため、フォームオーバーレイ
-        一式を作り直す（_after_annot 等と同じ「変更後に作り直す」方針）。
+        _01（選択）と _OFF（非選択）は同じ矩形を共有し、常にどちらか一方だけ
+        表示される。矩形に紐づく「その時点で表示中のクリック対象」を毎回引き
+        直して実行するので、select / deselect のどちらも overlay を再バインド
+        せずに正しく動く。
+
+        重要（体感速度）: ここで overlay 一式を作り直すと 4 ページ分＝約 270 個の
+        ウィジェットが毎クリック再生成され、1 クリックごとに ~0.5 秒フリーズして
+        「選択がうまく効かない」体感になる。セルの集合はクリックで変わらない
+        （各セルは常に1つだけ表示ウィジェットを持つ）ため、overlay は作り直さず
+        ページ再描画だけ行う（Adobe 同等の即応）。
         """
-        if not self._doc:
+        if not self._doc or not self._doc.is_govform_js_eligible():
             return
-        if not self._doc.is_govform_js_eligible():
+        xref = self._doc.govform_click_target_at(index, pdf_rect)
+        if xref is None:
             return
         if self._doc.click_govform_widget(index, xref):
             self.form_changed.emit()
-            # 同じページ内の別ウィジェット（ペア相手や他の選択肢）も表示が
-            # 変わり得るため、オーバーレイ一式を作り直す。
-            self._build_form_overlays()
-            self._after_annot(index)
+            self._after_annot(index)  # 再描画のみ（overlay は据え置き）
 
     # --- 構築・レイアウト ----------------------------------------------
     def _rebuild(self, fit: bool, target: int) -> None:

@@ -633,6 +633,37 @@ class PdfDocument:
         この文書自身が定義しているか（= 対応スコープ内のフォームか）。"""
         return govform_js.is_eligible(self.doc_scripts())
 
+    def govform_click_target_at(self, index: int, rect):
+        """rect とほぼ一致し、現在表示中(display 0/2)で govform クリック
+        スクリプトを持つウィジェットの xref を返す（無ければ None）。
+
+        「〇で選択」の _01(選択) と _OFF(非選択) は同じ矩形を共有し、常に
+        どちらか一方だけが表示される。UI 側はクリックのたびにこれを呼び、
+        「今クリックすべき可視側」を引き直す。こうすることで選択/解除の
+        どちらでも overlay を作り直さずに正しい対象を実行できる。
+        """
+        if not self._doc:
+            return None
+        try:
+            target = fitz.Rect(rect)
+            fallback = None
+            for w in (self._doc.load_page(index).widgets() or []):
+                if int(getattr(w, "field_display", 0) or 0) in (1, 3):
+                    continue  # 非表示（Hidden/印刷のみ）は対象外
+                script = (getattr(w, "script", None) or "").strip()
+                if not (script and govform_js.SIMPLE_CALL_RE.match(script)):
+                    continue
+                wr = w.rect
+                if (abs(wr.x0 - target.x0) < 1.0 and abs(wr.y0 - target.y0) < 1.0
+                        and abs(wr.x1 - target.x1) < 1.0
+                        and abs(wr.y1 - target.y1) < 1.0):
+                    return w.xref               # 矩形一致（本命）
+                if fallback is None and wr.intersects(target):
+                    fallback = w.xref           # 念のための保険
+            return fallback
+        except Exception:  # noqa: BLE001
+            return None
+
     def click_govform_widget(self, index: int, xref: int) -> bool:
         """官公庁フォームの選択ウィジェットをクリックした効果を再現する。
 
