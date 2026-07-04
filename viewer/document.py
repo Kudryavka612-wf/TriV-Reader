@@ -46,12 +46,17 @@ _UNSET = object()
 class PdfDocument:
     """PyMuPDF の Document を薄くラップしたクラス。"""
 
+    _UNDO_MAX = 60
+
     def __init__(self) -> None:
         self._doc: fitz.Document | None = None
         self.path: str | None = None
         self.modified: bool = False
         self._authenticated: bool = True
         self._doc_scripts_cache: dict[str, str] | None = None
+        # 注釈の Undo/Redo（ページ単位のスナップショット）
+        self._undo: list = []   # [(page_index, [desc,...]), ...] 変更前の状態
+        self._redo: list = []
 
     # --- ライフサイクル -------------------------------------------------
     def open(self, path: str, password: str | None = None) -> None:
@@ -65,6 +70,8 @@ class PdfDocument:
         self.modified = False
         self._authenticated = not self._doc.needs_pass
         self._doc_scripts_cache = None
+        self._undo.clear()   # 別ファイルを開いたら注釈 Undo 履歴は無効
+        self._redo.clear()
         # 保持する doc には「正しいパスワードでのみ」authenticate する。
         # 誤パスワードの照合は check_password（使い捨て）で行うこと。
         if self._doc.needs_pass and password:
@@ -192,6 +199,7 @@ class PdfDocument:
         return r
 
     def add_highlight(self, index, rect, color=(1.0, 0.86, 0.18), opacity=1.0) -> None:
+        self._push_undo(index)
         page = self._doc.load_page(index)
         annot = page.add_highlight_annot(rect)
         annot.set_colors(stroke=color)
@@ -228,6 +236,7 @@ class PdfDocument:
         quads = [fitz.Rect(w[:4]).quad for w in ordered[i0:i1 + 1]]
         if not quads:
             return False
+        self._push_undo(index)
         annot = page.add_highlight_annot(quads)
         annot.set_colors(stroke=color)
         annot.update()
@@ -236,6 +245,7 @@ class PdfDocument:
 
     def add_rect(self, index, rect, color=(0.9, 0.1, 0.1), width=1.5,
                  fill=None, dashes=None, opacity=1.0) -> None:
+        self._push_undo(index)
         page = self._doc.load_page(index)
         annot = page.add_rect_annot(rect)
         annot.set_colors(stroke=color, fill=fill)
@@ -247,6 +257,7 @@ class PdfDocument:
 
     def add_ink(self, index, strokes, color=(0.9, 0.1, 0.1), width=2.0, opacity=1.0) -> None:
         """strokes: PDF 座標の点列のリスト（[[Point or (x,y), ...], ...]）。"""
+        self._push_undo(index)
         page = self._doc.load_page(index)
         # add_ink_annot は「float ペアの列の列」を要求するため変換する
         norm = [[(float(p.x), float(p.y)) if hasattr(p, "x") else (float(p[0]), float(p[1]))
@@ -261,6 +272,7 @@ class PdfDocument:
 
     def add_freetext(self, index, rect, text, color=(0.0, 0.0, 0.0),
                      fontsize=12, fontname="helv") -> None:
+        self._push_undo(index)
         page = self._doc.load_page(index)
         annot = page.add_freetext_annot(
             rect, text, fontsize=fontsize, fontname=fontname, text_color=color
@@ -270,6 +282,7 @@ class PdfDocument:
 
     def add_text_note(self, index, point, text, icon="Note") -> None:
         """付箋（テキスト注釈）。point は PDF 座標。"""
+        self._push_undo(index)
         page = self._doc.load_page(index)
         annot = page.add_text_annot(point, text, icon=icon)
         annot.update()
@@ -288,6 +301,7 @@ class PdfDocument:
         _text, rects = self.select_text(index, p0, p1)
         if not rects:
             return False
+        self._push_undo(index)
         page = self._doc.load_page(index)
         quads = [r.quad for r in rects]
         if kind == "underline":
@@ -308,6 +322,7 @@ class PdfDocument:
         arrow=True は後方互換のショートカットで、end が未指定（"none"）の
         場合に限り end="closed_arrow" として扱う。
         """
+        self._push_undo(index)
         page = self._doc.load_page(index)
         annot = page.add_line_annot(p0, p1)
         annot.set_colors(stroke=color)
@@ -325,6 +340,7 @@ class PdfDocument:
     def add_circle(self, index, rect, color=(0.9, 0.1, 0.1), width=2.0,
                     fill=None, dashes=None, opacity=1.0) -> None:
         """楕円/円の注釈。"""
+        self._push_undo(index)
         page = self._doc.load_page(index)
         annot = page.add_circle_annot(rect)
         annot.set_colors(stroke=color, fill=fill)
@@ -845,7 +861,7 @@ class PdfDocument:
     def _describe(self, annot) -> dict:
         colors = annot.colors or {}
         border = annot.border or {}
-        return {
+        desc = {
             "kind": annot.type[1],
             "rect": fitz.Rect(annot.rect),
             "vertices": annot.vertices,
@@ -857,6 +873,33 @@ class PdfDocument:
             "opacity": annot.opacity,
             "content": annot.info.get("content", ""),
         }
+        if desc["kind"] == "FreeText":
+            # 文字サイズと文字色は /DA に入る（annot.colors の stroke は枠線色で
+            # あって本文色ではない）。ここで拾わないと移動/リサイズ/Undo で
+            # サイズも色も失われる。
+            desc["fontsize"], desc["text_color"] = self._parse_freetext_da(annot)
+        return desc
+
+    def _parse_freetext_da(self, annot):
+        """FreeText の /DA 文字列からフォントサイズと本文色を取り出す。"""
+        fs, tc = 12.0, (0.0, 0.0, 0.0)
+        try:
+            da = self._doc.xref_get_key(annot.xref, "DA")
+            s = da[1] if da and da[0] == "string" else ""
+            m = re.search(r"([\d.]+)\s+Tf", s)
+            if m:
+                fs = float(m.group(1))
+            m = re.search(r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+rg", s)
+            if m:
+                tc = tuple(float(m.group(i)) for i in (1, 2, 3))
+            else:
+                m = re.search(r"([\d.]+)\s+g\b", s)  # グレースケール
+                if m:
+                    v = float(m.group(1))
+                    tc = (v, v, v)
+        except Exception:  # noqa: BLE001
+            pass
+        return fs, tc
 
     def _recreate(self, page, desc, dx=0.0, dy=0.0, color=None, width=None,
                   text=None, new_rect=None, dashes=_UNSET, opacity=_UNSET,
@@ -895,7 +938,10 @@ class PdfDocument:
             annot.set_colors(stroke=stroke, fill=fill)
             annot.set_border(width=w, dashes=dashes)
         elif kind == "FreeText":
-            annot = page.add_freetext_annot(target, content, fontsize=12, text_color=stroke)
+            fs = desc.get("fontsize", 12) or 12
+            tc = color if color is not None else desc.get("text_color", stroke)
+            annot = page.add_freetext_annot(target, content, fontsize=fs,
+                                            text_color=tc)
         elif kind == "Text":
             annot = page.add_text_annot(fitz.Point(target.x0, target.y0), content)
         elif kind == "Ink":
@@ -964,6 +1010,7 @@ class PdfDocument:
         annot = self._find_on(page, xref)
         if not annot:
             return None
+        self._push_undo(index)
         desc = self._describe(annot)
         page.delete_annot(annot)
         return self._recreate(page, desc, **kwargs)
@@ -974,6 +1021,7 @@ class PdfDocument:
         annot = self._find_on(page, xref)
         if annot is None:
             return False
+        self._push_undo(index)
         page.delete_annot(annot)
         self.modified = True
         return True
@@ -1010,6 +1058,7 @@ class PdfDocument:
             if point in annot.rect:
                 target = annot  # 後勝ち＝最前面
         if target is not None:
+            self._push_undo(index)
             page.delete_annot(target)
             self.modified = True
             return True
@@ -1018,11 +1067,69 @@ class PdfDocument:
     def clear_annots(self, index: int) -> int:
         page = self._doc.load_page(index)
         annots = list(page.annots())
+        if annots:
+            self._push_undo(index)
         for annot in annots:
             page.delete_annot(annot)
         if annots:
             self.modified = True
         return len(annots)
+
+    # --- 注釈の Undo / Redo（ページ単位のスナップショット）--------------
+    def _annot_snapshot(self, index: int) -> list:
+        """ページ index の全注釈を _describe のリストで捕捉する。"""
+        page = self._doc.load_page(index)
+        return [self._describe(a) for a in page.annots()]
+
+    def _push_undo(self, index: int) -> None:
+        """注釈を変更する直前に、そのページの現状を Undo スタックへ積む。"""
+        if not self._doc:
+            return
+        try:
+            self._undo.append((index, self._annot_snapshot(index)))
+        except Exception:  # noqa: BLE001
+            return
+        if len(self._undo) > self._UNDO_MAX:
+            self._undo.pop(0)
+        self._redo.clear()  # 新しい変更が入ったら Redo は無効化
+
+    def _restore_snapshot(self, index: int, snap: list) -> None:
+        page = self._doc.load_page(index)
+        for a in list(page.annots()):
+            page.delete_annot(a)
+        for desc in snap:
+            self._recreate(page, desc)
+        self.modified = True
+
+    def undo_annot(self):
+        """直前の注釈変更を取り消す。対象ページ番号を返す（無ければ None）。"""
+        if not self._undo or not self._doc:
+            return None
+        index, snap = self._undo.pop()
+        try:
+            self._redo.append((index, self._annot_snapshot(index)))
+            self._restore_snapshot(index, snap)
+        except Exception:  # noqa: BLE001
+            return None
+        return index
+
+    def redo_annot(self):
+        """取り消した注釈変更をやり直す。対象ページ番号を返す（無ければ None）。"""
+        if not self._redo or not self._doc:
+            return None
+        index, snap = self._redo.pop()
+        try:
+            self._undo.append((index, self._annot_snapshot(index)))
+            self._restore_snapshot(index, snap)
+        except Exception:  # noqa: BLE001
+            return None
+        return index
+
+    def can_undo_annot(self) -> bool:
+        return bool(self._undo)
+
+    def can_redo_annot(self) -> bool:
+        return bool(self._redo)
 
     # --- ページ編集（並べ替え・削除・統合） ---------------------------
     def move_page(self, src: int, dst: int) -> None:

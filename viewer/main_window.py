@@ -459,6 +459,18 @@ class MainWindow(QMainWindow):
         self.act_clear_annots = QAction("このページの注釈を全消去", self)
         tb.addAction(self.act_clear_annots)
 
+        # 注釈の元に戻す / やり直し
+        self.act_undo = QAction("元に戻す", self)
+        self.act_undo.setShortcut(QKeySequence.StandardKey.Undo)   # Ctrl+Z
+        self.act_undo.setToolTip("注釈操作を元に戻す (Ctrl+Z)")
+        tb.addAction(self.act_undo)
+        self.act_redo = QAction("やり直し", self)
+        # Ctrl+Y と Ctrl+Shift+Z の両方で効くようにする
+        self.act_redo.setShortcuts([QKeySequence.StandardKey.Redo,
+                                    QKeySequence("Ctrl+Y")])
+        self.act_redo.setToolTip("注釈操作をやり直す (Ctrl+Y)")
+        tb.addAction(self.act_redo)
+
     def _build_search_toolbar(self) -> None:
         """検索ポップアップ（Ctrl+F / 検索ボタンで表示される小窓）。"""
         from PySide6.QtWidgets import QDialog, QHBoxLayout, QToolButton
@@ -742,6 +754,7 @@ class MainWindow(QMainWindow):
         g.add_label(" 文字サイズ ")
         g.add_widget(self.text_size_spin)
         g = r.add_group(p, "編集")
+        g.add_stack([self.act_undo, self.act_redo])
         g.add_stack([self.act_apply_redact, self.act_clear_annots, self.act_copy])
         r.end_page(p)
 
@@ -1042,6 +1055,8 @@ class MainWindow(QMainWindow):
             lambda v: self.page_view.set_text_size(v)
         )
         self.act_clear_annots.triggered.connect(self._clear_annots)
+        self.act_undo.triggered.connect(self._undo_annot)
+        self.act_redo.triggered.connect(self._redo_annot)
         # しおり / 最適化 / PDF-A
         self.act_add_bookmark.triggered.connect(self._add_bookmark)
         self.act_edit_toc.triggered.connect(self._edit_toc)
@@ -1463,7 +1478,23 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("このページに注釈はありません", 3000)
 
+    def _undo_annot(self) -> None:
+        if self.doc.is_open:
+            self.page_view.undo_annot()
+            self._update_undo_actions()
+
+    def _redo_annot(self) -> None:
+        if self.doc.is_open:
+            self.page_view.redo_annot()
+            self._update_undo_actions()
+
+    def _update_undo_actions(self) -> None:
+        pv = self.page_view
+        self.act_undo.setEnabled(pv.can_undo_annot())
+        self.act_redo.setEnabled(pv.can_redo_annot())
+
     def _on_annotation_changed(self, index: int) -> None:
+        self._update_undo_actions()
         self._update_title()
         self.thumbnails.refresh_page(self.doc, index)
 

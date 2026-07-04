@@ -135,6 +135,54 @@ def main() -> int:
           ft is not None and ft.info.get("content") == "メモ テスト")
     check("editor is gone after commit", pv._text_editor is None)
 
+    # --- undo / redo ---
+    def count_annots():
+        return len(list(doc._doc.load_page(0).annots()))
+
+    n_before = count_annots()
+    pv.set_tool(TOOL_RECT)
+    pv.set_fill_enabled(False)
+    drag(QPoint(40, 130), QPoint(120, 180))
+    check("draw adds an annot", count_annots() == n_before + 1)
+    pv.undo_annot()
+    check("undo removes it", count_annots() == n_before)
+    pv.redo_annot()
+    check("redo brings it back", count_annots() == n_before + 1)
+
+    # undo a restyle: width goes back
+    pv.set_tool(TOOL_RECT)
+    pv.set_pen_width(3)
+    drag(QPoint(260, 130), QPoint(340, 180))
+    xr = last()["xref"]
+    pv.set_tool(TOOL_NONE)
+    pv.set_selection(0, xr)
+    pv.set_pen_width(15)
+    check("restyle set width 15", last().get("w") == 15.0)
+    pv.undo_annot()
+    check("undo restyle -> width back to 3", last().get("w") == 3.0, str(last()))
+
+    # --- FreeText keeps size + colour through an edit (move) ---
+    from PySide6.QtGui import QColor as _QC2
+    pv.set_tool(TOOL_TEXT)
+    pv.set_color(_QC2(0, 0, 200))
+    pv.set_text_size(26)
+    drag(QPoint(40, 250), QPoint(320, 290))
+    pv._text_editor.setPlainText("色サイズ保持")
+    pv._text_editor._finish()
+    app.processEvents()
+    ftx = None
+    for a in doc._doc.load_page(0).annots():
+        if a.type[1] == "FreeText":
+            ftx = a.xref
+    fs0, tc0 = doc._parse_freetext_da(
+        [a for a in doc._doc.load_page(0).annots() if a.xref == ftx][0])
+    new = doc.move_annot(0, ftx, 5, 5)   # edit (move) -> recreated
+    fa = [a for a in doc._doc.load_page(0).annots() if a.xref == new][0]
+    fs1, tc1 = doc._parse_freetext_da(fa)
+    check("FreeText keeps font size through edit", abs(fs1 - 26) < 0.5, f"({fs1})")
+    check("FreeText keeps blue text colour through edit",
+          tc1[2] > 0.5 and tc1[0] < 0.3, f"({tc1})")
+
     # --- round-trip persistence ---
     out = os.path.join(tmp, "_annot_restyled.pdf")
     doc.save_as(out)

@@ -1182,6 +1182,32 @@ class PageView(QScrollArea):
         self._doc.delete_annot_xref(index, xref)
         self._after_annot(index)
 
+    def undo_annot(self) -> None:
+        """直前の注釈操作を取り消す。"""
+        if not self._doc:
+            return
+        if self._text_editor is not None:
+            self._text_editor._finish()  # 入力中なら確定してから取り消す
+        idx = self._doc.undo_annot()
+        if idx is not None:
+            self.clear_selection()
+            self._after_annot(idx)
+
+    def redo_annot(self) -> None:
+        """取り消した注釈操作をやり直す。"""
+        if not self._doc:
+            return
+        idx = self._doc.redo_annot()
+        if idx is not None:
+            self.clear_selection()
+            self._after_annot(idx)
+
+    def can_undo_annot(self) -> bool:
+        return bool(self._doc and self._doc.can_undo_annot())
+
+    def can_redo_annot(self) -> bool:
+        return bool(self._doc and self._doc.can_redo_annot())
+
     def edit_selection_text(self) -> None:
         if self._sel_xref is None or not self._doc:
             return
