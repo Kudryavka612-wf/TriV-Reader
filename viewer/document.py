@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import fitz  # PyMuPDF
 from PySide6.QtGui import QImage, QPixmap
@@ -608,16 +609,46 @@ class PdfDocument:
             if w.xref == xref:
                 try:
                     if w.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
-                        w.field_value = bool(value)
+                        # field_value=True は、ON 状態名が非ASCII（日本語を
+                        # UTF-16 で PDF 名にしたもの。官公庁フォームで実在）だと
+                        # PyMuPDF が対応しきれず反映されないことがある。/AS・/V を
+                        # 直接書いて確実にチェック/解除する。
+                        if not self._set_checkbox(w, bool(value)):
+                            return False
                     else:
                         w.field_value = "" if value is None else str(value)
-                    self._fit_text_fontsize(w)
-                    w.update()
+                        self._fit_text_fontsize(w)
+                        w.update()
                     self.modified = True
                     return True
                 except Exception:  # noqa: BLE001
                     return False
         return False
+
+    def _set_checkbox(self, w, on: bool) -> bool:
+        """チェックボックスの ON/OFF を /AS・/V を直接書いて反映する。
+
+        ON にするときは外観辞書(/AP/N)にある "Off" 以外の状態名を使う。
+        /V はフィールド（親があれば親、無ければウィジェット自身）に、/AS は
+        見た目を持つウィジェットに書く。
+        """
+        xref = w.xref
+        if on:
+            apn = self._doc.xref_get_key(xref, "AP/N")
+            if not apn or apn[0] != "dict":
+                return False
+            keys = re.findall(r"/([^ /<>]+)\s+\d+\s+0\s+R", apn[1])
+            on_states = [k for k in keys if k != "Off"]
+            if not on_states:
+                return False
+            name = "/" + on_states[0]
+        else:
+            name = "/Off"
+        parent = self._doc.xref_get_key(xref, "Parent")
+        v_xref = int(parent[1].split()[0]) if parent and parent[0] == "xref" else xref
+        self._doc.xref_set_key(v_xref, "V", name)
+        self._doc.xref_set_key(xref, "AS", name)
+        return True
 
     # --- 官公庁フォームの「丸で選択」 JS トグル（限定対応） -------------
     def doc_scripts(self) -> dict[str, str]:
