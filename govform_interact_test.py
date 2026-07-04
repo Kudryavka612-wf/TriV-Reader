@@ -24,7 +24,7 @@ from PySide6.QtWidgets import QApplication, QComboBox
 
 from viewer import theme
 from viewer.document import PdfDocument
-from viewer.page_view import PageView, _GovFormClickOverlay
+from viewer.page_view import PageView, _FormComboBox, _GovFormClickOverlay
 
 
 def _find_pdf() -> str | None:
@@ -168,6 +168,46 @@ def main() -> int:
           "rgba(112, 150, 216, 45)" in ss and "dashed" in ss)
     check("overlays are NoFocus (#2/#3)",
           ov is not None and ov.focusPolicy() == Qt.FocusPolicy.NoFocus)
+
+    # --- ホイールでコンボの値が勝手に変わらない（スクロール中の誤入力防止）---
+    pv.set_page(0)
+    app.processEvents()
+    combo = next((w for w in pv._form_overlays
+                  if isinstance(w, _FormComboBox) and w.count() > 3), None)
+    if combo is None:
+        check("setup: a combo overlay", False)
+    else:
+        combo.setCurrentIndex(1)
+        app.processEvents()
+        before = combo.currentText()
+        gc = combo.mapToGlobal(combo.rect().center())
+        we = QWheelEvent(QPointF(combo.rect().center()), QPointF(gc),
+                         QPoint(0, -120), QPoint(0, -120),
+                         Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                         Qt.ScrollPhase.NoScrollPhase, False)
+        we.accept()
+        app.sendEvent(combo, we)
+        app.processEvents()
+        check("wheel over combo does NOT change its value",
+              combo.currentText() == before, f"({before!r})")
+        check("combo passes wheel through (scrolls page)", not we.isAccepted())
+
+    # --- ズームは overlay を全再構築せず即応（重さの回帰防止）----------------
+    import time
+    pv.set_form_mode(True)
+    app.processEvents()
+    n_before = len(pv._form_overlays)
+    t0 = time.perf_counter()
+    pv.set_zoom(1.7)
+    dt = (time.perf_counter() - t0) * 1000
+    right_after = len(pv._form_overlays)   # デバウンス: 即時は0
+    app.processEvents()
+    time.sleep(0.2)
+    app.processEvents()
+    check("zoom is responsive (no synchronous full overlay rebuild)",
+          dt < 300 and right_after == 0 and n_before > 100, f"({dt:.0f}ms)")
+    check("overlays rebuilt after zoom settles",
+          len(pv._form_overlays) > 100)
 
     ok = sum(results)
     print(f"\n==== {ok}/{len(results)} checks passed ====")

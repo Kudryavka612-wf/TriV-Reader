@@ -94,6 +94,24 @@ class _FormTextArea(QPlainTextEdit):
         super().focusOutEvent(event)
         self.committed.emit()
 
+    def wheelEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        # 欄の上でホイールしたらページをスクロール（自身の内容ではなく）。
+        event.ignore()
+
+
+class _FormComboBox(QComboBox):
+    """フォーム用コンボ。閉じている状態でホイールしても値が変わらないよう、
+    ホイールは飲み込まず下のスクロール領域へ流す。
+
+    QComboBox は既定だとホイールで選択値が回ってしまい、ページをスクロール中に
+    カーソルがコンボに乗るだけで値が勝手に書き換わる（＝誤入力）。ドロップダウンを
+    開いている間はポップアップ側が別ウィジェットとしてホイールを処理するので、
+    ここで無視しても一覧のスクロールには影響しない。
+    """
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        event.ignore()
+
 
 class _CombLineEdit(QLineEdit):
     """コム欄（1文字1マス）の入力欄。各文字をマスの中央に自前描画する。
@@ -596,6 +614,14 @@ class PageView(QScrollArea):
         # フォーム（入力欄）入力モード
         self._form_mode = False
         self._form_overlays: list[QWidget] = []
+        # ズーム時の overlay 再構築はデバウンスする。全 overlay（このフォームで
+        # 約270個）の再生成は ~0.5秒かかり、Ctrl+ホイールの1ノッチごとにこれを
+        # 走らせると拡大縮小が極端に重くなるため、ズームが落ち着いてから1回だけ
+        # 作り直す（それまでは一旦消しておく）。
+        self._overlay_rebuild_timer = QTimer(self)
+        self._overlay_rebuild_timer.setSingleShot(True)
+        self._overlay_rebuild_timer.setInterval(140)
+        self._overlay_rebuild_timer.timeout.connect(self._build_form_overlays)
         self._index: int = 0
         self._zoom: float = 1.0
         self._cols = 1  # 1=通常 / 2=見開き
@@ -1035,7 +1061,10 @@ class PageView(QScrollArea):
         self._resize_all()
         self.set_page(anchor)
         if self._form_mode:
-            self._build_form_overlays()  # ズーム変更で位置がずれるため作り直す
+            # 旧位置の overlay を即座に消し、ズームが落ち着いてから1回だけ
+            # 作り直す（毎ノッチ 270個を再生成して固まるのを防ぐ）。
+            self._clear_form_overlays()
+            self._overlay_rebuild_timer.start()
         self.zoom_changed.emit(self._zoom)
 
     def fit_width(self) -> None:
@@ -1148,7 +1177,7 @@ class PageView(QScrollArea):
             ctl.toggled.connect(
                 lambda on, i=index, x=xref: self._commit_field(i, x, on))
         elif kind in ("combo", "list"):
-            ctl = QComboBox(label)
+            ctl = _FormComboBox(label)
             ctl.setEditable(kind == "combo")
             ctl.addItems(field["choices"])
             if value and value not in field["choices"]:
