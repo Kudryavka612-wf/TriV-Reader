@@ -536,6 +536,8 @@ class MainWindow(QMainWindow):
         m_view.addSeparator()
         m_view.addAction(self.act_rotate_left)
         m_view.addAction(self.act_rotate_right)
+        m_view.addSeparator()
+        self._build_default_zoom_menu(m_view)
 
         m_pages = mb.addMenu("ページ(&P)")
         m_pages.addAction(self.act_organize)
@@ -588,6 +590,55 @@ class MainWindow(QMainWindow):
         m_help.addAction(self.act_set_update_url)
         m_help.addSeparator()
         m_help.addAction(self.act_about)
+
+    # 開いた時の表示倍率のプリセット（設定値の文字列 → 表示ラベル）
+    _DEFAULT_ZOOM_PRESETS = [
+        ("fit", "幅に合わせる"),
+        ("remember", "前回の倍率を維持"),
+        ("50", "50%"),
+        ("75", "75%"),
+        ("100", "100%"),
+        ("125", "125%"),
+        ("150", "150%"),
+        ("200", "200%"),
+    ]
+
+    def _build_default_zoom_menu(self, m_view: QMenu) -> None:
+        """PDFを開いた時の既定の表示倍率を選ぶサブメニュー（表示メニュー内）。"""
+        sub = m_view.addMenu("開いた時の表示倍率")
+        self.default_zoom_group = QActionGroup(self)
+        self.default_zoom_group.setExclusive(True)
+        self.default_zoom_actions = {}
+        for key, label in self._DEFAULT_ZOOM_PRESETS:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setData(key)
+            self.default_zoom_group.addAction(act)
+            sub.addAction(act)
+            self.default_zoom_actions[key] = act
+        self.default_zoom_group.triggered.connect(self._on_default_zoom_changed)
+
+    def _on_default_zoom_changed(self, action) -> None:
+        self.settings.setValue("default_zoom_mode", action.data())
+
+    def _apply_default_zoom(self, remember_zoom: float | None = None) -> None:
+        """新しく開いた文書に、設定済みの既定の表示倍率を適用する。
+
+        remember_zoom は「前回の倍率を維持」モード用に、呼び出し側が
+        set_document() などを呼ぶ *前* に読み取っておいた値を渡す。
+        ドキュメントを開く過程で発生する内部的な fit_width() の呼び出し
+        （新しいタブの初期化など）が settings の last_zoom を上書きして
+        しまうため、ここで改めて読み直すと直前の値を取り逃す。
+        """
+        mode = self.settings.value("default_zoom_mode", "fit", str)
+        if mode == "remember":
+            zoom = remember_zoom if remember_zoom is not None else \
+                self.settings.value("last_zoom", 1.0, float)
+            self.page_view.set_zoom(zoom)
+        elif mode.isdigit():
+            self.page_view.set_zoom(int(mode) / 100.0)
+        else:
+            self.page_view.fit_width()
 
     def _build_ribbon(self) -> None:
         """Foxit 風のリボン（タブ切替式ツールバー）を最上部に構築する。
@@ -1109,6 +1160,10 @@ class MainWindow(QMainWindow):
                 self.tabs.setCurrentIndex(i)
                 return
 
+        # 「前回の倍率を維持」モード用に、新規タブ初期化の副作用で上書きされる
+        # 前に読み取っておく
+        remembered_zoom = self.settings.value("last_zoom", 1.0, float)
+
         tab = self._new_tab()
         doc = tab.doc
         try:
@@ -1141,7 +1196,7 @@ class MainWindow(QMainWindow):
         self.center.setCurrentWidget(self.tabs)
         self.tabs.setCurrentIndex(idx)  # _on_tab_changed が読み込み・更新を行う
         QApplication.processEvents()
-        tab.page_view.fit_width()
+        self._apply_default_zoom(remembered_zoom)
         self._add_recent(path)
         # 入力欄付き（フォーム）PDF は Adobe と同様、開いた時点で入力可能にする
         if doc.is_form():
@@ -1671,6 +1726,8 @@ class MainWindow(QMainWindow):
                                       min(pct, self.zoom_slider.maximum())))
         self.zoom_slider.blockSignals(False)
         self._update_status()
+        # 「前回の倍率を維持」モード用に、実際の倍率を都度記憶しておく
+        self.settings.setValue("last_zoom", zoom)
 
     def _toggle_facing(self, on: bool) -> None:
         self.page_view.set_facing(on)
@@ -2061,6 +2118,10 @@ class MainWindow(QMainWindow):
         # ドック（ページ一覧/しおり）の表示状態を復元（前回消していたら消したまま）
         self.page_dock.setVisible(self.settings.value("page_dock_visible", True, bool))
         self.toc_dock.setVisible(self.settings.value("toc_dock_visible", True, bool))
+        # 開いた時の既定の表示倍率（未設定なら「幅に合わせる」）
+        mode = self.settings.value("default_zoom_mode", "fit", str)
+        act = self.default_zoom_actions.get(mode, self.default_zoom_actions["fit"])
+        act.setChecked(True)
         self._rebuild_recent_menu()
 
     def _save_settings(self) -> None:

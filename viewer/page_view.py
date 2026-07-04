@@ -979,6 +979,18 @@ class PageView(QScrollArea):
             avail = self.viewport().width() - margin
             self.set_zoom(avail / (w * self._cols))
 
+    WHEEL_ZOOM_STEP = 1.1  # Ctrl+ホイール1ノッチあたりの倍率変化
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            notches = event.angleDelta().y() / 120.0
+            if notches:
+                factor = self.WHEEL_ZOOM_STEP ** notches
+                self.set_zoom(self._zoom * factor)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
     def refresh_page(self, index: int) -> None:
         """1 ページを再描画（回転後などサイズが変わる場合に対応）。"""
         if not self._doc or not (0 <= index < len(self._labels)):
