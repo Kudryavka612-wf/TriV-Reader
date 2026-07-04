@@ -152,7 +152,13 @@ class _AutoFitLineEdit(QLineEdit):
     setFont() を IME 変換中（プリエディット表示中）に呼ぶと、Windows の
     日本語IMEでは変換中の内容がキャンセルされ、確定（Enter）しても入力
     した文字が消えてしまうことがある。変換中はフォント変更を保留し、
-    確定した直後にまとめて反映することでこれを避ける。
+    確定した「次のイベントループ」でまとめて反映することでこれを避ける。
+
+    重要: 確定直後のフィットを inputMethodEvent の処理中（同じターン内）に
+    同期実行すると、setFont が「まだ IME イベント処理中」に走るため、上記の
+    キャンセルが起きて入力文字が丸ごと消える。必ず QTimer.singleShot(0, ...) で
+    イベント処理が完了した後に回すこと（合成 QInputMethodEvent のテストでは
+    native IME の取り消しが再現されないため、ここは実機の日本語IMEで確認する）。
     """
 
     def __init__(self, parent=None) -> None:
@@ -164,7 +170,19 @@ class _AutoFitLineEdit(QLineEdit):
         was_composing = self.composing
         self.composing = bool(event.preeditString())
         if was_composing and not self.composing:
-            self.textChanged.emit(self.text())  # 変換確定直後にフィットさせる
+            # 変換確定直後にフィットさせる。ただし今このターンで setFont すると
+            # IME が確定を取り消すため、次のイベントループへ必ず遅延させる。
+            QTimer.singleShot(0, self._refit_after_commit)
+
+    def _refit_after_commit(self) -> None:
+        # タイマー発火までに新しい変換が始まっていたら、その確定を待つ
+        # （フォント変更が再び変換を壊さないように）。
+        if self.composing:
+            return
+        try:
+            self.textChanged.emit(self.text())
+        except RuntimeError:
+            pass  # 遅延発火までに欄が破棄済み（ページ切替・フォーム解除等）
 
 
 # 注釈ツール
