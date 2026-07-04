@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import ocr, page_view, theme
+from .annot_list import AnnotListDock
 from .bookmarks import TocDock, TocEditDialog
 from .document import PdfDocument
 from .organizer import PageOrganizer
@@ -161,6 +162,12 @@ class MainWindow(QMainWindow):
         self.toc_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.toc_dock)
         self.tabifyDockWidget(dock, self.toc_dock)
+
+        # 注釈一覧ドック：同じ左側にタブで重ねる
+        self.annot_dock = AnnotListDock(self)
+        self.annot_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.annot_dock)
+        self.tabifyDockWidget(self.toc_dock, self.annot_dock)
         dock.raise_()
 
         # ドックの方針: 基本はウィンドウ内。×で閉じられる。外窓（フローティング）は
@@ -168,7 +175,7 @@ class MainWindow(QMainWindow):
         feat = (QDockWidget.DockWidgetFeature.DockWidgetClosable
                 | QDockWidget.DockWidgetFeature.DockWidgetMovable
                 | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
-        for d in (dock, self.toc_dock):
+        for d in (dock, self.toc_dock, self.annot_dock):
             d.setFeatures(feat)
             d.setFloating(False)  # 起動時は必ずウィンドウ内
             # 非表示→再表示（表示メニュー等）のとき、外窓のままなら中へ戻す
@@ -570,6 +577,10 @@ class MainWindow(QMainWindow):
         act_toggle_toc = self.toc_dock.toggleViewAction()
         act_toggle_toc.setText("しおり一覧を表示")
         m_view.addAction(act_toggle_toc)
+        # 注釈一覧ドックの表示/非表示
+        act_toggle_annots = self.annot_dock.toggleViewAction()
+        act_toggle_annots.setText("注釈一覧を表示")
+        m_view.addAction(act_toggle_annots)
         m_view.addSeparator()
         # 注釈バーの表示/非表示（折りたたみ）
         self.act_toggle_annotbar = self.annot_toolbar.toggleViewAction()
@@ -1091,6 +1102,8 @@ class MainWindow(QMainWindow):
         self.act_compress.triggered.connect(self.compress_save)
         self.act_export_pdfa.triggered.connect(self.export_pdfa)
         self.toc_dock.page_requested.connect(self._goto)
+        self.annot_dock.annot_selected.connect(self._on_annot_list_selected)
+        self.annot_dock.annot_delete_requested.connect(self._on_annot_list_delete)
         # 検索 / ページ番号
         self.search_edit.returnPressed.connect(self._do_search)
         self.act_search_next.triggered.connect(lambda: self._search_step(1))
@@ -1370,6 +1383,7 @@ class MainWindow(QMainWindow):
             return
         self.thumbnails.load(tab.doc)
         self.toc_dock.load(tab.doc.get_toc())
+        self._refresh_annot_list()
         self.thumbnails.select_page(tab.page_view.index)
         # このタブで前回見ていたスクロール位置を復元（描画確定後に）
         saved = getattr(tab, "_saved_scroll", 0)
@@ -1489,6 +1503,9 @@ class MainWindow(QMainWindow):
 
     def _on_selection_changed(self, has: bool) -> None:
         self._refresh_copy_enabled()
+        ref = self.page_view.current_annot_ref()
+        if ref is not None:
+            self.annot_dock.select_xref(ref[0], ref[1])
         if has:
             self.statusBar().showMessage(
                 "注釈を選択中：ドラッグで移動 / ダブルクリックで本文編集 / "
@@ -1576,8 +1593,30 @@ class MainWindow(QMainWindow):
 
     def _on_annotation_changed(self, index: int) -> None:
         self._update_undo_actions()
+        self._refresh_annot_list()
         self._update_title()
         self.thumbnails.refresh_page(self.doc, index)
+
+    def _refresh_annot_list(self) -> None:
+        try:
+            self.annot_dock.load(self.doc.list_annots() if self.doc.is_open else [])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_annot_list_selected(self, page: int, xref: int) -> None:
+        """一覧クリック：そのページへ移動し、注釈を選択する。"""
+        if not self.doc.is_open:
+            return
+        self._goto(page)
+        self.page_view.set_tool(page_view.TOOL_NONE)  # 選択できるツールに
+        self.page_view.set_selection(page, xref)
+
+    def _on_annot_list_delete(self, page: int, xref: int) -> None:
+        if not self.doc.is_open:
+            return
+        self.doc.delete_annot_xref(page, xref)
+        self.page_view.refresh_page(page)
+        self._on_annotation_changed(page)
 
     # --- 墨消し / ページ操作 / 透かし / メタ / 抽出 -------------------
     def _apply_redactions(self) -> None:

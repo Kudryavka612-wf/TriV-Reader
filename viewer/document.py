@@ -1071,6 +1071,42 @@ class PdfDocument:
     def set_annot_text(self, index, xref, text):
         return self._edit_annot(index, xref, text=text)
 
+    # 注釈種別 → 一覧に出す日本語ラベル
+    _ANNOT_LABELS = {
+        "Highlight": "ハイライト", "Square": "四角", "Circle": "円",
+        "Line": "直線/矢印", "Ink": "ペン", "FreeText": "テキスト",
+        "Text": "付箋", "Underline": "下線", "StrikeOut": "取消線",
+        "Polygon": "多角形", "PolyLine": "折れ線", "Redact": "墨消し",
+    }
+
+    def list_annots(self) -> list:
+        """全ページの注釈を一覧用の dict リストで返す。
+
+        各要素: {page, xref, kind, label, content, color(rgb 0-1 tuple|None)}。
+        content はテキスト系は本文、それ以外は種別ラベル。
+        """
+        out = []
+        if not self._doc:
+            return out
+        for pno in range(self._doc.page_count):
+            try:
+                page = self._doc.load_page(pno)
+                for a in page.annots():
+                    kind = a.type[1]
+                    colors = a.colors or {}
+                    col = colors.get("stroke") or colors.get("fill")
+                    content = a.info.get("content", "") or ""
+                    label = self._ANNOT_LABELS.get(kind, kind)
+                    text = content.strip().replace("\n", " ") if content.strip() else label
+                    out.append({
+                        "page": pno, "xref": a.xref, "kind": kind,
+                        "label": label, "content": text[:40],
+                        "color": tuple(col) if col else None,
+                    })
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
     def describe_annot(self, index, xref):
         """注釈の内容を dict で取り出す（コピー用）。無ければ None。"""
         page = self._doc.load_page(index)

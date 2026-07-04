@@ -1196,6 +1196,12 @@ class PageView(QScrollArea):
         self._doc.delete_annot_xref(index, xref)
         self._after_annot(index)
 
+    def current_annot_ref(self):
+        """選択中の注釈の (page_index, xref)。無ければ None。"""
+        if self._sel_xref is None:
+            return None
+        return (self._sel_index, self._sel_xref)
+
     def selected_annot_desc(self):
         """選択中の注釈の内容（コピー用の dict）を返す。無ければ None。"""
         if self._sel_xref is None or not self._doc:
