@@ -334,6 +334,8 @@ class MainWindow(QMainWindow):
         self.act_set_update_url = QAction("更新元URLを設定…", self)
         self.act_report_govform = QAction("未対応フォーム機能を報告用に保存…", self)
         self.act_report_govform.setEnabled(False)
+        self.act_telemetry_toggle = QAction("匿名レポートを送信する", self)
+        self.act_telemetry_toggle.setCheckable(True)
         self.act_dark = QAction("ダークモード", self)
         self.act_dark.setCheckable(True)
         self.act_compact = QAction("コンパクト表示（アイコンのみ）", self)
@@ -592,6 +594,7 @@ class MainWindow(QMainWindow):
         m_help.addAction(self.act_set_update_url)
         m_help.addSeparator()
         m_help.addAction(self.act_report_govform)
+        m_help.addAction(self.act_telemetry_toggle)
         m_help.addSeparator()
         m_help.addAction(self.act_about)
 
@@ -1069,6 +1072,7 @@ class MainWindow(QMainWindow):
         self.act_set_update_url.triggered.connect(self.set_update_url)
         self.act_about.triggered.connect(self.show_about)
         self.act_report_govform.triggered.connect(self.report_govform_unsupported)
+        self.act_telemetry_toggle.toggled.connect(self._toggle_telemetry)
         # 共有ドック（アクティブタブに対して動作）
         self.thumbnails.page_selected.connect(self._goto)
         self.thumbnails.pages_reordered.connect(self._reorder)
@@ -2067,6 +2071,77 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"このフォームには未対応の入力補助が {len(names)} 件あります。"
                 "［ヘルプ > 未対応フォーム機能を報告用に保存］で書き出せます。", 8000)
+            self._maybe_send_govform_telemetry(doc)
+
+    def _telemetry_url(self) -> str:
+        """テレメトリ送信先（version.py の定数を設定で上書き可）。空=送信しない。"""
+        from .version import TELEMETRY_URL
+        return self.settings.value("telemetry_url", "", str) or TELEMETRY_URL
+
+    def _maybe_send_govform_telemetry(self, doc) -> None:
+        """同意済みなら、未対応フォームの匿名レポートを自動送信する。
+
+        送信先URL未設定なら何もしない（同意も尋ねない）。未決定なら初回だけ
+        同意を尋ね、既定は「送らない」。送るのは関数名＋フォーム定義＋版＋指紋
+        だけで、利用者の入力値・氏名・ファイル名は含めない。
+        """
+        from . import telemetry
+        url = self._telemetry_url()
+        if not url:
+            return  # 配布者が受け口を設定していない → 送信機能そのものが無効
+        state = telemetry.consent_state(self.settings)
+        if state == "":  # 未決定 → 初回だけ同意を尋ねる
+            state = "yes" if self._ask_telemetry_consent() else "no"
+        if state != "yes":
+            return
+        try:
+            payload = doc.govform_telemetry_payload(app_version=self._app_version())
+        except Exception:  # noqa: BLE001
+            payload = None
+        if not payload:
+            return
+        fp = payload.get("form_fingerprint", "")
+        if fp and telemetry.already_sent(self.settings, fp):
+            return  # 同じフォームは一度だけ
+        telemetry.send_async(url, payload)
+        if fp:
+            telemetry.mark_sent(self.settings, fp)
+        self.statusBar().showMessage("未対応フォームの匿名レポートを送信しました", 4000)
+
+    def _ask_telemetry_consent(self) -> bool:
+        """初回の同意確認。既定（Escや×）は「送らない」。"""
+        from . import telemetry
+        box = QMessageBox(self)
+        box.setWindowTitle("匿名レポートの送信")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(
+            "未対応の入力補助を含むフォームを開きました。\n"
+            "改善のため、匿名レポートを開発元へ送信してもよろしいですか？")
+        box.setInformativeText(
+            "送信する内容: 未対応の関数名 / フォーム側の定義 / アプリ・ライブラリ版 /\n"
+            "　フォームの指紋（同一判定用）\n"
+            "送信しない内容: あなたが入力した値・氏名・住所等の個人情報・ファイル名\n\n"
+            "この選択は［ヘルプ > 匿名レポートを送信する］でいつでも変更できます。")
+        yes = box.addButton("送信する", QMessageBox.ButtonRole.YesRole)
+        no = box.addButton("送信しない", QMessageBox.ButtonRole.NoRole)
+        box.setDefaultButton(no)
+        box.exec()
+        agreed = box.clickedButton() is yes
+        telemetry.set_consent(self.settings, agreed)
+        self.act_telemetry_toggle.blockSignals(True)
+        self.act_telemetry_toggle.setChecked(agreed)
+        self.act_telemetry_toggle.blockSignals(False)
+        return agreed
+
+    def _app_version(self) -> str:
+        from .version import APP_VERSION
+        return APP_VERSION
+
+    def _toggle_telemetry(self, on: bool) -> None:
+        from . import telemetry
+        telemetry.set_consent(self.settings, on)
+        self.statusBar().showMessage(
+            "匿名レポートの送信を{}にしました".format("オン" if on else "オフ"), 4000)
 
     def report_govform_unsupported(self) -> None:
         """未対応ヘルパーの診断テキストを保存する（報告用）。
@@ -2185,6 +2260,15 @@ class MainWindow(QMainWindow):
         mode = self.settings.value("default_zoom_mode", "fit", str)
         act = self.default_zoom_actions.get(mode, self.default_zoom_actions["fit"])
         act.setChecked(True)
+        # 匿名レポート送信トグル: 送信先URL未設定なら意味がないので隠す。
+        # 設定済みなら現在の同意状態を反映する。
+        from . import telemetry
+        has_url = bool(self._telemetry_url())
+        self.act_telemetry_toggle.setVisible(has_url)
+        self.act_telemetry_toggle.blockSignals(True)
+        self.act_telemetry_toggle.setChecked(
+            telemetry.consent_state(self.settings) == "yes")
+        self.act_telemetry_toggle.blockSignals(False)
         self._rebuild_recent_menu()
 
     def _save_settings(self) -> None:

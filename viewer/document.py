@@ -696,6 +696,24 @@ class PdfDocument:
             return []
         return govform_js.unsupported_helpers(self._doc, self.doc_scripts())
 
+    def govform_telemetry_payload(self, app_version: str = ""):
+        """未対応フォーム機能の匿名テレメトリ用ペイロード（無ければ None）。
+
+        含めるのはフォーム由来の定義と版・指紋のみ（個人情報・入力値は含まない）。
+        """
+        if not self._doc:
+            return None
+        names = self.govform_unsupported_helpers()
+        if not names:
+            return None
+        from . import telemetry
+        scripts = self.doc_scripts()
+        sources = govform_js._all_function_bodies("\n".join(scripts.values()))
+        import fitz as _fitz
+        return telemetry.build_payload(
+            scripts, names, {n: sources.get(n, "") for n in names},
+            app_version, getattr(_fitz, "__version__", ""))
+
     def write_govform_diagnostic(self, out_path: str,
                                  app_version: str = "") -> list[str]:
         """未対応ヘルパーの報告用テキストを out_path に書き出す。
