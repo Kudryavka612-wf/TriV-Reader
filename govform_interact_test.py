@@ -33,6 +33,11 @@ def _find_pdf() -> str | None:
     env = os.environ.get("TRIV_GOVFORM_PDF", "")
     if env and os.path.exists(env):
         return env
+    # リポジトリ同梱のフィクスチャ（CI でも使える）
+    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "tests", "fixtures", "6010_form_sample.pdf")
+    if os.path.exists(fixture):
+        return fixture
     guess = os.path.join(os.path.expanduser("~"), "Downloads",
                          "6010_健康保険傷病手当金支給申請書.pdf")
     return guess if os.path.exists(guess) else None

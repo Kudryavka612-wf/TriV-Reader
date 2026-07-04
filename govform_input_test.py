@@ -30,6 +30,11 @@ def _find_pdf() -> str | None:
     env = os.environ.get("TRIV_GOVFORM_PDF", "")
     if env and os.path.exists(env):
         return env
+    # リポジトリ同梱のフィクスチャ（CI でも使える）
+    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "tests", "fixtures", "6010_form_sample.pdf")
+    if os.path.exists(fixture):
+        return fixture
     guess = os.path.join(os.path.expanduser("~"), "Downloads",
                          "6010_健康保険傷病手当金支給申請書.pdf")
     return guess if os.path.exists(guess) else None
@@ -177,6 +182,41 @@ def main() -> int:
         check("round-trip: multiline value persists",
               str(v2("FRM6010-01-015", 0)) == "みずほ銀行")
         d2.close()
+
+        # --- 独立ライブラリ(pikepdf)で読み直し、仕様通り書けているか確認 ----
+        # PyMuPDF 自身で読めるだけでなく、別実装（＝他ビューアと同じ土俵）でも
+        # AcroForm の値が正しく取り出せることを保証する。
+        import pikepdf
+        raw: dict = {}
+
+        def walk(f, prefix=""):
+            t = f.get("/T")
+            fq = ((prefix + "." if prefix else "") + str(t)) if t is not None else prefix
+            kids = f.get("/Kids")
+            if kids and any(k.get("/T") is not None for k in kids):
+                for k in kids:
+                    walk(k, fq)
+            else:
+                raw[fq] = f.get("/V")
+
+        with pikepdf.open(out) as pk:
+            acro = pk.Root.get("/AcroForm")
+            for f in (acro.get("/Fields") or []):
+                walk(f)
+
+            def as_str(v):
+                try:
+                    return str(v)
+                except Exception:  # noqa: BLE001  非UTF8名（チェックボックス）等
+                    return None
+
+            check("pikepdf: comb value written per spec",
+                  as_str(raw.get("FRM6010-01-001")) == "12345678")
+            check("pikepdf: multiline value written per spec",
+                  as_str(raw.get("FRM6010-01-015")) == "みずほ銀行")
+            cb = raw.get("FRM6010-02-009_")
+            check("pikepdf: checkbox is checked (/V != /Off)",
+                  cb is not None and cb != pikepdf.Name("/Off"))
     except Exception as exc:  # noqa: BLE001
         check("round-trip save/reopen", False, f"({exc})")
     finally:

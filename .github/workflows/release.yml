@@ -40,6 +40,13 @@ jobs:
             exit 1
           }
 
+      - name: テスト実行（失敗したらリリースしない）
+        run: |
+          python smoke_test.py
+          python updater_test.py
+          python govform_interact_test.py
+          python govform_input_test.py
+
       - name: ビルド（exe 化）
         run: python build_exe.py
 
