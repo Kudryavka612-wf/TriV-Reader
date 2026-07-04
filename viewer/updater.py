@@ -140,18 +140,20 @@ def apply_and_restart(zip_path: str) -> None:
     # tasklist/find/robocopy/timeout はフルパス指定にする。開発機などで
     # Git for Windows 等の Unix 版コマンド（find 等）が PATH 上で標準の
     # System32 版より手前に来ていると、動作が変わって既定の判定が壊れるため。
+    # 待機は timeout ではなく ping を使う。timeout はコンソール/標準入力に依存し、
+    # 下の CREATE_NO_WINDOW（コンソール窓なし）起動下では
+    # 「Input redirection is not supported」で失敗して待たずに突き進むことがある。
+    # ping -n 2 127.0.0.1 は約1秒待ち、コンソールに依存しない。
     sysdir = r"%SystemRoot%\System32"
     script = f"""@echo off
 setlocal enabledelayedexpansion
-{sysdir}\\chcp.com 65001 >nul
-echo 更新を適用しています。しばらくお待ちください...
 set _wait=0
 :waitloop
 {sysdir}\\tasklist.exe /FI "PID eq {pid}" /FI "IMAGENAME eq {exe_name}" 2>nul | {sysdir}\\find.exe /I "{exe_name}" >nul
 if errorlevel 1 goto docopy
 set /a _wait+=1
 if !_wait! GEQ 30 goto docopy
-{sysdir}\\timeout.exe /t 1 /nobreak >nul
+{sysdir}\\ping.exe -n 2 127.0.0.1 >nul
 goto waitloop
 :docopy
 {sysdir}\\robocopy.exe "{src_dir}" "{app_dir}" /E /NFL /NDL /NJH /NJS /NP /R:3 /W:1 /XD "TriVReader_data" /XF "portable.ini" "lite.ini" "TriVReader.ini" >nul
@@ -162,11 +164,14 @@ del "%~f0"
         f.write(script)
 
     import subprocess
-    # 新しいコンソールで起動（親終了後も生存する）。
-    # CREATE_NEW_CONSOLE と DETACHED_PROCESS は排他で、併用すると
-    # CreateProcess が WinError 87 (パラメーターが間違っています) になる。
+    # コンソール窓を出さずに起動する（更新中に黒いコマンドプロンプトを見せない）。
+    # CREATE_NO_WINDOW は「コンソールアプリを窓なしで実行」するフラグで、親（GUI）
+    # 終了後もこの子プロセスは生存し、待機→入れ替え→再起動を続ける。
+    # 注意: CREATE_NO_WINDOW / CREATE_NEW_CONSOLE / DETACHED_PROCESS はいずれも
+    # コンソール生成の指定で相互排他。併用すると CreateProcess が WinError 87
+    # （パラメーターが間違っています）になるため、単独で指定する。
     subprocess.Popen(
         ["cmd", "/c", helper],
-        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         close_fds=True,
     )
