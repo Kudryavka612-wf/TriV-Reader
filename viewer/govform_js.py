@@ -27,6 +27,7 @@ import fitz
 ALLOWED_HELPERS = (
     "GroupButtonClick",   # クリックで「丸選択」をトグル（表示切替）
     "KinmuButtonClick",   # 勤務状況の複数状態トグル（表示切替）
+    "GroupCheckboxClick",  # チェックボックス群の排他選択（他を「いいえ」に）
     "SetShinryoAll",      # 診療日を31日分まとめて選択（表示切替）
     "SetKinmuAll",        # 勤務日を31日分まとめて選択（表示切替）
     "StateNameSelect",    # 都道府県コンボ選択で枝ラベルを表示/非表示
