@@ -107,10 +107,27 @@ class _FormComboBox(QComboBox):
     カーソルがコンボに乗るだけで値が勝手に書き換わる（＝誤入力）。ドロップダウンを
     開いている間はポップアップ側が別ウィジェットとしてホイールを処理するので、
     ここで無視しても一覧のスクロールには影響しない。
+
+    また、QComboBox にスタイルシートを当てると Qt の仕様で標準の▽矢印が
+    消えてしまい、テキスト入力欄と見分けがつかない。そこで▽を自前で描いて
+    「選べる欄（ドロップダウン）」だと分かるようにする。
     """
 
     def wheelEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         event.ignore()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx = self.width() - 7
+        cy = self.height() // 2
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0x2a, 0x4a, 0x8a))
+        p.drawPolygon(QPolygon([QPoint(cx - 4, cy - 2),
+                                QPoint(cx + 4, cy - 2),
+                                QPoint(cx, cy + 3)]))
+        p.end()
 
 
 class _CombLineEdit(QLineEdit):
@@ -1229,12 +1246,27 @@ class PageView(QScrollArea):
                 size -= 1
                 f.setPixelSize(size)
             ctl.setFont(f)
+        elif isinstance(ctl, _FormComboBox):
+            ctl.setFont(f)
+            # 選択欄（ドロップダウン）はテキスト入力欄と見分けられるよう、
+            # やや濃い地色＋右端に区切り線付きのボタン領域を出す（▽は自前描画）。
+            # padding-right で本文が▽に重ならないよう右側を空ける。
+            ctl.setStyleSheet(
+                "QComboBox { background: #d7e6ff;"
+                " border: 1px solid #5b82c8; padding: 0px 16px 0px 3px;"
+                " color: #111; }"
+                "QComboBox::drop-down { subcontrol-origin: padding;"
+                " subcontrol-position: top right; width: 14px;"
+                " border-left: 1px solid #5b82c8; background: #b9d0f2; }"
+                "QComboBox QAbstractItemView {"
+                " background: #ffffff; color: #111;"
+                " selection-background-color: #7096d8; }")
         else:
             ctl.setFont(f)
             # Adobe 風の薄青ハイライト。半透明だと下に描画済みの PDF 側の
             # 文字が透けて二重に見えるため不透明にする
             ctl.setStyleSheet(
-                "QLineEdit, QComboBox, QPlainTextEdit {"
+                "QLineEdit, QPlainTextEdit {"
                 " background: #e1ebff;"
                 " border: 1px solid #7096d8; padding: 0px 2px; color: #111; }"
                 "QCheckBox { background: #e1ebff; }")

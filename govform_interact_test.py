@@ -191,6 +191,9 @@ def main() -> int:
         check("wheel over combo does NOT change its value",
               combo.currentText() == before, f"({before!r})")
         check("combo passes wheel through (scrolls page)", not we.isAccepted())
+        # 選択欄だと分かる見た目（ドロップダウンボタン領域＋自前の▽）
+        check("combo has dropdown affordance (distinct from text field)",
+              "drop-down" in combo.styleSheet())
 
     # --- ズームは overlay を全再構築せず即応（重さの回帰防止）----------------
     import time
