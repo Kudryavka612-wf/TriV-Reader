@@ -39,6 +39,9 @@ LINE_DASH_PATTERNS = {
     "dotted": [1, 3],
 }
 
+# 「指定なし（元の値を引き継ぐ）」を None（＝塗り無しに設定）と区別するための番兵。
+_UNSET = object()
+
 
 class PdfDocument:
     """PyMuPDF の Document を薄くラップしたクラス。"""
@@ -856,22 +859,25 @@ class PdfDocument:
         }
 
     def _recreate(self, page, desc, dx=0.0, dy=0.0, color=None, width=None,
-                  text=None, new_rect=None):
-        """捕捉した注釈情報から、平行移動・リサイズ・色/太さ/本文変更して作り直す。
+                  text=None, new_rect=None, dashes=_UNSET, opacity=_UNSET,
+                  fill=_UNSET):
+        """捕捉した注釈情報から、平行移動・リサイズ・色/太さ/線種/不透明度/塗り/
+        本文を変更して作り直す。
 
         page は呼び出し側が delete に使ったのと同一の Page オブジェクトを渡す
         （別インスタンスを混在させると PyMuPDF がクラッシュするため）。
         new_rect 指定時はリサイズ（Ink/Line/下線/取消線は点列を旧矩形→新矩形へ
-        スケール）。塗り色・線種・矢印の線端・不透明度は元の注釈から引き継ぐ。
+        スケール）。dashes/opacity/fill を指定しなければ元の注釈から引き継ぐ
+        （_UNSET＝未指定。fill=None は「塗り無し」を明示的に設定する意味）。
         """
         kind = desc["kind"]
         stroke = color if color is not None else desc["stroke"]
         w = width if width is not None else desc["width"]
         content = text if text is not None else desc["content"]
         old = desc["rect"]
-        fill = desc.get("fill")
-        dashes = desc.get("dashes")
-        opacity = desc.get("opacity")
+        fill = desc.get("fill") if fill is _UNSET else fill
+        dashes = desc.get("dashes") if dashes is _UNSET else dashes
+        opacity = desc.get("opacity") if opacity is _UNSET else opacity
         if new_rect is not None:
             target = fitz.Rect(new_rect)
         else:
@@ -982,6 +988,16 @@ class PdfDocument:
 
     def recolor_annot(self, index, xref, color):
         return self._edit_annot(index, xref, color=color)
+
+    def restyle_annot(self, index, xref, width=None, dashes=_UNSET,
+                      opacity=_UNSET, fill=_UNSET):
+        """選択済み注釈の太さ・線種(dashes)・不透明度・塗りを後から変更する。
+
+        未指定（_UNSET / None）の項目は元の値を引き継ぐ。fill=None は「塗り無し」。
+        変更後の新しい xref を返す（作り直しのため xref は変わる）。
+        """
+        return self._edit_annot(index, xref, width=width, dashes=dashes,
+                                opacity=opacity, fill=fill)
 
     def set_annot_text(self, index, xref, text):
         return self._edit_annot(index, xref, text=text)

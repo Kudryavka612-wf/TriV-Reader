@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .document import PdfDocument
+from .document import _UNSET, PdfDocument
 from .govform_js import SIMPLE_CALL_RE
 
 PAGE_SPACING = 12  # ページ間の余白(px)
@@ -738,9 +738,12 @@ class PageView(QScrollArea):
 
     def set_pen_width(self, width: int) -> None:
         self.pen_width = max(1, int(width))
+        # 注釈を選択中なら、その注釈にも即座に反映する（新規描画用の設定も更新）。
+        self.restyle_selection(width=self.pen_width)
 
     def set_line_style(self, style: str) -> None:
         self.line_style = style
+        self.restyle_selection(dashes=self._dashes())
 
     def set_line_start(self, key: str) -> None:
         self.line_start = key
@@ -750,12 +753,16 @@ class PageView(QScrollArea):
 
     def set_fill_enabled(self, on: bool) -> None:
         self.fill_enabled = bool(on)
+        self.restyle_selection(fill=self._fill_rgb())
 
     def set_fill_color(self, qcolor: QColor) -> None:
         self.fill_color = qcolor
+        if self.fill_enabled:
+            self.restyle_selection(fill=self._fill_rgb())
 
     def set_opacity(self, opacity: float) -> None:
         self.opacity = max(0.05, min(1.0, float(opacity)))
+        self.restyle_selection(opacity=self.opacity)
 
     def _rgb(self) -> tuple:
         c = self.color
@@ -1030,6 +1037,23 @@ class PageView(QScrollArea):
         if new_xref is not None:
             self._sel_xref = new_xref
         self._after_annot(self._sel_index)
+
+    def restyle_selection(self, *, width=None, dashes=_UNSET,
+                          opacity=_UNSET, fill=_UNSET) -> bool:
+        """選択中の注釈の太さ・線種・不透明度・塗りを変更する。
+
+        注釈を選択していなければ何もしない（新規描画用の設定変更のときは無視）。
+        指定した項目だけ変え、残りは元の値を保つ。
+        """
+        if self._sel_xref is None or not self._doc:
+            return False
+        new_xref = self._doc.restyle_annot(
+            self._sel_index, self._sel_xref,
+            width=width, dashes=dashes, opacity=opacity, fill=fill)
+        if new_xref is not None:
+            self._sel_xref = new_xref
+        self._after_annot(self._sel_index)
+        return True
 
     def delete_selection(self) -> None:
         if self._sel_xref is None or not self._doc:
