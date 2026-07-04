@@ -127,6 +127,27 @@ class _CombLineEdit(QLineEdit):
         p.end()
 
 
+class _AutoFitLineEdit(QLineEdit):
+    """入力に応じて文字サイズを自動縮小する1行フォーム欄。
+
+    setFont() を IME 変換中（プリエディット表示中）に呼ぶと、Windows の
+    日本語IMEでは変換中の内容がキャンセルされ、確定（Enter）しても入力
+    した文字が消えてしまうことがある。変換中はフォント変更を保留し、
+    確定した直後にまとめて反映することでこれを避ける。
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.composing = False
+
+    def inputMethodEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        super().inputMethodEvent(event)
+        was_composing = self.composing
+        self.composing = bool(event.preeditString())
+        if was_composing and not self.composing:
+            self.textChanged.emit(self.text())  # 変換確定直後にフィットさせる
+
+
 # 注釈ツール
 TOOL_NONE = "none"
 TOOL_HIGHLIGHT = "highlight"
@@ -1042,7 +1063,7 @@ class PageView(QScrollArea):
                 # コム欄: 1文字1マス。全角/半角が混ざってもマス中央に描画する
                 ctl = _CombLineEdit(field["maxlen"], label)
             else:
-                ctl = QLineEdit(label)
+                ctl = _AutoFitLineEdit(label)
                 if field.get("maxlen"):
                     ctl.setMaxLength(field["maxlen"])
             ctl.setText(str(value))
@@ -1076,9 +1097,12 @@ class PageView(QScrollArea):
                 " background: #e1ebff;"
                 " border: 1px solid #7096d8; padding: 0px 2px; color: #111; }"
                 "QCheckBox { background: #e1ebff; }")
-            # 自動サイズの1行欄: 入力に応じて縮小し、枠からはみ出さない（Adobe同等）
-            if pdf_fs == 0 and isinstance(ctl, QLineEdit):
+            # 自動サイズの1行欄: 入力に応じて縮小し、枠からはみ出さない（Adobe同等）。
+            # IME変換中（composing）はフォントを変更しない（変換内容の消失を防ぐ）。
+            if pdf_fs == 0 and isinstance(ctl, _AutoFitLineEdit):
                 def _fit_font(text, c=ctl, base=base_px):
+                    if c.composing:
+                        return
                     fnt = c.font()
                     size = base
                     avail = max(10, c.width() - 8)
@@ -1087,7 +1111,8 @@ class PageView(QScrollArea):
                         if QFontMetrics(fnt).horizontalAdvance(text) <= avail:
                             break
                         size -= 1
-                    c.setFont(fnt)
+                    if fnt.pixelSize() != c.font().pixelSize():
+                        c.setFont(fnt)
                 ctl.textChanged.connect(_fit_font)
                 _fit_font(ctl.text())
         ctl.show()
