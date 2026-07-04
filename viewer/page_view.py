@@ -1054,6 +1054,14 @@ class PageView(QScrollArea):
             except Exception:  # noqa: BLE001
                 fields = []
             for field in fields:
+                # 画面に出ない欄（PDF の Hidden=1 / 印刷のみ=3）は編集オーバー
+                # レイを作らない。官公庁フォームの相棒 _PRINT 欄（印刷のみ）や
+                # 選択ペアの隠れている側がこれに当たり、重なりや誤入力を防ぐ。
+                # ただしコンボ/リストは「選択できる部品を消さない」ため常に描く
+                # （都道府県コンボのように稀に Hidden 指定でも操作が要る欄がある）。
+                if (int(field.get("display", 0)) in (1, 3)
+                        and field.get("kind") not in ("combo", "list")):
+                    continue
                 ctl = self._make_form_control(index, field, label)
                 if ctl is not None:
                     self._form_overlays.append(ctl)
@@ -1087,7 +1095,7 @@ class PageView(QScrollArea):
                 ctl.addItem(str(value))
             ctl.setCurrentText(str(value))
             ctl.currentTextChanged.connect(
-                lambda text, i=index, x=xref: self._commit_field(i, x, text))
+                lambda text, i=index, x=xref: self._commit_combo(i, x, text))
         elif field.get("multiline"):  # 複数行のテキスト欄
             ctl = _FormTextArea(label)
             ctl.setPlainText(str(value))
@@ -1165,6 +1173,22 @@ class PageView(QScrollArea):
     def _commit_field(self, index, xref, value) -> None:
         if self._doc and self._doc.set_field_value(index, xref, value):
             self.form_changed.emit()
+
+    def _commit_combo(self, index, xref, text) -> None:
+        """コンボ選択: 値を確定し、官公庁フォームなら JS 連動（_PRINT 転写・
+        枝ラベル表示切替）も再現してからページを再描画する。"""
+        if not self._doc:
+            return
+        committed = self._doc.set_field_value(index, xref, text)
+        js_changed = False
+        if self._doc.is_govform_js_eligible():
+            js_changed = self._doc.commit_govform_combo(index, xref, text)
+        if committed or js_changed:
+            self.form_changed.emit()
+        if js_changed:
+            # 枝ラベルの表示切替や _PRINT の値が変わり得るので描画を作り直す
+            self._build_form_overlays()
+            self._after_annot(index)
 
     def _is_govform_click_field(self, field) -> bool:
         """kind=="radio" の欄が、官公庁フォームJSトグルの対象として妥当そうか。

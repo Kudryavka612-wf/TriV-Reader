@@ -593,6 +593,9 @@ class PdfDocument:
                 "fontsize": float(getattr(w, "text_fontsize", 0) or 0),
                 # 官公庁フォームの JS トグル判定用（クリックハンドラの有無）。
                 "script": getattr(w, "script", None) or "",
+                # 表示状態(0=表示,1=非表示,2=画面のみ,3=印刷のみ)。画面に出す
+                # かどうかの判定に使う（_PRINT 欄など画面非表示の欄を除外）。
+                "display": int(getattr(w, "field_display", 0) or 0),
             })
         return out
 
@@ -639,6 +642,46 @@ class PdfDocument:
         if not self._doc:
             return False
         changed = govform_js.run_click(self._doc, index, xref, self.doc_scripts())
+        if changed:
+            self.modified = True
+        return changed
+
+    def govform_combo_export_value(self, index: int, xref: int, display_text: str):
+        """コンボの表示テキストから、対応するエクスポート値を求める。
+
+        choice_values は文字列か (エクスポート値, 表示名) のタプル。JS の
+        event.changeEx にはエクスポート値を渡す必要がある（表示名しか一致
+        しなければ、そのまま表示名を使う）。
+        """
+        if not self._doc:
+            return display_text
+        try:
+            page = self._doc.load_page(index)
+            for w in (page.widgets() or []):
+                if w.xref != xref:
+                    continue
+                for c in (getattr(w, "choice_values", None) or []):
+                    if isinstance(c, (list, tuple)):
+                        export = str(c[0])
+                        face = str(c[1] if len(c) > 1 else c[0])
+                        if face == display_text or export == display_text:
+                            return export
+                    elif str(c) == display_text:
+                        return str(c)
+        except Exception:  # noqa: BLE001
+            pass
+        return display_text
+
+    def commit_govform_combo(self, index: int, xref: int, display_text: str) -> bool:
+        """コンボ選択時の JS（_PRINT 転写・枝ラベル表示切替）を再現する。
+
+        値/表示が実際に変化すれば True を返し modified を立てる。
+        """
+        if not self._doc:
+            return False
+        export = self.govform_combo_export_value(index, xref, display_text)
+        changed = govform_js.run_keystroke(
+            self._doc, index, xref, self.doc_scripts(), export)
         if changed:
             self.modified = True
         return changed

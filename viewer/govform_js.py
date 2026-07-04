@@ -21,9 +21,19 @@ import fitz
 
 # --- 実行を許可するヘルパー関数名（ここに書かれた名前だけを対象文書から
 #     抽出して V8 に注入する。文書 JS 全体は絶対に注入しない）------------
-ALLOWED_HELPERS = ("GroupButtonClick", "KinmuButtonClick")
+# いずれも「フィールドの表示状態(display)か値(value)だけを操作する」既知の
+# ヘルパー。入力チェック(CHK*/AlertError)や日付範囲制約(SetDateComb)等は
+# 対象外（未注入なら実行時に ReferenceError となり try/catch で無害に無視）。
+ALLOWED_HELPERS = (
+    "GroupButtonClick",   # クリックで「丸選択」をトグル（表示切替）
+    "KinmuButtonClick",   # 勤務状況の複数状態トグル（表示切替）
+    "SetShinryoAll",      # 診療日を31日分まとめて選択（表示切替）
+    "SetKinmuAll",        # 勤務日を31日分まとめて選択（表示切替）
+    "StateNameSelect",    # 都道府県コンボ選択で枝ラベルを表示/非表示
+    "DropDownSelect",     # コンボ選択値を相棒の _PRINT 欄へ転写（値書き込み）
+)
 
-# ウィジェットの /A スクリプトが「単純な no-arg-besides-event の関数呼び出し」
+# ウィジェットのスクリプトが「単純な no-arg-besides-event の関数呼び出し」
 # であることを確認するための形状チェック（それ以外は何もしない）。
 SIMPLE_CALL_RE = re.compile(r"^(\w+)\(event\)$")
 
@@ -168,6 +178,21 @@ class FieldBridge:
         )
 
 
+def widget_keystroke_js(doc: "fitz.Document", xref: int) -> str:
+    """コンボ等の Keystroke アクション(/AA/K/JS)を取り出す。
+
+    PyMuPDF の widget.script_change はこのフォームで空を返すことがあるため
+    低レベルに /AA/K/JS を直接読む。無ければ空文字。
+    """
+    try:
+        js = doc.xref_get_key(xref, "AA/K/JS")
+        if js and js[0] == "string":
+            return js[1]
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def run_click(doc: "fitz.Document", page_index: int, widget_xref: int,
               doc_scripts: dict[str, str]) -> bool:
     """widget_xref のウィジェットをクリックしたとして /A スクリプトを実行する。
@@ -177,13 +202,41 @@ def run_click(doc: "fitz.Document", page_index: int, widget_xref: int,
     握りつぶし、呼び出し元やアプリ全体を絶対に落とさない）。
     """
     try:
-        return _run_click_impl(doc, page_index, widget_xref, doc_scripts)
+        clicked_script = None
+        page = doc.load_page(page_index)
+        for w in (page.widgets() or []):
+            if w.xref == widget_xref:
+                clicked_script = w.script or ""
+                break
+        if clicked_script is None:
+            return False
+        return _run_action_impl(doc, page_index, widget_xref, doc_scripts,
+                                clicked_script, change_value=None)
     except Exception:  # noqa: BLE001
         return False
 
 
-def _run_click_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
-                     doc_scripts: dict[str, str]) -> bool:
+def run_keystroke(doc: "fitz.Document", page_index: int, widget_xref: int,
+                  doc_scripts: dict[str, str], change_value: str) -> bool:
+    """コンボ選択時の Keystroke(/AA/K)を実行し、値/表示の変化を PDF へ反映する。
+
+    change_value は選択されたエクスポート値（event.changeEx 相当）。
+    DropDownSelect による _PRINT 欄への転写や StateNameSelect による
+    枝ラベルの表示切替が対象。失敗時は何もせず False。
+    """
+    try:
+        entry_script = widget_keystroke_js(doc, widget_xref)
+        if not entry_script:
+            return False
+        return _run_action_impl(doc, page_index, widget_xref, doc_scripts,
+                                entry_script, change_value=change_value)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
+                     doc_scripts: dict[str, str], entry_script: str,
+                     change_value) -> bool:
     from py_mini_racer import MiniRacer  # 使う時だけ import（起動時コストを避ける）
 
     if not is_eligible(doc_scripts):
@@ -191,12 +244,11 @@ def _run_click_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
 
     page = doc.load_page(page_index)
     widgets = list(page.widgets() or [])
-    clicked = next((w for w in widgets if w.xref == widget_xref), None)
-    if clicked is None:
+    target = next((w for w in widgets if w.xref == widget_xref), None)
+    if target is None:
         return False
 
-    script = clicked.script or ""
-    m = SIMPLE_CALL_RE.match(script.strip())
+    m = SIMPLE_CALL_RE.match((entry_script or "").strip())
     if not m:
         # 単純な「識別子(event)」形でなければ、何を実行することになるか
         # 保証できないため何もしない。
@@ -212,9 +264,9 @@ def _run_click_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
     if not helper_sources:
         return False
 
-    # entry_name 自体が GroupButtonClick/KinmuButtonClick そのものの場合と、
-    # それらを内部で呼ぶラッパー関数（例: FRM6010_03_004_1_MouseUp）の場合が
-    # 実ファイルで両方観測されている。ラッパーなら定義も追加で注入する。
+    # entry_name 自体が許可ヘルパーそのものの場合と、それらを内部で呼ぶ
+    # ラッパー関数（例: FRM6010_03_004_1_MouseUp / FRM6010_01_005_Keystroke）の
+    # 場合が実ファイルで両方観測されている。ラッパーなら定義も追加で注入する。
     entry_source = None
     if entry_name not in ALLOWED_HELPERS:
         entry_source = _find_function_source(combined, entry_name)
@@ -223,12 +275,14 @@ def _run_click_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
 
     # --- 各ウィジェットの現在状態を Python 側に集約（getField 用）------
     before_display: dict[str, int] = {}
+    before_value: dict[str, str] = {}
     bridges: list[FieldBridge] = []
     for w in widgets:
         if not w.field_name:
             continue
         bridge = FieldBridge.from_widget(w)
         before_display[bridge.name] = bridge.display
+        before_value[bridge.name] = bridge.valueAsString
         bridges.append(bridge)
 
     ctx = MiniRacer()
@@ -242,7 +296,10 @@ def _run_click_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
             __fields[name] = {
                 name: name,
                 display: disp,
-                value: value,
+                _value: value,
+                get value(){ return this._value; },
+                set value(v){ this._value = v;
+                    this.valueAsString = (v===null||v===undefined)?"":String(v); },
                 valueAsString: (value === null || value === undefined) ? "" : String(value),
                 readonly: readonly,
                 required: false,
@@ -268,41 +325,66 @@ def _run_click_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
     if entry_source:
         ctx.eval(entry_source, timeout=_JS_EXEC_TIMEOUT_MS)
 
-    # entry のラッパー本体が CHK6010_* / AlertError2 等の未定義関数を呼んでも
-    # トグル自体は既に走った後なので、try/catch で無害に握りつぶす。
+    # entry のラッパー本体が CHK6010_* / AlertError2 / SetDateComb 等の未注入
+    # 関数を呼んでも、対象の表示/値変更は先に走った後なので try/catch で無視。
+    # keystroke の場合は willCommit=false・changeEx を渡す（DropDownSelect 等が
+    # この条件下でのみ動くため）。
     ctx.eval(
         """
-        function __run_click(eventTargetName){
+        function __run_action(eventTargetName, changeEx, isKeystroke){
             var event = {target: {name: eventTargetName}};
-            try { %s(event); } catch (e) { /* validation 等は対象外・無視 */ }
+            if (isKeystroke) { event.willCommit = false; event.changeEx = changeEx; }
+            try { %s(event); } catch (e) { /* 対象外の処理は無視 */ }
         }
         """ % entry_name,
         timeout=_JS_EXEC_TIMEOUT_MS,
     )
-    ctx.eval("__run_click(%s); null;" % _js_str(clicked.field_name),
-             timeout=_JS_EXEC_TIMEOUT_MS)
+    is_keystroke = change_value is not None
+    ctx.eval(
+        "__run_action(%s, %s, %s); null;" % (
+            _js_str(target.field_name),
+            _js_str("" if change_value is None else str(change_value)),
+            "true" if is_keystroke else "false"),
+        timeout=_JS_EXEC_TIMEOUT_MS,
+    )
 
-    # --- 変化した display を PDF の /F に反映する -------------------------
+    # --- 変化した display / value を PDF に反映する ----------------------
     changed = False
     for w in widgets:
-        if not w.field_name or w.field_name not in before_display:
+        name = w.field_name
+        if not name or name not in before_display:
             continue
         try:
             new_disp = ctx.eval(
                 "__fields[%s] ? __fields[%s].display : -1"
-                % (_js_str(w.field_name), _js_str(w.field_name)),
+                % (_js_str(name), _js_str(name)),
+                timeout=_JS_EXEC_TIMEOUT_MS,
+            )
+            new_val = ctx.eval(
+                "__fields[%s] ? String(__fields[%s].valueAsString) : null"
+                % (_js_str(name), _js_str(name)),
                 timeout=_JS_EXEC_TIMEOUT_MS,
             )
         except Exception:  # noqa: BLE001
             continue
-        if new_disp is None or new_disp < 0:
-            continue
-        new_disp = int(new_disp)
-        if new_disp == before_display[w.field_name]:
-            continue
-        if _apply_display(doc, w.xref, new_disp):
-            changed = True
+        if new_disp is not None and int(new_disp) >= 0 \
+                and int(new_disp) != before_display[name]:
+            if _apply_display(doc, w.xref, int(new_disp)):
+                changed = True
+        if new_val is not None and str(new_val) != before_value.get(name, ""):
+            if _apply_value(w, str(new_val)):
+                changed = True
     return changed
+
+
+def _apply_value(widget, new_value: str) -> bool:
+    """ウィジェットのフィールド値を書き込む（_PRINT 欄への転写用）。"""
+    try:
+        widget.field_value = new_value
+        widget.update()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _apply_display(doc: "fitz.Document", xref: int, new_display: int) -> bool:
