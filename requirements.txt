@@ -3,7 +3,12 @@ PyMuPDF>=1.27
 pikepdf>=10
 Pillow>=10        # 画像処理（傾き補正など）
 numpy>=1.26       # 傾き補正の射影プロファイル計算
-py_mini_racer     # 官公庁フォームの「丸で選択」JS トグル実行用（V8同梱・ビルド不要）
+# 官公庁フォームの「丸で選択」JS トグル実行用（V8同梱・ビルド不要）。
+# 0.14.0 以上を必須にする: 0.6.x は PyInstaller で固めると V8 DLL の探索先が
+# _MEIPASS 直下に固定されており（--collect-all は py_mini_racer/ サブフォルダに
+# 置く）DLL を見つけられず、凍結ビルドで JS 実行が黙って失敗する。0.14.0 は
+# _MEIPASS/py_mini_racer/ を見るため同梱と整合する（GitHub issue bpcreech/#78）。
+py_mini_racer>=0.14.0
 
 # OCR は PyMuPDF 内蔵の Tesseract を使うため追加の pip パッケージは不要。
 # 言語データ(*.traineddata)のみ必要で、アプリが自動で

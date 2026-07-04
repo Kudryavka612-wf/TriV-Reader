@@ -312,6 +312,66 @@ def widget_keystroke_js(doc: "fitz.Document", xref: int) -> str:
     return ""
 
 
+# entry ラッパーが「GroupButtonClick(event, [...])」を呼ぶだけかを見抜く。
+# これは同じ rect の _ON/_OFF ペアの表示を切り替えるだけの純ラジオ動作なので、
+# V8 を使わず Python で完全再現できる（凍結ビルドで V8 DLL が読めなくても動く）。
+_GROUP_BUTTON_CALL_RE = re.compile(
+    r"GroupButtonClick\s*\(\s*event\s*,\s*(\[[^\]]*\])\s*\)")
+
+
+def _native_group_button_click(doc: "fitz.Document", page_index: int,
+                               clicked_name: str, entry_source: str,
+                               combined: str) -> bool | None:
+    """GroupButtonClick の「丸選択」トグルを V8 なしで再現する。
+
+    entry_source が実質 GroupButtonClick(event, [base...]) を呼ぶだけで、
+    クリック欄が base の "_ON"/"_OFF" のいずれかなら、各 base の _ON/_OFF の
+    表示（/F Hidden ビット）を JS と同じラジオ規則で切り替える。
+
+    返り値: 変化を適用したら True／変化なしなら False／このパターンに当て
+    はまらず処理していない場合は None（呼び出し側は V8 実行へフォールバック）。
+    """
+    # 文書が GroupButtonClick を実際に定義していること（安全確認）
+    if _find_function_source(combined, "GroupButtonClick") is None:
+        return None
+    m = _GROUP_BUTTON_CALL_RE.search(entry_source or "")
+    if not m:
+        return None
+    try:
+        bases = json.loads(m.group(1))
+    except Exception:  # noqa: BLE001
+        return None
+    if not (isinstance(bases, list) and bases
+            and all(isinstance(b, str) for b in bases)):
+        return None
+    # クリック欄が list 内 base の _ON/_OFF でなければ、想定外なので V8 に委ねる
+    if not any(clicked_name == b + "_ON" or clicked_name == b + "_OFF"
+               for b in bases):
+        return None
+
+    # フィールド名 → xref（このページ内）
+    name_to_xref: dict[str, int] = {}
+    for w in (doc.load_page(page_index).widgets() or []):
+        if w.field_name:
+            name_to_xref[w.field_name] = w.xref
+
+    # JS の GroupButtonClick と同じ規則で、各欄の目標表示を決める
+    #  ・クリックした _OFF の base → その base を選択（_ON 表示 / _OFF 非表示）
+    #  ・クリックした _ON  の base → 選択解除（_ON 非表示 / _OFF 表示）
+    #  ・それ以外の base       → 選択解除（_ON 非表示 / _OFF 表示）
+    changed = False
+    for b in bases:
+        on_name, off_name = b + "_ON", b + "_OFF"
+        select = (clicked_name == off_name)  # OFF を押した base だけ選択状態に
+        targets = ((on_name, DISPLAY_VISIBLE if select else DISPLAY_HIDDEN),
+                   (off_name, DISPLAY_HIDDEN if select else DISPLAY_VISIBLE))
+        for name, disp in targets:
+            xref = name_to_xref.get(name)
+            if xref is not None and _apply_display(doc, xref, disp):
+                changed = True
+    return changed
+
+
 def run_click(doc: "fitz.Document", page_index: int, widget_xref: int,
               doc_scripts: dict[str, str]) -> bool:
     """widget_xref のウィジェットをクリックしたとして /A スクリプトを実行する。
@@ -319,16 +379,32 @@ def run_click(doc: "fitz.Document", page_index: int, widget_xref: int,
     実際に表示状態が変わったウィジェットがあれば PDF の /F に書き戻して
     True を返す。何かがおかしければ何もせず False を返す（例外は必ずここで
     握りつぶし、呼び出し元やアプリ全体を絶対に落とさない）。
+
+    「丸選択」(GroupButtonClick) は V8 非依存のネイティブ経路で先に処理する。
+    こうすることで、万一 py_mini_racer/V8 が読み込めない環境でも選択が動く。
     """
     try:
         clicked_script = None
+        clicked_name = ""
         page = doc.load_page(page_index)
         for w in (page.widgets() or []):
             if w.xref == widget_xref:
                 clicked_script = w.script or ""
+                clicked_name = w.field_name or ""
                 break
         if clicked_script is None:
             return False
+        if not is_eligible(doc_scripts):
+            return False
+        m = SIMPLE_CALL_RE.match(clicked_script.strip())
+        if m:
+            combined = "\n".join(doc_scripts.values())
+            entry_source = _find_function_source(combined, m.group(1))
+            if entry_source is not None:
+                native = _native_group_button_click(
+                    doc, page_index, clicked_name, entry_source, combined)
+                if native is not None:
+                    return native  # ネイティブで処理済み（V8 不要）
         return _run_action_impl(doc, page_index, widget_xref, doc_scripts,
                                 clicked_script, change_value=None)
     except Exception:  # noqa: BLE001
