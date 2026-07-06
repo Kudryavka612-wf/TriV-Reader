@@ -111,6 +111,44 @@ def main() -> int:
     check("restyle selected: fill", last().get("fill") is not None)
     check("restyle keeps width through later edits", last().get("w") == 12.0, str(last()))
 
+    # --- restyle the arrow start/end of an EXISTING selected line ---
+    from viewer.document import LINE_END_STYLES
+
+    def line_ends_of(xr):
+        for a in doc._doc.load_page(0).annots():
+            if a.xref == xr:
+                return a.line_ends
+        return None
+
+    pv.set_tool(TOOL_LINE)
+    pv.set_line_start("none")
+    pv.set_line_end("closed_arrow")
+    drag(QPoint(40, 190), QPoint(240, 210))
+    line_xref = last()["xref"]
+    check("new line: end is closed_arrow",
+          line_ends_of(line_xref) == (LINE_END_STYLES["none"],
+                                      LINE_END_STYLES["closed_arrow"]),
+          str(line_ends_of(line_xref)))
+    pv.set_tool(TOOL_NONE)
+    pv.set_selection(0, line_xref)
+    pv.set_line_end("open_arrow")   # 選択中の線の終点を変更
+    check("restyle selected: end -> open_arrow",
+          line_ends_of(pv._sel_xref)[1] == LINE_END_STYLES["open_arrow"],
+          str(line_ends_of(pv._sel_xref)))
+    pv.set_line_start("circle")     # 始点も変更
+    check("restyle selected: start -> circle",
+          line_ends_of(pv._sel_xref)[0] == LINE_END_STYLES["circle"],
+          str(line_ends_of(pv._sel_xref)))
+    pv.undo_annot()   # undo は選択を解除し xref も変わるので種別で引き直す
+
+    def only_line_ends():
+        for a in doc._doc.load_page(0).annots():
+            if a.type[1] == "Line":
+                return a.line_ends
+        return None
+    check("undo restyle -> start back to none",
+          only_line_ends()[0] == LINE_END_STYLES["none"], str(only_line_ends()))
+
     # --- in-place text annotation (type live, size + colour) ---
     from PySide6.QtGui import QColor as _QC
     pv.set_tool(TOOL_TEXT)

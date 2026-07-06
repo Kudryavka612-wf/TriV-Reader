@@ -924,7 +924,7 @@ class PdfDocument:
 
     def _recreate(self, page, desc, dx=0.0, dy=0.0, color=None, width=None,
                   text=None, new_rect=None, dashes=_UNSET, opacity=_UNSET,
-                  fill=_UNSET):
+                  fill=_UNSET, line_ends=_UNSET):
         """捕捉した注釈情報から、平行移動・リサイズ・色/太さ/線種/不透明度/塗り/
         本文を変更して作り直す。
 
@@ -975,7 +975,7 @@ class PdfDocument:
             annot = page.add_line_annot(p0, p1)
             annot.set_colors(stroke=stroke)
             annot.set_border(width=w, dashes=dashes)
-            ends = desc.get("line_ends")
+            ends = desc.get("line_ends") if line_ends is _UNSET else line_ends
             if ends:
                 annot.set_line_ends(ends[0], ends[1])
         elif kind in ("Underline", "StrikeOut"):
@@ -1059,14 +1059,15 @@ class PdfDocument:
         return self._edit_annot(index, xref, color=color)
 
     def restyle_annot(self, index, xref, width=None, dashes=_UNSET,
-                      opacity=_UNSET, fill=_UNSET):
-        """選択済み注釈の太さ・線種(dashes)・不透明度・塗りを後から変更する。
+                      opacity=_UNSET, fill=_UNSET, line_ends=_UNSET):
+        """選択済み注釈の太さ・線種(dashes)・不透明度・塗り・線端を後から変更する。
 
         未指定（_UNSET / None）の項目は元の値を引き継ぐ。fill=None は「塗り無し」。
+        line_ends は (始点, 終点) の PDF 線端コード(int)のタプル（直線/矢印のみ有効）。
         変更後の新しい xref を返す（作り直しのため xref は変わる）。
         """
         return self._edit_annot(index, xref, width=width, dashes=dashes,
-                                opacity=opacity, fill=fill)
+                                opacity=opacity, fill=fill, line_ends=line_ends)
 
     def set_annot_text(self, index, xref, text):
         return self._edit_annot(index, xref, text=text)

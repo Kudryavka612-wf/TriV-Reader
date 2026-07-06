@@ -823,9 +823,20 @@ class PageView(QScrollArea):
 
     def set_line_start(self, key: str) -> None:
         self.line_start = key
+        # 注釈を選択中なら、その注釈の線端にも即座に反映する。
+        self.restyle_selection(line_ends=self._line_ends())
 
     def set_line_end(self, key: str) -> None:
         self.line_end = key
+        self.restyle_selection(line_ends=self._line_ends())
+
+    def _line_ends(self):
+        """現在の始点/終点キーを PDF 線端コード (始点, 終点) のタプルに変換する。"""
+        from .document import LINE_END_STYLES
+        import fitz
+        s = LINE_END_STYLES.get(self.line_start, fitz.PDF_ANNOT_LE_NONE)
+        e = LINE_END_STYLES.get(self.line_end, fitz.PDF_ANNOT_LE_NONE)
+        return (s, e)
 
     def set_fill_enabled(self, on: bool) -> None:
         self.fill_enabled = bool(on)
@@ -1171,8 +1182,8 @@ class PageView(QScrollArea):
         self._after_annot(self._sel_index)
 
     def restyle_selection(self, *, width=None, dashes=_UNSET,
-                          opacity=_UNSET, fill=_UNSET) -> bool:
-        """選択中の注釈の太さ・線種・不透明度・塗りを変更する。
+                          opacity=_UNSET, fill=_UNSET, line_ends=_UNSET) -> bool:
+        """選択中の注釈の太さ・線種・不透明度・塗り・線端を変更する。
 
         注釈を選択していなければ何もしない（新規描画用の設定変更のときは無視）。
         指定した項目だけ変え、残りは元の値を保つ。
@@ -1181,7 +1192,8 @@ class PageView(QScrollArea):
             return False
         new_xref = self._doc.restyle_annot(
             self._sel_index, self._sel_xref,
-            width=width, dashes=dashes, opacity=opacity, fill=fill)
+            width=width, dashes=dashes, opacity=opacity, fill=fill,
+            line_ends=line_ends)
         if new_xref is not None:
             self._sel_xref = new_xref
         self._after_annot(self._sel_index)
