@@ -849,7 +849,20 @@ class MainWindow(QMainWindow):
         # リボンを最上部に据え、従来のメニューバー/ツールバーは隠す
         self.setMenuWidget(r)
         r.setStyleSheet(RIBBON_QSS)
+        # 太さ・線種・始点/終点・不透明・ズーム等のコントロールは、元々ツールバーへ
+        # addWidget で置いてからリボンへ移設している。addWidget が内部で作る
+        # QWidgetAction はウィジェットを「所有」し続けるため、この後 tb.hide() すると
+        # リボンへ移したはずのウィジェットまで一緒に隠され、操作できなくなる
+        # （＝リボン折りたたみに関係なく、これらの入力欄が使えない不具合）。
+        # ツールバー側の QWidgetAction を外し、リボン内で確実に表示させてから隠す。
+        from PySide6.QtWidgets import QWidgetAction
         for tb in (self.main_toolbar, self.annot_toolbar):
+            for act in list(tb.actions()):
+                if isinstance(act, QWidgetAction):
+                    wdg = act.defaultWidget()
+                    if wdg is not None and r.isAncestorOf(wdg):
+                        tb.removeAction(act)
+                        wdg.show()
             tb.hide()
         # 折りたたみ状態を復元
         if self.settings.value("ribbon_collapsed", False, bool):
