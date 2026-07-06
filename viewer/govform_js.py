@@ -500,6 +500,11 @@ _STATENAME_CALL_RE = re.compile(
     r'\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)')
 
 
+def _norm_state(s: str) -> str:
+    """都道府県名の照合用に前後の空白（半角・全角「　」）を落とす。"""
+    return s.strip().strip("　").strip()
+
+
 def _parse_state_lists(state_src: str) -> dict[str, list[str]]:
     """StateNameSelect 内の toLst/douLst/fuLst/kenLst を「代入」「+= 追記」の
     両方から集めて {リスト名: [エクスポート値...]} を返す。"""
@@ -543,16 +548,21 @@ def _native_state_name_select(doc: "fitz.Document", page_index: int,
             changed = True
 
     state = "" if change_value is None else str(change_value)
-    if state == "" or state == " ":
+    if _norm_state(state) == "":
         return changed  # 未選択なら全非表示のまま（JS と同じ）
 
-    # 分類に一致する枝を表示（複数該当は JS 同様すべて表示するが実データでは排他）
+    # 分類に一致する枝を表示（複数該当は JS 同様すべて表示するが実データでは排他）。
+    # 照合は前後の空白（半角・全角「　」）を無視する。実フォーム(6010)では
+    # 「鹿児島」の選択肢だけ先頭の " 　" が欠落しており、厳密一致だと kenLst の
+    # " 　鹿児島" と一致せず「県」ラベルが出ない（PDF 側のデータ不備）。正規化
+    # 後の都道府県名は to/道/府/県 の各リスト間で重複しないため誤判定は起きない。
+    norm_state = _norm_state(state)
     show = ((to_btn, lists.get("toLst", [])),
             (dou_btn, lists.get("douLst", [])),
             (fu_btn, lists.get("fuLst", [])),
             (ken_btn, lists.get("kenLst", [])))
     for name, values in show:
-        if state in values:
+        if any(norm_state == _norm_state(v) for v in values):
             xref = name_to_xref.get(name)
             if xref is not None and _apply_display(doc, xref, DISPLAY_VISIBLE):
                 changed = True
