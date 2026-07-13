@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QScrollArea,
     QSizePolicy,
     QTabWidget,
     QToolButton,
@@ -93,6 +94,12 @@ class RibbonGroup(QWidget):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             # 列の幅いっぱいに広げる → 同列のボタン幅が揃って整って見える
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            # ウィンドウ幅が足りないときにボタンが文字幅より縮んで
+            # 「ハ..ト」のように見切れないよう、文字＋アイコン分を下限にする。
+            # （収まらない分はリボン全体の横スクロールで見られる）
+            fm = btn.fontMetrics()
+            # 内訳: アイコン16 + アイコンと文字の間隔4 + QSS padding 左右6+6 + 余裕2
+            btn.setMinimumWidth(fm.horizontalAdvance(btn.text()) + 34)
             btn.setMinimumHeight(24)
             col.addWidget(btn)
 
@@ -106,13 +113,18 @@ class RibbonGroup(QWidget):
 class Ribbon(QTabWidget):
     """タブごとにグループを並べるリボン本体。折りたたみ対応。"""
 
-    EXPANDED_HEIGHT = 96  # 2段スタック向けに低め
+    # 2段スタック＋グループ名が収まる高さ。幅不足時に出る横スクロールバー
+    # （8px）分の余裕も含める（96 だと2段目が押し出されて隠れるため）。
+    EXPANDED_HEIGHT = 104
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setDocumentMode(True)
         self.tabBar().setExpanding(False)
-        self.setMaximumHeight(self.EXPANDED_HEIGHT)
+        # 高さは sizeHint に任せず固定する。ページを QScrollArea（縦 Ignored）で
+        # 包んだことで sizeHint が実内容を反映しなくなったため、ヒント経由だと
+        # リボンが潰れて2段目が見えなくなる。
+        self._apply_height(self.EXPANDED_HEIGHT)
         self.setObjectName("ribbon")
         self._collapsed = False
 
@@ -144,14 +156,20 @@ class Ribbon(QTabWidget):
     def is_collapsed(self) -> bool:
         return self._collapsed
 
+    def _apply_height(self, h: int) -> None:
+        """リボンの高さを固定する（min/max を揃える）。"""
+        self.setMinimumHeight(h)
+        self.setMaximumHeight(h)
+
+    def _collapsed_height(self) -> int:
+        return self.tabBar().sizeHint().height() + 3
+
     def set_collapsed(self, on: bool) -> None:
         self._collapsed = on
         self._end_temp_open()
         self._collapse_btn.setText("▾" if on else "▴")
-        if on:
-            self.setMaximumHeight(self.tabBar().sizeHint().height() + 3)
-        else:
-            self.setMaximumHeight(self.EXPANDED_HEIGHT)
+        self._apply_height(self._collapsed_height() if on
+                           else self.EXPANDED_HEIGHT)
 
     def toggle_collapsed(self) -> None:
         self.set_collapsed(not self._collapsed)
@@ -160,7 +178,7 @@ class Ribbon(QTabWidget):
         if self._collapsed and not getattr(self, "_temp_open", False):
             # 一時展開（_collapsed は True のまま）
             self._temp_open = True
-            self.setMaximumHeight(self.EXPANDED_HEIGHT)
+            self._apply_height(self.EXPANDED_HEIGHT)
             QApplication.instance().installEventFilter(self)
 
     def _end_temp_open(self) -> None:
@@ -181,7 +199,7 @@ class Ribbon(QTabWidget):
                 w = w.parentWidget()
             if not inside:
                 self._end_temp_open()
-                self.setMaximumHeight(self.tabBar().sizeHint().height() + 3)
+                self._apply_height(self._collapsed_height())
         return super().eventFilter(obj, event)
 
     # --- ページ / グループ ----------------------------------------------
@@ -192,7 +210,19 @@ class Ribbon(QTabWidget):
         row.setSpacing(0)
         row.setAlignment(Qt.AlignmentFlag.AlignLeft)
         page._ribbon_row = row  # type: ignore[attr-defined]
-        self.addTab(page, name)
+        # ウィンドウ幅が足りないときはボタンを潰して文字を見切れさせるのではなく、
+        # ページごと横スクロールできるようにする（内容の最小幅を尊重する）。
+        # 縦方向は Ignored にして、スクロールバー分の高さ変動があっても
+        # 従来どおりレイアウト側で圧縮する（2段目が隠れないように）。
+        page.setSizePolicy(QSizePolicy.Policy.Preferred,
+                           QSizePolicy.Policy.Ignored)
+        scroll = QScrollArea()
+        scroll.setWidget(page)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.addTab(scroll, name)
         return page
 
     def add_group(self, page: QWidget, title: str) -> RibbonGroup:
@@ -216,4 +246,12 @@ RIBBON_QSS = """
 #ribbon QToolButton { padding: 2px 6px; border-radius: 4px; }
 #ribbon QToolButton:hover { background: rgba(37,99,235,0.12); }
 #ribbon QToolButton:checked { background: rgba(37,99,235,0.20); }
+#ribbon QScrollArea { background: transparent; }
+#ribbon QScrollArea > QWidget > QWidget { background: transparent; }
+/* 幅不足時のみ出る横スクロールバー。グループの高さを圧迫しないよう薄くする */
+#ribbon QScrollBar:horizontal { height: 8px; background: transparent; }
+#ribbon QScrollBar::handle:horizontal {
+    background: rgba(120,120,120,0.45); border-radius: 4px; min-width: 24px; }
+#ribbon QScrollBar::add-line:horizontal, #ribbon QScrollBar::sub-line:horizontal {
+    width: 0px; }
 """

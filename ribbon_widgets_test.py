@@ -106,6 +106,32 @@ def main() -> int:
           line_ends() is not None and line_ends()[1] == LINE_END_STYLES["open_arrow"],
           f"(ends={line_ends()})")
 
+    # 狭いウィンドウでもツールボタンが文字幅より縮んで「ハ..ト」のように
+    # 見切れないこと（収まらない分はリボンの横スクロールで送る）。
+    from PySide6.QtWidgets import QToolButton
+    for i in range(rb.count()):
+        if rb.tabText(i) == "注釈":
+            rb.setCurrentIndex(i)
+    w.resize(690, 420)
+    app.processEvents()
+    app.processEvents()
+    squeezed = []
+    tool_btns = [b for b in rb.findChildren(QToolButton)
+                 if b.isVisible() and b.text()
+                 and b.defaultAction() in w.tool_group.actions()]
+    for b in tool_btns:
+        need = b.fontMetrics().horizontalAdvance(b.text()) + 34
+        if b.width() < need - 2:
+            squeezed.append((b.text(), b.width(), need))
+    check("tool buttons keep full label width at 690px", not squeezed,
+          str(squeezed))
+    # 2段目（例: 四角）が縦方向にも隠れず見えていること
+    ys = sorted({b.y() for b in tool_btns})
+    check("both stacked rows are visible at 690px",
+          len(ys) >= 2 and all(0 <= y < rb.height() for y in ys), f"(rows y={ys})")
+    w.resize(1300, 850)
+    app.processEvents()
+
     if os.path.exists(sample):
         os.remove(sample)
     ok = sum(results)
