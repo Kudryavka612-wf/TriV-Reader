@@ -711,8 +711,9 @@ class PageView(QScrollArea):
         self.fill_color = QColor(255, 255, 255)
         self.opacity = 1.0           # 0.0-1.0
         self.text_size = 14          # テキスト注釈の文字サイズ(pt)
+        self.text_font = "helv"      # テキスト注釈のフォント（helv/tiro/cour）
         self._text_editor = None     # その場入力中の _TextAnnotEditor（1個だけ）
-        self._text_ctx = None        # (page_index, pdf_rect)
+        self._text_ctx = None        # {"index", "rect", "xref"(既存編集時のみ), "color"}
         self.pending_stamp = None    # 配置待ちスタンプ {text, color(QColor), fontsize}
         self._sel_index = -1
         self._sel_xref = None
@@ -806,6 +807,32 @@ class PageView(QScrollArea):
         self.text_size = max(6, int(size))
         if self._text_editor is not None:
             self._apply_text_editor_style()
+        # テキスト注釈を選択中なら、入力後でもサイズを変更できる
+        if self._selection_is_freetext():
+            self.restyle_selection(fontsize=self.text_size)
+
+    def set_text_font(self, fontname: str) -> None:
+        """テキスト注釈のフォント（helv/tiro/cour）を設定する。
+
+        その場入力中はプレビューへ、テキスト注釈を選択中はその注釈へ即反映する。
+        """
+        self.text_font = fontname or "helv"
+        if self._text_editor is not None:
+            self._apply_text_editor_style()
+        if self._selection_is_freetext():
+            self.restyle_selection(fontname=self.text_font)
+
+    def _selection_is_freetext(self) -> bool:
+        if self._sel_xref is None or not self._doc:
+            return False
+        style = self._doc.annot_textstyle(self._sel_index, self._sel_xref)
+        return bool(style) and style["kind"] == "FreeText"
+
+    def selection_textstyle(self):
+        """選択中の注釈の文字スタイル（annot_textstyle の dict）。無ければ None。"""
+        if self._sel_xref is None or not self._doc:
+            return None
+        return self._doc.annot_textstyle(self._sel_index, self._sel_xref)
 
     def set_stamp(self, text: str, qcolor: QColor, fontsize: int = 22) -> None:
         """スタンプ配置モードにする。以後クリックした位置に text を置く。"""
@@ -899,8 +926,10 @@ class PageView(QScrollArea):
         if rect.width < 2 or rect.height < 2:
             return  # 誤クリックの極小矩形は無視
         if tool == TOOL_HIGHLIGHT:
-            if not self._doc.add_text_highlight(index, a, b, color=self._rgb()):
-                self._doc.add_highlight(index, rect, color=self._rgb())
+            if not self._doc.add_text_highlight(index, a, b, color=self._rgb(),
+                                                opacity=self.opacity):
+                self._doc.add_highlight(index, rect, color=self._rgb(),
+                                        opacity=self.opacity)
         elif tool == TOOL_RECT:
             self._doc.add_rect(index, rect, color=self._rgb(), width=self.pen_width,
                                fill=self._fill_rgb(), dashes=self._dashes(),
@@ -932,21 +961,59 @@ class PageView(QScrollArea):
         x1, y1 = max(p0.x(), p1.x()), max(p0.y(), p1.y())
         ed.setGeometry(int(x0), int(y0), max(40, int(x1 - x0)), max(24, int(y1 - y0)))
         self._text_editor = ed
-        self._text_ctx = (index, pdf_rect)
+        self._text_ctx = {"index": index, "rect": pdf_rect, "xref": None}
         self._apply_text_editor_style()
         ed.committed.connect(self._commit_text_edit)
         ed.cancelled.connect(self._discard_text_editor)
         ed.show()
         ed.setFocus()
 
+    def _begin_text_edit_existing(self, index: int, xref) -> None:
+        """既存のテキスト注釈（FreeText）を、その場の編集ボックスで直接編集する。
+
+        別ウィンドウ（ダイアログ）を開かず、注釈の位置に本文を載せて編集できる。
+        確定（外側クリック / Ctrl+Enter）で本文を書き戻す。Esc で取消。
+        """
+        if not self._doc:
+            return
+        rect = self._doc.annot_rect(index, xref)
+        if rect is None:
+            return
+        self._discard_text_editor()
+        style = self._doc.annot_textstyle(index, xref) or {}
+        x0, y0, x1, y1 = self._doc.pdf_rect_to_label(index, rect, self._zoom)
+        label = self._labels[index]
+        ed = _TextAnnotEditor(label)
+        ed.setGeometry(int(x0), int(y0), max(40, int(x1 - x0)), max(24, int(y1 - y0)))
+        ed.setPlainText(self._doc.annot_text(index, xref))
+        tc = style.get("text_color") or (0.0, 0.0, 0.0)
+        self._text_editor = ed
+        self._text_ctx = {
+            "index": index, "rect": rect, "xref": xref,
+            "color": QColor(int(tc[0] * 255), int(tc[1] * 255), int(tc[2] * 255)),
+        }
+        self._apply_text_editor_style()
+        ed.committed.connect(self._commit_text_edit)
+        ed.cancelled.connect(self._discard_text_editor)
+        ed.show()
+        ed.setFocus()
+        cur = ed.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        ed.setTextCursor(cur)
+
     def _apply_text_editor_style(self) -> None:
         ed = self._text_editor
         if ed is None:
             return
+        # 既存注釈の編集中はその注釈の文字色、新規はツールバーの色
         c = self.color
+        if self._text_ctx and self._text_ctx.get("color") is not None:
+            c = self._text_ctx["color"]
         px = max(8, int(self.text_size * self._zoom))
         f = ed.font()
         f.setPixelSize(px)
+        f.setFamily({"tiro": "Times New Roman", "cour": "Courier New"}
+                    .get(self.text_font, "Arial"))
         ed.setFont(f)
         ed.setStyleSheet(
             "QPlainTextEdit { background: rgba(255,255,255,235);"
@@ -957,12 +1024,25 @@ class PageView(QScrollArea):
         if self._text_editor is None or self._text_ctx is None:
             return
         text = self._text_editor.toPlainText()
-        index, pdf_rect = self._text_ctx
+        ctx = self._text_ctx
+        index = ctx["index"]
         self._discard_text_editor()
-        if text.strip() and self._doc:
-            self._doc.add_freetext(index, pdf_rect, text,
-                                   color=self._rgb(), fontsize=self.text_size)
-            self._after_annot(index)
+        if not text.strip() or not self._doc:
+            return
+        if ctx.get("xref") is not None:
+            # 既存注釈の本文を書き換え。編集中にサイズ変更等で xref が
+            # 変わっている場合は選択中の xref（最新）を優先する。
+            xref = ctx["xref"]
+            if self._sel_index == index and self._sel_xref is not None:
+                xref = self._sel_xref
+            new_xref = self._doc.set_annot_text(index, xref, text)
+            if new_xref is not None and self._sel_index == index:
+                self._sel_xref = new_xref
+        else:
+            self._doc.add_freetext(index, ctx["rect"], text,
+                                   color=self._rgb(), fontsize=self.text_size,
+                                   fontname=self.text_font)
+        self._after_annot(index)
 
     def _discard_text_editor(self) -> None:
         ed = self._text_editor
@@ -1182,8 +1262,9 @@ class PageView(QScrollArea):
         self._after_annot(self._sel_index)
 
     def restyle_selection(self, *, width=None, dashes=_UNSET,
-                          opacity=_UNSET, fill=_UNSET, line_ends=_UNSET) -> bool:
-        """選択中の注釈の太さ・線種・不透明度・塗り・線端を変更する。
+                          opacity=_UNSET, fill=_UNSET, line_ends=_UNSET,
+                          fontsize=None, fontname=None) -> bool:
+        """選択中の注釈の太さ・線種・不透明度・塗り・線端・文字サイズ/フォントを変更する。
 
         注釈を選択していなければ何もしない（新規描画用の設定変更のときは無視）。
         指定した項目だけ変え、残りは元の値を保つ。
@@ -1193,7 +1274,7 @@ class PageView(QScrollArea):
         new_xref = self._doc.restyle_annot(
             self._sel_index, self._sel_xref,
             width=width, dashes=dashes, opacity=opacity, fill=fill,
-            line_ends=line_ends)
+            line_ends=line_ends, fontsize=fontsize, fontname=fontname)
         if new_xref is not None:
             self._sel_xref = new_xref
         self._after_annot(self._sel_index)
@@ -1264,6 +1345,12 @@ class PageView(QScrollArea):
         index = self._sel_index
         if not self._doc.annot_is_textual(index, self._sel_xref):
             return
+        style = self._doc.annot_textstyle(index, self._sel_xref) or {}
+        if style.get("kind") == "FreeText":
+            # テキスト注釈はダイアログではなく、注釈の位置でその場編集する
+            self._begin_text_edit_existing(index, self._sel_xref)
+            return
+        # 付箋（アイコン注釈）は矩形が小さすぎるため従来どおりダイアログで編集
         from PySide6.QtWidgets import QInputDialog
         current = self._doc.annot_text(index, self._sel_xref)
         text, ok = QInputDialog.getMultiLineText(self, "注釈の編集", "本文:", current)
@@ -1311,6 +1398,15 @@ class PageView(QScrollArea):
             margin = PAGE_SPACING * (self._cols + 2) + 8
             avail = self.viewport().width() - margin
             self.set_zoom(avail / (w * self._cols))
+
+    def fit_height(self) -> None:
+        """ページ全体が縦に収まる倍率にする（縦に合わせる）。"""
+        if not self._doc or not self._doc.is_open:
+            return
+        _, h = self._doc.page_pixel_size(self._index, zoom=1.0)
+        if h:
+            avail = self.viewport().height() - PAGE_SPACING * 2
+            self.set_zoom(max(0.1, avail / h))
 
     WHEEL_ZOOM_STEP = 1.1  # Ctrl+ホイール1ノッチあたりの倍率変化
 

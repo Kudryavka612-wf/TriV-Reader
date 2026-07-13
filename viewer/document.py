@@ -208,7 +208,8 @@ class PdfDocument:
         annot.update()
         self.modified = True
 
-    def add_text_highlight(self, index, p0, p1, color=(1.0, 0.86, 0.18)) -> bool:
+    def add_text_highlight(self, index, p0, p1, color=(1.0, 0.86, 0.18),
+                           opacity=1.0) -> bool:
         """p0→p1（PDF座標）の間にある文字を、語のquadに沿ってハイライトする。
 
         テキストが見つからなければ False を返す（呼び出し側で矩形ハイライトに
@@ -239,6 +240,8 @@ class PdfDocument:
         self._push_undo(index)
         annot = page.add_highlight_annot(quads)
         annot.set_colors(stroke=color)
+        if opacity < 1.0:
+            annot.set_opacity(opacity)
         annot.update()
         self.modified = True
         return True
@@ -895,21 +898,31 @@ class PdfDocument:
             "content": annot.info.get("content", ""),
         }
         if desc["kind"] == "FreeText":
-            # 文字サイズと文字色は /DA に入る（annot.colors の stroke は枠線色で
-            # あって本文色ではない）。ここで拾わないと移動/リサイズ/Undo で
+            # 文字サイズ・フォント・文字色は /DA に入る（annot.colors の stroke は
+            # 枠線色であって本文色ではない）。ここで拾わないと移動/リサイズ/Undo で
             # サイズも色も失われる。
-            desc["fontsize"], desc["text_color"] = self._parse_freetext_da(annot)
+            (desc["fontsize"], desc["text_color"],
+             desc["fontname"]) = self._parse_freetext_da(annot)
         return desc
 
+    # /DA のフォント資源名 → add_freetext_annot に渡す短縮名
+    _DA_FONT_NAMES = {"helv": "helv", "tiro": "tiro", "cour": "cour",
+                      "times": "tiro"}
+
     def _parse_freetext_da(self, annot):
-        """FreeText の /DA 文字列からフォントサイズと本文色を取り出す。"""
-        fs, tc = 12.0, (0.0, 0.0, 0.0)
+        """FreeText の /DA 文字列からフォントサイズ・本文色・フォント名を取り出す。"""
+        fs, tc, fn = 12.0, (0.0, 0.0, 0.0), "helv"
         try:
             da = self._doc.xref_get_key(annot.xref, "DA")
             s = da[1] if da and da[0] == "string" else ""
-            m = re.search(r"([\d.]+)\s+Tf", s)
+            m = re.search(r"/(\w+)\s+([\d.]+)\s+Tf", s)
             if m:
-                fs = float(m.group(1))
+                fs = float(m.group(2))
+                fn = self._DA_FONT_NAMES.get(m.group(1).lower(), "helv")
+            else:
+                m = re.search(r"([\d.]+)\s+Tf", s)
+                if m:
+                    fs = float(m.group(1))
             m = re.search(r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+rg", s)
             if m:
                 tc = tuple(float(m.group(i)) for i in (1, 2, 3))
@@ -920,11 +933,11 @@ class PdfDocument:
                     tc = (v, v, v)
         except Exception:  # noqa: BLE001
             pass
-        return fs, tc
+        return fs, tc, fn
 
     def _recreate(self, page, desc, dx=0.0, dy=0.0, color=None, width=None,
                   text=None, new_rect=None, dashes=_UNSET, opacity=_UNSET,
-                  fill=_UNSET, line_ends=_UNSET):
+                  fill=_UNSET, line_ends=_UNSET, fontsize=None, fontname=None):
         """捕捉した注釈情報から、平行移動・リサイズ・色/太さ/線種/不透明度/塗り/
         本文を変更して作り直す。
 
@@ -959,10 +972,11 @@ class PdfDocument:
             annot.set_colors(stroke=stroke, fill=fill)
             annot.set_border(width=w, dashes=dashes)
         elif kind == "FreeText":
-            fs = desc.get("fontsize", 12) or 12
+            fs = fontsize if fontsize else (desc.get("fontsize", 12) or 12)
+            fn = fontname if fontname else (desc.get("fontname") or "helv")
             tc = color if color is not None else desc.get("text_color", stroke)
             annot = page.add_freetext_annot(target, content, fontsize=fs,
-                                            text_color=tc)
+                                            fontname=fn, text_color=tc)
         elif kind == "Text":
             annot = page.add_text_annot(fitz.Point(target.x0, target.y0), content)
         elif kind == "Ink":
@@ -1059,18 +1073,37 @@ class PdfDocument:
         return self._edit_annot(index, xref, color=color)
 
     def restyle_annot(self, index, xref, width=None, dashes=_UNSET,
-                      opacity=_UNSET, fill=_UNSET, line_ends=_UNSET):
-        """選択済み注釈の太さ・線種(dashes)・不透明度・塗り・線端を後から変更する。
+                      opacity=_UNSET, fill=_UNSET, line_ends=_UNSET,
+                      fontsize=None, fontname=None):
+        """選択済み注釈の太さ・線種(dashes)・不透明度・塗り・線端・文字サイズ/
+        フォント（FreeText のみ）を後から変更する。
 
         未指定（_UNSET / None）の項目は元の値を引き継ぐ。fill=None は「塗り無し」。
         line_ends は (始点, 終点) の PDF 線端コード(int)のタプル（直線/矢印のみ有効）。
         変更後の新しい xref を返す（作り直しのため xref は変わる）。
         """
         return self._edit_annot(index, xref, width=width, dashes=dashes,
-                                opacity=opacity, fill=fill, line_ends=line_ends)
+                                opacity=opacity, fill=fill, line_ends=line_ends,
+                                fontsize=fontsize, fontname=fontname)
 
     def set_annot_text(self, index, xref, text):
         return self._edit_annot(index, xref, text=text)
+
+    def annot_textstyle(self, index, xref):
+        """注釈の種別と文字スタイルを返す（UI 同期用）。無ければ None。
+
+        {"kind": 種別, "fontsize": float, "fontname": str, "text_color": rgb}
+        fontsize 等は FreeText 以外では既定値のまま。
+        """
+        page = self._doc.load_page(index)
+        annot = self._find_on(page, xref)
+        if annot is None:
+            return None
+        kind = annot.type[1]
+        fs, tc, fn = 12.0, (0.0, 0.0, 0.0), "helv"
+        if kind == "FreeText":
+            fs, tc, fn = self._parse_freetext_da(annot)
+        return {"kind": kind, "fontsize": fs, "fontname": fn, "text_color": tc}
 
     # 注釈種別 → 一覧に出す日本語ラベル
     _ANNOT_LABELS = {

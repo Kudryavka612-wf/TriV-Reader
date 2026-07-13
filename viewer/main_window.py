@@ -245,9 +245,11 @@ class MainWindow(QMainWindow):
         self.act_zoom_out = QAction("－ 縮小", self)
         self.act_zoom_out.setShortcut(QKeySequence.StandardKey.ZoomOut)
         self.act_fit = QAction("幅に合わせる", self)
+        self.act_fit_height = QAction("縦に合わせる", self)
         tb.addAction(self.act_zoom_out)
         tb.addAction(self.act_zoom_in)
         tb.addAction(self.act_fit)
+        tb.addAction(self.act_fit_height)
         # ズームスライダー＋プリセット
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self.zoom_slider.setRange(25, 400)   # 25%〜400%
@@ -255,7 +257,8 @@ class MainWindow(QMainWindow):
         self.zoom_slider.setFixedWidth(120)
         tb.addWidget(self.zoom_slider)
         self.zoom_combo = QComboBox()
-        self.zoom_combo.addItems(["50%", "75%", "100%", "125%", "150%", "200%", "幅に合わせる"])
+        self.zoom_combo.addItems(["50%", "75%", "100%", "125%", "150%", "200%",
+                                  "幅に合わせる", "縦に合わせる"])
         self.zoom_combo.setCurrentText("100%")
         tb.addWidget(self.zoom_combo)
         tb.addSeparator()
@@ -452,7 +455,9 @@ class MainWindow(QMainWindow):
         self.opacity_spin.setRange(10, 100)
         self.opacity_spin.setValue(100)
         self.opacity_spin.setSuffix("%")
-        self.opacity_spin.setToolTip("新しく描く注釈の不透明度")
+        self.opacity_spin.setToolTip(
+            "不透明度。新しく描く注釈に適用されるほか、選択中の注釈にも即反映されます\n"
+            "（選択ツールで注釈をクリック → この値を変更）")
         tb.addWidget(self.opacity_spin)
         tb.addSeparator()
 
@@ -462,9 +467,25 @@ class MainWindow(QMainWindow):
         self.text_size_spin.setRange(6, 96)
         self.text_size_spin.setValue(14)
         self.text_size_spin.setSuffix("pt")
-        self.text_size_spin.setToolTip("テキスト注釈の文字サイズ（入力中も変更可）")
+        self.text_size_spin.setToolTip(
+            "テキスト注釈の文字サイズ（入力中や、テキスト注釈を選択中も変更可）")
         tb.addWidget(self.text_size_spin)
         tb.addSeparator()
+
+        # フォント（テキスト注釈用）。リボンへ直接配置するためここでは作るだけ
+        # （ツールバー経由で移設すると QWidgetAction の所有問題があるため）。
+        self.text_font_combo = QComboBox()
+        for key, label in (("helv", "ゴシック(標準)"), ("tiro", "明朝(Times)"),
+                           ("cour", "等幅(Courier)")):
+            self.text_font_combo.addItem(label, key)
+        self.text_font_combo.setToolTip(
+            "テキスト注釈のフォント（英数字に適用。日本語は標準フォントで描画）")
+
+        # 入力コントロールが押しやすいよう最小幅を確保（リボン上で潰れない）
+        self.opacity_spin.setMinimumWidth(58)
+        self.text_size_spin.setMinimumWidth(56)
+        self.width_spin.setMinimumWidth(46)
+        self.text_font_combo.setMinimumWidth(104)
 
         # スタンプ（承認・済・日付など。選ぶとクリックした位置に置く）
         from PySide6.QtWidgets import QMenu, QToolButton
@@ -595,6 +616,7 @@ class MainWindow(QMainWindow):
         m_view.addAction(self.act_zoom_in)
         m_view.addAction(self.act_zoom_out)
         m_view.addAction(self.act_fit)
+        m_view.addAction(self.act_fit_height)
         m_view.addSeparator()
         m_view.addAction(self.act_rotate_left)
         m_view.addAction(self.act_rotate_right)
@@ -659,6 +681,7 @@ class MainWindow(QMainWindow):
     # 開いた時の表示倍率のプリセット（設定値の文字列 → 表示ラベル）
     _DEFAULT_ZOOM_PRESETS = [
         ("fit", "幅に合わせる"),
+        ("fit_height", "縦に合わせる"),
         ("remember", "前回の倍率を維持"),
         ("50", "50%"),
         ("75", "75%"),
@@ -700,6 +723,8 @@ class MainWindow(QMainWindow):
             zoom = remember_zoom if remember_zoom is not None else \
                 self.settings.value("last_zoom", 1.0, float)
             self.page_view.set_zoom(zoom)
+        elif mode == "fit_height":
+            self.page_view.fit_height()
         elif mode.isdigit():
             self.page_view.set_zoom(int(mode) / 100.0)
         else:
@@ -758,9 +783,23 @@ class MainWindow(QMainWindow):
         g.add_widget(self.page_edit)
         g.add_widget(self.page_total_label)
         g = r.add_group(p, "表示倍率")
-        g.add_stack([self.act_zoom_in, self.act_zoom_out, self.act_fit])
+        g.add_stack([self.act_zoom_in, self.act_zoom_out,
+                     self.act_fit, self.act_fit_height])
         g.add_widget(self.zoom_slider)
         g.add_widget(self.zoom_combo)
+        # PDF を開いた時にどの倍率で表示するかを固定する設定（プルダウン）
+        default_zoom_btn = QToolButton()
+        default_zoom_btn.setText("開き方 ▾")
+        default_zoom_btn.setAutoRaise(True)
+        default_zoom_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        default_zoom_btn.setToolTip(
+            "PDFを開いた時の表示倍率を固定します（幅/縦に合わせる・前回維持・固定%）")
+        dz_menu = QMenu(default_zoom_btn)
+        for act in self.default_zoom_group.actions():
+            dz_menu.addAction(act)
+        default_zoom_btn.setMenu(dz_menu)
+        self.default_zoom_btn = default_zoom_btn
+        g.add_widget(default_zoom_btn)
         g = r.add_group(p, "回転")
         g.add_stack([self.act_rotate_left, self.act_rotate_right])
         g = r.add_group(p, "検索")
@@ -787,8 +826,11 @@ class MainWindow(QMainWindow):
         g.add_action(self.act_fill_color, big=True)
         g.add_label(" 不透明度 ")
         g.add_widget(self.opacity_spin)
-        g.add_label(" 文字サイズ ")
+        g = r.add_group(p, "テキスト")
+        g.add_label(" サイズ ")
         g.add_widget(self.text_size_spin)
+        g.add_label(" フォント ")
+        g.add_widget(self.text_font_combo)
         g = r.add_group(p, "スタンプ")
         g.add_widget(self.stamp_btn)
         g = r.add_group(p, "編集")
@@ -838,7 +880,10 @@ class MainWindow(QMainWindow):
         toc_toggle = self.toc_dock.toggleViewAction()
         toc_toggle.setIconText("しおり一覧")
         toc_toggle.setIcon(self._glyph_icon("📑"))
-        g.add_stack([self.act_toggle_pagedock, toc_toggle])
+        annot_toggle = self.annot_dock.toggleViewAction()
+        annot_toggle.setIconText("注釈一覧")
+        annot_toggle.setIcon(self._glyph_icon("🗒"))
+        g.add_stack([self.act_toggle_pagedock, toc_toggle, annot_toggle])
         g = r.add_group(p, "しおり")
         g.add_stack([self.act_add_bookmark, self.act_edit_toc])
         g = r.add_group(p, "ヘルプ")
@@ -900,6 +945,7 @@ class MainWindow(QMainWindow):
             self.act_zoom_in: "拡大",
             self.act_zoom_out: "縮小",
             self.act_fit: "ページ幅に合わせる",
+            self.act_fit_height: "ページ全体が縦に収まる倍率にする",
             self.act_facing: "2ページずつ並べて表示（見開き）",
             self.act_rotate_left: "左に90°回転",
             self.act_rotate_right: "右に90°回転",
@@ -967,6 +1013,7 @@ class MainWindow(QMainWindow):
             self.act_open: "📂", self.act_save: "💾", self.act_save_as: "📝",
             self.act_print: "🖨", self.act_prev: "◀", self.act_next: "▶",
             self.act_zoom_in: "➕", self.act_zoom_out: "➖", self.act_fit: "↔",
+            self.act_fit_height: "↕",
             self.act_facing: "📖", self.act_rotate_left: "↺", self.act_rotate_right: "↻",
             self.act_organize: "🗂", self.act_delete: "🗑", self.act_merge: "🔗",
             self.act_extract: "📤", self.act_split: "✂", self.act_to_images: "🖼",
@@ -1069,6 +1116,7 @@ class MainWindow(QMainWindow):
             lambda: self.page_view.set_zoom(self.page_view.zoom / ZOOM_STEP)
         )
         self.act_fit.triggered.connect(self._fit)
+        self.act_fit_height.triggered.connect(self._fit_height)
         self.act_rotate_left.triggered.connect(lambda: self._rotate(-90))
         self.act_rotate_right.triggered.connect(lambda: self._rotate(90))
         self.act_save.triggered.connect(self.save)
@@ -1105,6 +1153,9 @@ class MainWindow(QMainWindow):
         )
         self.text_size_spin.valueChanged.connect(
             lambda v: self.page_view.set_text_size(v)
+        )
+        self.text_font_combo.currentIndexChanged.connect(
+            lambda: self.page_view.set_text_font(self.text_font_combo.currentData())
         )
         self.act_clear_annots.triggered.connect(self._clear_annots)
         self.act_undo.triggered.connect(self._undo_annot)
@@ -1185,6 +1236,9 @@ class MainWindow(QMainWindow):
         # Ctrl+1: 実際のサイズ (100%)
         QShortcut(QKeySequence("Ctrl+1"), self,
                   lambda: self.page_view.set_zoom(1.0))
+        # Ctrl+2: 縦に合わせる
+        self.act_fit_height.setShortcut(QKeySequence("Ctrl+2"))
+        self.addAction(self.act_fit_height)
         # Ctrl+Home / Ctrl+End: 先頭 / 最終ページ
         QShortcut(QKeySequence("Ctrl+Home"), self,
                   lambda: self.page_view.set_page(0))
@@ -1463,6 +1517,10 @@ class MainWindow(QMainWindow):
         self.page_view.fit_width()
         self._update_status()
 
+    def _fit_height(self) -> None:
+        self.page_view.fit_height()
+        self._update_status()
+
     def _rotate(self, delta: int) -> None:
         if not self.doc.is_open:
             return
@@ -1520,13 +1578,34 @@ class MainWindow(QMainWindow):
         if ref is not None:
             self.annot_dock.select_xref(ref[0], ref[1])
         if has:
+            self._sync_textstyle_controls()
             self.statusBar().showMessage(
                 "注釈を選択中：ドラッグで移動 / ダブルクリックで本文編集 / "
-                "太さ・線種・色・不透明度・塗りで書式変更 / Ctrl+C コピー / "
-                "Delete で削除", 0
+                "太さ・線種・色・不透明度・塗り・文字サイズ・フォントで書式変更 / "
+                "Ctrl+C コピー / Delete で削除", 0
             )
         else:
             self.statusBar().clearMessage()
+
+    def _sync_textstyle_controls(self) -> None:
+        """テキスト注釈を選択したら、文字サイズ・フォントの表示を注釈に合わせる。
+
+        こうすることで、選択後にスピンを1回動かすだけで「今のサイズから」
+        変更できる（意図しないサイズへ飛ばない）。
+        """
+        style = self.page_view.selection_textstyle()
+        if not style or style.get("kind") != "FreeText":
+            return
+        self.text_size_spin.blockSignals(True)
+        self.text_size_spin.setValue(int(round(style["fontsize"])))
+        self.text_size_spin.blockSignals(False)
+        self.page_view.text_size = max(6, int(round(style["fontsize"])))
+        i = self.text_font_combo.findData(style.get("fontname", "helv"))
+        if i >= 0:
+            self.text_font_combo.blockSignals(True)
+            self.text_font_combo.setCurrentIndex(i)
+            self.text_font_combo.blockSignals(False)
+            self.page_view.text_font = style.get("fontname", "helv")
 
     def _refresh_copy_enabled(self) -> None:
         pv = self.page_view
@@ -1904,6 +1983,8 @@ class MainWindow(QMainWindow):
         text = self.zoom_combo.currentText()
         if text == "幅に合わせる":
             self.page_view.fit_width()
+        elif text == "縦に合わせる":
+            self.page_view.fit_height()
         else:
             try:
                 self.page_view.set_zoom(int(text.rstrip("%")) / 100.0)
@@ -2432,9 +2513,18 @@ class MainWindow(QMainWindow):
             self.act_compact.setChecked(True)  # toggled で適用
         # ツールバーの表示/非表示（折りたたみ）を復元
         self.annot_toolbar.setVisible(self.settings.value("annot_bar", True, bool))
-        # ドック（ページ一覧/しおり）の表示状態を復元（前回消していたら消したまま）
+        # ドック（ページ一覧/しおり/注釈一覧）の表示状態を復元
+        # （前回消していたら消したまま）
         self.page_dock.setVisible(self.settings.value("page_dock_visible", True, bool))
         self.toc_dock.setVisible(self.settings.value("toc_dock_visible", True, bool))
+        self.annot_dock.setVisible(
+            self.settings.value("annot_dock_visible", True, bool))
+        # 前回どのパネルを手前（タブの前面）にしていたかを復元
+        active = self.settings.value("left_dock_active", "page", str)
+        d = {"page": self.page_dock, "toc": self.toc_dock,
+             "annot": self.annot_dock}.get(active)
+        if d is not None and not d.isHidden():
+            d.raise_()
         # 開いた時の既定の表示倍率（未設定なら「幅に合わせる」）
         mode = self.settings.value("default_zoom_mode", "fit", str)
         act = self.default_zoom_actions.get(mode, self.default_zoom_actions["fit"])
@@ -2458,6 +2548,17 @@ class MainWindow(QMainWindow):
         # ドックの表示状態（タブ化で裏に隠れていても「表示中」として扱う）
         self.settings.setValue("page_dock_visible", not self.page_dock.isHidden())
         self.settings.setValue("toc_dock_visible", not self.toc_dock.isHidden())
+        self.settings.setValue("annot_dock_visible", not self.annot_dock.isHidden())
+        # 手前（タブの前面）に出ているパネルを記憶する。タブ化されたドックは
+        # 前面の1つだけ isVisible() が True になる。
+        active = ""
+        for name, d in (("page", self.page_dock), ("toc", self.toc_dock),
+                        ("annot", self.annot_dock)):
+            if d.isVisible():
+                active = name
+                break
+        if active:
+            self.settings.setValue("left_dock_active", active)
         if hasattr(self, "ribbon"):
             self.settings.setValue("ribbon_collapsed", self.ribbon.is_collapsed())
 
@@ -3126,6 +3227,7 @@ class MainWindow(QMainWindow):
             self.act_zoom_in,
             self.act_zoom_out,
             self.act_fit,
+            self.act_fit_height,
             self.act_rotate_left,
             self.act_rotate_right,
             self.act_save,

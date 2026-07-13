@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QPushButton,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -25,6 +27,65 @@ from PySide6.QtWidgets import (
 from .document import PdfDocument
 
 ORIG_INDEX_ROLE = Qt.ItemDataRole.UserRole
+
+
+class _PreviewPane(QWidget):
+    """選択中ページの拡大プレビュー。ペインの大きさに合わせて等比で描画する。
+
+    抽出・削除などの操作前に「どのページか」を確認しながら作業できるように、
+    グリッドの右側に常駐させる（スプリッターで幅の調整・折りたたみが可能）。
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._pixmap: QPixmap | None = None
+        self._caption = ""
+        self._dark = False
+        self.setMinimumWidth(120)
+
+    def set_page(self, pixmap: QPixmap, caption: str) -> None:
+        self._pixmap = pixmap
+        self._caption = caption
+        self.update()
+
+    def clear_page(self, message: str = "ページを選択するとここに表示されます") -> None:
+        self._pixmap = None
+        self._caption = message
+        self.update()
+
+    def apply_theme(self, dark: bool) -> None:
+        self._dark = dark
+        self.update()
+
+    CAPTION_H = 24  # 上部のページ番号表示の高さ(px)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        p = QPainter(self)
+        r = self.rect()
+        p.fillRect(r, QColor("#242426") if self._dark else QColor("#fafafa"))
+        p.setPen(QColor("#ddd") if self._dark else QColor("#333"))
+        p.drawText(0, 0, r.width(), self.CAPTION_H,
+                   Qt.AlignmentFlag.AlignCenter, self._caption)
+        if self._pixmap is None or self._pixmap.isNull():
+            p.end()
+            return
+        avail_w = max(1, r.width() - 12)
+        avail_h = max(1, r.height() - self.CAPTION_H - 8)
+        pm = self._pixmap
+        scale = min(avail_w / pm.width(), avail_h / pm.height(), 1.0)
+        w = max(1, int(pm.width() * scale))
+        h = max(1, int(pm.height() * scale))
+        x = (r.width() - w) // 2
+        y = self.CAPTION_H + (avail_h - h) // 2
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.drawPixmap(x, y, w, h, pm)
+        p.setPen(QColor("#666") if self._dark else QColor("#b0b0b0"))
+        p.drawRect(x, y, w - 1, h - 1)
+        p.end()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        super().resizeEvent(event)
+        self.update()
 
 
 class _Grid(QListWidget):
@@ -213,7 +274,21 @@ class PageOrganizer(QWidget):
         self.grid = _Grid(self.THUMB)
         self.grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.grid.customContextMenuRequested.connect(self._on_context_menu)
-        layout.addWidget(self.grid)
+
+        # グリッドの右に選択ページの拡大プレビュー（スプリッターで幅調整可）
+        self.preview = _PreviewPane()
+        self.preview.clear_page()
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter.addWidget(self.grid)
+        self._splitter.addWidget(self.preview)
+        self._splitter.setStretchFactor(0, 3)
+        self._splitter.setStretchFactor(1, 1)
+        self._splitter.setSizes([720, 300])
+        # ペイン幅を変えたら、その幅に合った解像度で描画し直す（ぼやけ防止）
+        self._splitter.splitterMoved.connect(
+            lambda *_: self._update_preview(self.selected_indices()))
+        layout.addWidget(self._splitter, 1)  # 余白はすべてグリッド/プレビューへ
+        self._doc: PdfDocument | None = None
 
         # 配線
         self._btn_insert.clicked.connect(self._insert_dialog)
@@ -237,6 +312,9 @@ class PageOrganizer(QWidget):
         self.grid.reordered.connect(self.reordered.emit)
         self.grid.itemDoubleClicked.connect(self._on_double_click)
         self.grid.itemSelectionChanged.connect(self._update_selection_label)
+        # カレント行だけが動いた場合（Ctrl+クリック等）もプレビューを追従させる
+        self.grid.currentItemChanged.connect(
+            lambda *_: self._update_preview(self.selected_indices()))
 
     # --- 挿入 / 右クリックメニュー --------------------------------------
     def _insert_position(self, pos_index: int) -> int:
@@ -314,7 +392,9 @@ class PageOrganizer(QWidget):
 
     # --- 読み込み -------------------------------------------------------
     def load(self, doc: PdfDocument) -> None:
+        self._doc = doc
         self.grid.clear()
+        self.preview.clear_page()
         if not doc.is_open:
             return
         for i in range(doc.page_count):
@@ -327,6 +407,7 @@ class PageOrganizer(QWidget):
 
     def apply_theme(self, dark: bool) -> None:
         self.grid.apply_theme(dark)
+        self.preview.apply_theme(dark)
 
     def selected_indices(self) -> list[int]:
         return sorted(self.grid.row(it) for it in self.grid.selectedItems())
@@ -351,6 +432,37 @@ class PageOrganizer(QWidget):
         else:
             pages = ", ".join(str(i + 1) for i in sel)
             self._sel_label.setText(f"{len(sel)} ページ選択中（{pages}）")
+        self._update_preview(sel)
+
+    def _update_preview(self, sel: list[int]) -> None:
+        """選択中のページ（複数選択時はカレント行）をプレビューに描画する。"""
+        if not sel or self._doc is None or not self._doc.is_open:
+            self.preview.clear_page()
+            return
+        # Ctrl/Shift 選択の途中でも「最後に操作した行」を優先して見せる
+        row = self.grid.currentRow()
+        if row not in sel:
+            row = sel[-1]
+        item = self.grid.item(row)
+        if item is None:
+            self.preview.clear_page()
+            return
+        # 並べ替え直後でも正しいページを描画できるよう元インデックスで引く
+        orig = item.data(ORIG_INDEX_ROLE)
+        try:
+            w_pt, h_pt = self._doc.page_pixel_size(orig, 1.0)
+            avail_w = max(120, self.preview.width() - 12)
+            avail_h = max(120, self.preview.height() - 32)
+            zoom = min(avail_w / max(1, w_pt), avail_h / max(1, h_pt), 3.0)
+            pixmap = self._doc.render_page(orig, zoom=zoom)
+        except Exception:  # noqa: BLE001
+            self.preview.clear_page("プレビューを表示できません")
+            return
+        n = len(sel)
+        cap = f"ページ {row + 1} / {self.grid.count()}"
+        if n > 1:
+            cap += f"（{n} ページ選択中）"
+        self.preview.set_page(pixmap, cap)
 
     # --- 内部 -----------------------------------------------------------
     def _emit_selected(self, signal: Signal) -> None:

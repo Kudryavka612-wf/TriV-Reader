@@ -212,11 +212,11 @@ def main() -> int:
     for a in doc._doc.load_page(0).annots():
         if a.type[1] == "FreeText":
             ftx = a.xref
-    fs0, tc0 = doc._parse_freetext_da(
+    fs0, tc0, fn0 = doc._parse_freetext_da(
         [a for a in doc._doc.load_page(0).annots() if a.xref == ftx][0])
     new = doc.move_annot(0, ftx, 5, 5)   # edit (move) -> recreated
     fa = [a for a in doc._doc.load_page(0).annots() if a.xref == new][0]
-    fs1, tc1 = doc._parse_freetext_da(fa)
+    fs1, tc1, fn1 = doc._parse_freetext_da(fa)
     check("FreeText keeps font size through edit", abs(fs1 - 26) < 0.5, f"({fs1})")
     check("FreeText keeps blue text colour through edit",
           tc1[2] > 0.5 and tc1[0] < 0.3, f"({tc1})")

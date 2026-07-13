@@ -65,17 +65,21 @@ def main() -> int:
     print(f"OK: rotate resized {before} -> {after}")
 
     # --- オートスクロールの計算ロジック ----------------------------
+    # _auto_scroll_tick は実カーソル位置（QCursor.pos）を参照するため、
+    # QCursor.setPos で仮想カーソルを動かして検証する（実行環境の実マウス
+    # 位置に依存しないように）。
     from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QCursor
 
     pv.set_page(0)
     app.processEvents()
     start_val = pv.verticalScrollBar().value()
     pv._auto_active = True
     pv._auto_origin = QPoint(100, 100)
-    pv._auto_pos = QPoint(100, 300)  # 下方向に大きく離す → 下スクロール
+    QCursor.setPos(pv.viewport().mapToGlobal(QPoint(100, 300)))  # 下へ大きく
     pv._auto_scroll_tick()
     assert pv.verticalScrollBar().value() > start_val, "下方向スクロールされない"
-    pv._auto_pos = QPoint(100, 105)  # デッドゾーン内 → 動かない
+    QCursor.setPos(pv.viewport().mapToGlobal(QPoint(100, 105)))  # デッドゾーン内
     held = pv.verticalScrollBar().value()
     pv._auto_scroll_tick()
     assert pv.verticalScrollBar().value() == held, "デッドゾーンで動いてしまう"
@@ -267,14 +271,14 @@ def main() -> int:
     assert w.main_toolbar.toolButtonStyle() == _Qt.ToolButtonStyle.ToolButtonTextOnly
     print("OK: コンパクト表示トグル")
 
-    # 注釈バーの折りたたみ（表示/非表示）
-    assert w.annot_toolbar.isVisible()
-    w.act_toggle_annotbar.trigger()
-    app.processEvents()
+    # 注釈バー（旧ツールバー）はリボン統合後は既定で非表示。トグルの往復のみ確認
     assert not w.annot_toolbar.isVisible()
     w.act_toggle_annotbar.trigger()
     app.processEvents()
     assert w.annot_toolbar.isVisible()
+    w.act_toggle_annotbar.trigger()
+    app.processEvents()
+    assert not w.annot_toolbar.isVisible()
     print("OK: 注釈バー折りたたみトグル")
 
     # テキスト選択 → コピー（tdoc は "Hello selectable world"）
