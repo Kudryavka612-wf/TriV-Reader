@@ -133,7 +133,7 @@ def apply_and_restart(zip_path: str) -> None:
 
     # 終了待ちは PID だけで判定すると、終了後に別プロセスへ同じ PID が
     # 再利用された場合に「まだ起動中」と誤認し、永久に待ち続けてしまう。
-    # IMAGENAME も併せて確認し、万一に備え最大30秒で強制的に先へ進める。
+    # IMAGENAME も併せて確認し、万一に備え最大60秒で強制的に先へ進める。
     #
     # robocopy /E: 上書きコピー（/MIR と違い既存のユーザーデータを消さない）
     # /XD: ユーザーデータフォルダ除外、 /XF: マーカー/設定の保持
@@ -144,7 +144,18 @@ def apply_and_restart(zip_path: str) -> None:
     # 下の CREATE_NO_WINDOW（コンソール窓なし）起動下では
     # 「Input redirection is not supported」で失敗して待たずに突き進むことがある。
     # ping -n 2 127.0.0.1 は約1秒待ち、コンソールに依存しない。
+    #
+    # 重要: exe 自身は実行中に上書きしようとすると（ウイルス対策ソフトの
+    # スキャン等で）ごく短時間ロックされ、robocopy がその瞬間だけ exe の
+    # コピーに失敗することがある。他のファイルは成功するため見た目上は
+    # 「更新完了」に見えるが、実際は古い exe のまま再起動してしまい、
+    # 次回の更新確認でも同じことを繰り返す（更新できているように見えて
+    # 実際には何度やっても反映されない）。これを防ぐため、コピー後に
+    # exe のサイズを比較し、一致するまで robocopy を最大5回リトライする。
     sysdir = r"%SystemRoot%\System32"
+    new_exe = os.path.join(src_dir, exe_name)
+    expected_size = os.path.getsize(new_exe) if os.path.exists(new_exe) else -1
+    dest_exe = os.path.join(app_dir, exe_name)
     script = f"""@echo off
 setlocal enabledelayedexpansion
 set _wait=0
@@ -152,11 +163,20 @@ set _wait=0
 {sysdir}\\tasklist.exe /FI "PID eq {pid}" /FI "IMAGENAME eq {exe_name}" 2>nul | {sysdir}\\find.exe /I "{exe_name}" >nul
 if errorlevel 1 goto docopy
 set /a _wait+=1
-if !_wait! GEQ 30 goto docopy
+if !_wait! GEQ 60 goto docopy
 {sysdir}\\ping.exe -n 2 127.0.0.1 >nul
 goto waitloop
 :docopy
-{sysdir}\\robocopy.exe "{src_dir}" "{app_dir}" /E /NFL /NDL /NJH /NJS /NP /R:3 /W:1 /XD "TriVReader_data" /XF "portable.ini" "lite.ini" "TriVReader.ini" >nul
+set _copytry=0
+:copyloop
+{sysdir}\\robocopy.exe "{src_dir}" "{app_dir}" /E /NFL /NDL /NJH /NJS /NP /R:5 /W:1 /XD "TriVReader_data" /XF "portable.ini" "lite.ini" "TriVReader.ini" >nul
+for %%A in ("{dest_exe}") do set _sz=%%~zA
+if "!_sz!"=="{expected_size}" goto docopy_done
+set /a _copytry+=1
+if !_copytry! GEQ 5 goto docopy_done
+{sysdir}\\ping.exe -n 3 127.0.0.1 >nul
+goto copyloop
+:docopy_done
 start "" "{exe_path}"
 del "%~f0"
 """
