@@ -56,3 +56,31 @@ def make_settings():
         ini = os.path.join(base_dir(), "TriVReader.ini")
         return QSettings(ini, QSettings.Format.IniFormat)
     return QSettings("trivreader", "trivreader")
+
+
+def safe_cwd() -> str:
+    """プロセスのカレントディレクトリとして掴んでよい場所を返す。
+
+    エクスプローラから PDF をダブルクリックして起動すると、その PDF が入って
+    いるフォルダがプロセスのカレントディレクトリになる。Windows は CWD にして
+    いるフォルダの削除/移動を拒否する（WinError 32）ため、閲覧しただけで
+    フォルダを整理できなくなる。トレイ常駐でプロセスが残る分、症状も長引く。
+    """
+    try:
+        return data_dir()
+    except OSError:
+        return os.path.expanduser("~")
+
+
+def ensure_safe_cwd() -> None:
+    """CWD がユーザーのフォルダを掴んでいたら、安全な場所へ移す。"""
+    target = safe_cwd()
+    try:
+        if os.path.normcase(os.path.abspath(os.getcwd())) == os.path.normcase(target):
+            return
+    except OSError:
+        pass  # CWD 自体が消えている場合も chdir で復帰させる
+    try:
+        os.chdir(target)
+    except OSError:
+        pass

@@ -13,7 +13,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
-from viewer import theme
+from viewer import storage, theme
 from viewer.main_window import MainWindow
 
 # ユーザー毎に一意なサーバー名（同一PCの複数ユーザーでも衝突しない）
@@ -107,8 +107,16 @@ def _start_server(window: MainWindow) -> QLocalServer:
 def main() -> int:
     app = QApplication(sys.argv)
 
-    # 既に起動中なら、そのインスタンスにパスを渡して即終了（同一ウィンドウのタブで開く）
+    # 引数の相対パスは CWD を移す前に解決しておく。
     file_arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if file_arg:
+        file_arg = os.path.abspath(file_arg)
+    # 起動したフォルダを掴んだままにしない。エクスプローラから PDF を開くと
+    # CWD がその PDF のフォルダになり、Windows ではそのフォルダを削除/移動
+    # できなくなる（トレイ常駐でプロセスが残る分、症状が長引く）。
+    storage.ensure_safe_cwd()
+
+    # 既に起動中なら、そのインスタンスにパスを渡して即終了（同一ウィンドウのタブで開く）
     if _send_to_running(file_arg):
         return 0
 
@@ -126,9 +134,13 @@ def main() -> int:
     window.show()
     app._single_server = _start_server(window)  # GC されないよう参照を保持
 
+    # 前回開いていたファイルを復元（設定が有効なときだけ）
+    window.restore_session()
     # コマンドライン引数で PDF を渡されたら開く
     if file_arg:
         window.open_path(file_arg)
+    # 起動時の更新確認（設定が有効なときだけ。通信は別スレッド）
+    window.check_update_on_startup()
 
     return app.exec()
 

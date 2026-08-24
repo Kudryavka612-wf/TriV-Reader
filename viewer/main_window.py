@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import (
@@ -35,7 +36,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
 )
 
-from . import ocr, page_view, theme
+from . import ocr, page_view, settings_dialog as prefs, storage, theme
 from .annot_list import AnnotListDock
 from .bookmarks import TocDock, TocEditDialog
 from .document import PdfDocument
@@ -127,7 +128,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("TriV-Reader")
         self.resize(1180, 820)
         self.setAcceptDrops(True)
-        from . import storage
         self.settings = storage.make_settings()  # 通常=レジストリ / ポータブル=INI
 
         # タブが無いとき用の空状態（属性アクセスを安全にする）
@@ -273,6 +273,11 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_open_acrobat)
         self.act_set_default_pdf = QAction("既定のPDFアプリに設定", self)
         tb.addAction(self.act_set_default_pdf)
+        self.act_settings = QAction("設定…", self)
+        self.act_settings.setShortcut("Ctrl+,")
+        # メニューバーはリボンに置き換えられて非表示なので、ウィンドウ自身にも
+        # 登録しておかないと Ctrl+, が効かない。
+        self.addAction(self.act_settings)
         tb.addSeparator()
 
         self.act_rotate_left = QAction("⟲ 左回転", self)
@@ -585,6 +590,8 @@ class MainWindow(QMainWindow):
         m_file.addSeparator()
         m_file.addAction(self.act_protect)
         m_file.addAction(self.act_unlock)
+        m_file.addSeparator()
+        m_file.addAction(self.act_settings)
 
         m_view = mb.addMenu("表示(&V)")
         m_view.addAction(self.act_dark)
@@ -763,7 +770,8 @@ class MainWindow(QMainWindow):
         g = r.add_group(p, "ファイル")
         g.add_action(self.act_open, big=True)
         g.add_stack([self.act_save, self.act_save_as, self.act_print,
-                     self.act_open_acrobat, self.act_set_default_pdf])
+                     self.act_open_acrobat, self.act_set_default_pdf,
+                     self.act_settings])
         recent_btn = QToolButton()
         recent_btn.setText("最近 ▾")
         recent_btn.setAutoRaise(True)
@@ -887,8 +895,9 @@ class MainWindow(QMainWindow):
         g = r.add_group(p, "しおり")
         g.add_stack([self.act_add_bookmark, self.act_edit_toc])
         g = r.add_group(p, "ヘルプ")
-        g.add_stack([self.act_check_update, self.act_set_update_url,
-                     self.act_report_govform, self.act_about])
+        g.add_stack([self.act_settings, self.act_check_update,
+                     self.act_set_update_url, self.act_report_govform,
+                     self.act_about])
         r.end_page(p)
 
         # リボンを最上部に据え、従来のメニューバー/ツールバーは隠す
@@ -925,8 +934,6 @@ class MainWindow(QMainWindow):
 
     def _apply_lite_mode(self) -> None:
         """ライト版では OCR・傾き補正（numpy/Pillow 依存）の機能を隠す。"""
-        from . import storage
-
         self.is_lite = storage.is_lite()
         if self.is_lite:
             self.act_ocr.setVisible(False)
@@ -947,6 +954,7 @@ class MainWindow(QMainWindow):
             self.act_fit: "ページ幅に合わせる",
             self.act_fit_height: "ページ全体が縦に収まる倍率にする",
             self.act_facing: "2ページずつ並べて表示（見開き）",
+            self.act_settings: "表示・注釈・保存などの設定（Ctrl+,）",
             self.act_rotate_left: "左に90°回転",
             self.act_rotate_right: "右に90°回転",
             self.act_organize: "ページの並べ替え・削除・抽出を行う整理画面",
@@ -1033,6 +1041,7 @@ class MainWindow(QMainWindow):
             self.act_dark: "🌙", self.act_add_bookmark: "🔖",
             self.act_find: "🔍",
             self.act_edit_toc: "📇", self.act_check_update: "🔄",
+            self.act_settings: "⚙",
             self.act_set_update_url: "⚙", self.act_about: "ℹ",
             self.act_report_govform: "📮",
             self.act_toggle_pagedock: "▤",
@@ -1207,6 +1216,7 @@ class MainWindow(QMainWindow):
         self.act_deskew.triggered.connect(self.deskew_document)
         self.act_check_update.triggered.connect(self.check_for_update)
         self.act_set_update_url.triggered.connect(self.set_update_url)
+        self.act_settings.triggered.connect(self.open_settings)
         self.act_about.triggered.connect(self.show_about)
         self.act_report_govform.triggered.connect(self.report_govform_unsupported)
         self.act_telemetry_toggle.toggled.connect(self._toggle_telemetry)
@@ -1304,6 +1314,13 @@ class MainWindow(QMainWindow):
             self.open_path(path)
 
     def open_path(self, path: str) -> None:
+        # 相対パスは CWD を動かす前に解決しておく。開いたフォルダを掴んだままに
+        # すると Windows ではそのフォルダを削除/移動できなくなるので、開くたびに
+        # カレントディレクトリを安全な場所へ戻す（ファイルダイアログが CWD を
+        # 変える環境への保険。起動時の退避は main.py 側）。
+        path = os.path.abspath(path)
+        storage.ensure_safe_cwd()
+
         # 既に同じファイルを開いていれば、そのタブへ切り替える
         for i in range(self.tabs.count()):
             t = self.tabs.widget(i)
@@ -2479,7 +2496,155 @@ class MainWindow(QMainWindow):
                 "手動で［設定 > アプリ > 既定のアプリ］を開いてください。",
             )
 
+    # --- 設定ダイアログ -------------------------------------------------
+    def open_settings(self) -> None:
+        """設定ダイアログ（全般/表示/注釈/保存/更新/詳細）を開く。"""
+        prefs.SettingsDialog(self).exec()
+
+    def apply_preferences(self) -> None:
+        """設定の内容を、今開いているウィンドウへ反映する。
+
+        「次回起動から効く」項目を作らないよう、変えたその場で見た目・挙動が
+        変わるところまでやる。終了時に _save_settings が現在の状態を書き戻す
+        ので、即時反映しない設定は保存し直されて消えてしまう。
+        """
+        s = self.settings
+        self.act_dark.setChecked(prefs.value(s, "dark"))
+        self.act_compact.setChecked(prefs.value(s, "compact"))
+        mode = prefs.value(s, "default_zoom_mode")
+        act = self.default_zoom_actions.get(mode)
+        if act is not None:
+            act.setChecked(True)
+        self.act_facing.setChecked(prefs.value(s, "view/facing_default"))
+        self.page_dock.setVisible(prefs.value(s, "page_dock_visible"))
+        self.toc_dock.setVisible(prefs.value(s, "toc_dock_visible"))
+        self.annot_dock.setVisible(prefs.value(s, "annot_dock_visible"))
+        if getattr(self, "act_tray_resident", None) is not None:
+            self.act_tray_resident.setChecked(prefs.value(s, "tray/resident"))
+        self._apply_annot_defaults()
+        self._trim_recent()
+        self._setup_autosave()
+
+    def _apply_annot_defaults(self) -> None:
+        """注釈の既定スタイル（作成者・色・太さ・不透明度・文字サイズ）を反映。"""
+        s = self.settings
+        PdfDocument.annot_author = prefs.value(s, "annot/author")
+        col = QColor(prefs.value(s, "annot/color"))
+        if col.isValid():
+            self._annot_color = col
+            self._refresh_color_icon()
+            self.page_view.set_color(col)
+        self.width_spin.setValue(prefs.value(s, "annot/width"))
+        self.opacity_spin.setValue(prefs.value(s, "annot/opacity"))
+        self.text_size_spin.setValue(prefs.value(s, "annot/text_size"))
+
+    def _backup_if_enabled(self, path: str | None) -> None:
+        """設定が有効なら、上書きの前に元ファイルを .bak として残す。"""
+        if not path or not prefs.value(self.settings, "save/backup"):
+            return
+        if not os.path.exists(path):
+            return
+        try:
+            shutil.copy2(path, path + ".bak")
+        except OSError as exc:
+            self.statusBar().showMessage(
+                f"バックアップを作れませんでした: {exc}", 6000)
+
+    # --- 自動保存 ---------------------------------------------------------
+    def _setup_autosave(self) -> None:
+        """自動保存タイマーを設定どおりに張り直す（0 分なら止める）。"""
+        minutes = prefs.value(self.settings, "save/autosave_min")
+        if getattr(self, "_autosave_timer", None) is None:
+            self._autosave_timer = QTimer(self)
+            self._autosave_timer.timeout.connect(self._autosave_tick)
+        if minutes > 0:
+            self._autosave_timer.start(int(minutes) * 60 * 1000)
+        else:
+            self._autosave_timer.stop()
+
+    def _autosave_tick(self) -> None:
+        """変更があり、保存先の分かっているタブだけ上書き保存する。"""
+        saved = 0
+        for i in range(self.tabs.count()):
+            t = self.tabs.widget(i)
+            if not isinstance(t, DocTab):
+                continue
+            doc = t.doc
+            if not (doc.is_open and doc.modified and doc.path):
+                continue
+            try:
+                self._backup_if_enabled(doc.path)
+                doc.save()
+                saved += 1
+            except Exception as exc:  # noqa: BLE001
+                self.statusBar().showMessage(f"自動保存できませんでした: {exc}", 6000)
+                return
+        if saved:
+            self._update_actions()
+            self._update_title()
+            self.statusBar().showMessage(f"自動保存しました（{saved} 件）", 4000)
+
+    # --- 起動時の復元 / 更新確認 -----------------------------------------
+    def _save_session(self) -> None:
+        """開いているファイルを憶えておく（次回起動時の復元用）。"""
+        paths = [t.doc.path for i in range(self.tabs.count())
+                 if isinstance(t := self.tabs.widget(i), DocTab) and t.doc.path]
+        self.settings.setValue("session/open_files", paths)
+
+    def restore_session(self) -> None:
+        """設定が有効なら、前回開いていたファイルを開き直す。"""
+        if not prefs.value(self.settings, "startup/restore_session"):
+            return
+        for p in self.settings.value("session/open_files", [], list) or []:
+            if os.path.exists(p):
+                self.open_path(p)
+
+    def check_update_on_startup(self) -> None:
+        """設定が有効なら、起動直後に静かに更新を確認する。"""
+        if prefs.value(self.settings, "startup/check_update"):
+            QTimer.singleShot(3000, self._silent_update_check)
+
+    def _silent_update_check(self) -> None:
+        """更新があるときだけステータスバーで知らせる（無ければ黙る）。
+
+        通信でUIを止めないようワーカースレッドで確認し、結果だけ後から拾う。
+        """
+        import threading
+
+        from . import updater
+
+        if not updater.is_frozen():
+            return
+        url = updater.manifest_url(self.settings)
+        if not url:
+            return
+
+        def _worker() -> None:
+            try:
+                self._pending_update = updater.check(url, timeout=8)
+            except Exception:  # noqa: BLE001
+                self._pending_update = None  # ネットワーク不通で起動を邪魔しない
+
+        self._pending_update = None
+        threading.Thread(target=_worker, daemon=True).start()
+        QTimer.singleShot(9000, self._notify_pending_update)
+
+    def _notify_pending_update(self) -> None:
+        info = getattr(self, "_pending_update", None)
+        if info:
+            self.statusBar().showMessage(
+                f"新しいバージョン {info.get('version', '')} があります"
+                "（ファイル > 設定 > 更新 から更新できます）", 15000)
+
     # --- 設定の永続化 / 最近のファイル / D&D --------------------------
+    def _trim_recent(self) -> None:
+        """履歴の件数を設定に合わせて切り詰める。"""
+        limit = max(0, prefs.value(self.settings, "recent/limit"))
+        recent = self.settings.value("recent", [], list) or []
+        if len(recent) > limit:
+            self.settings.setValue("recent", recent[:limit])
+        self._rebuild_recent_menu()
+
     def _last_dir(self) -> str:
         return self.settings.value("last_dir", "", str)
 
@@ -2488,7 +2653,8 @@ class MainWindow(QMainWindow):
         recent = self.settings.value("recent", [], list) or []
         recent = [p for p in recent if p != path]
         recent.insert(0, path)
-        self.settings.setValue("recent", recent[:8])
+        limit = max(0, prefs.value(self.settings, "recent/limit"))
+        self.settings.setValue("recent", recent[:limit])
         self._rebuild_recent_menu()
 
     def _rebuild_recent_menu(self) -> None:
@@ -2529,6 +2695,11 @@ class MainWindow(QMainWindow):
         mode = self.settings.value("default_zoom_mode", "fit", str)
         act = self.default_zoom_actions.get(mode, self.default_zoom_actions["fit"])
         act.setChecked(True)
+        # 見開きで開く / 注釈の既定スタイル / 自動保存（設定ダイアログの項目）
+        if prefs.value(self.settings, "view/facing_default"):
+            self.act_facing.setChecked(True)
+        self._apply_annot_defaults()
+        self._setup_autosave()
         # 匿名レポート送信トグル: 送信先URL未設定なら意味がないので隠す。
         # 設定済みなら現在の同意状態を反映する。
         from . import telemetry
@@ -2541,6 +2712,7 @@ class MainWindow(QMainWindow):
         self._rebuild_recent_menu()
 
     def _save_settings(self) -> None:
+        self._save_session()
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("dark", self.act_dark.isChecked())
         self.settings.setValue("compact", self.act_compact.isChecked())
@@ -2559,6 +2731,7 @@ class MainWindow(QMainWindow):
                 break
         if active:
             self.settings.setValue("left_dock_active", active)
+        self.settings.setValue("view/facing_default", self.act_facing.isChecked())
         if hasattr(self, "ribbon"):
             self.settings.setValue("ribbon_collapsed", self.ribbon.is_collapsed())
 
@@ -3070,8 +3243,13 @@ class MainWindow(QMainWindow):
         if not self.doc.is_open:
             return
         labels = list(ocr.LANGUAGE_CHOICES.keys())
+        codes = list(ocr.LANGUAGE_CHOICES.values())
+        try:  # 設定の既定言語を最初から選んでおく
+            start = codes.index(prefs.value(self.settings, "ocr/lang"))
+        except ValueError:
+            start = 0
         label, ok = QInputDialog.getItem(
-            self, "文字認識(OCR)", "認識する言語:", labels, 0, False
+            self, "文字認識(OCR)", "認識する言語:", labels, start, False
         )
         if not ok:
             return
@@ -3150,6 +3328,7 @@ class MainWindow(QMainWindow):
         # Documents 配下などはフォルダー保護で上書きが弾かれることがあるため、
         # 失敗したら名前を付けて保存にフォールバックする。
         try:
+            self._backup_if_enabled(self.doc.path)
             self.doc.save()
         except Exception as exc:  # noqa: BLE001
             ret = QMessageBox.question(
@@ -3174,6 +3353,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
+            self._backup_if_enabled(path)
             self.doc.save_as(path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "エラー", f"保存できませんでした:\n{exc}")
@@ -3285,7 +3465,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         # 通常の×でタブがあるときは「現在のタブ / 全て / キャンセル」を尋ねる。
         # （トレイの「終了」からの呼び出し _force_quit ではダイアログを出さない）
-        if not self._force_quit and self.tabs.count() > 0:
+        if (not self._force_quit and self.tabs.count() > 0
+                and prefs.value(self.settings, "confirm_close")):
             box = QMessageBox(self)
             box.setWindowTitle("ウィンドウを閉じる")
             box.setIcon(QMessageBox.Icon.Question)

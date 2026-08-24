@@ -47,6 +47,9 @@ class PdfDocument:
     """PyMuPDF の Document を薄くラップしたクラス。"""
 
     _UNDO_MAX = 60
+    # 注釈に記録する作成者名。設定ダイアログから
+    # PdfDocument.annot_author = "..." で全ドキュメントに効かせる。
+    annot_author: str = ""
 
     def __init__(self) -> None:
         self._doc: fitz.Document | None = None
@@ -57,6 +60,19 @@ class PdfDocument:
         # 注釈の Undo/Redo（ページ単位のスナップショット）
         self._undo: list = []   # [(page_index, [desc,...]), ...] 変更前の状態
         self._redo: list = []
+
+    def _finish_annot(self, annot) -> None:
+        """注釈の仕上げ。作成者名を入れてから外観を確定する。
+
+        既に作成者が入っている注釈（他のアプリで作られたもの）は書き換えない。
+        """
+        if self.annot_author:
+            try:
+                if not (annot.info or {}).get("title"):
+                    annot.set_info(title=self.annot_author)
+            except Exception:  # noqa: BLE001
+                pass  # 作成者名は付けられなくても注釈自体は残す
+        annot.update()
 
     # --- ライフサイクル -------------------------------------------------
     def open(self, path: str, password: str | None = None) -> None:
@@ -205,7 +221,7 @@ class PdfDocument:
         annot.set_colors(stroke=color)
         if opacity < 1.0:
             annot.set_opacity(opacity)
-        annot.update()
+        self._finish_annot(annot)
         self.modified = True
 
     def add_text_highlight(self, index, p0, p1, color=(1.0, 0.86, 0.18),
@@ -242,7 +258,7 @@ class PdfDocument:
         annot.set_colors(stroke=color)
         if opacity < 1.0:
             annot.set_opacity(opacity)
-        annot.update()
+        self._finish_annot(annot)
         self.modified = True
         return True
 
@@ -255,7 +271,7 @@ class PdfDocument:
         annot.set_border(width=width, dashes=dashes)
         if opacity < 1.0:
             annot.set_opacity(opacity)
-        annot.update()
+        self._finish_annot(annot)
         self.modified = True
 
     def add_ink(self, index, strokes, color=(0.9, 0.1, 0.1), width=2.0, opacity=1.0) -> None:
@@ -270,7 +286,7 @@ class PdfDocument:
         annot.set_border(width=width)
         if opacity < 1.0:
             annot.set_opacity(opacity)
-        annot.update()
+        self._finish_annot(annot)
         self.modified = True
 
     def add_freetext(self, index, rect, text, color=(0.0, 0.0, 0.0),
@@ -280,7 +296,7 @@ class PdfDocument:
         annot = page.add_freetext_annot(
             rect, text, fontsize=fontsize, fontname=fontname, text_color=color
         )
-        annot.update()
+        self._finish_annot(annot)
         self.modified = True
 
     def add_text_note(self, index, point, text, icon="Note") -> None:
@@ -288,7 +304,7 @@ class PdfDocument:
         self._push_undo(index)
         page = self._doc.load_page(index)
         annot = page.add_text_annot(point, text, icon=icon)
-        annot.update()
+        self._finish_annot(annot)
         self.modified = True
 
     def add_stamp(self, index, point, text, color=(0.85, 0.1, 0.1),
@@ -308,7 +324,7 @@ class PdfDocument:
         annot = page.add_freetext_annot(
             rect, text, fontsize=fontsize, text_color=color,
             border_width=2, align=1)  # align=1: 中央寄せ
-        annot.update()
+        self._finish_annot(annot)
         self.modified = True
         return annot.xref
 
@@ -333,7 +349,7 @@ class PdfDocument:
         else:
             annot = page.add_strikeout_annot(quads)
         annot.set_colors(stroke=color)
-        annot.update()
+        self._finish_annot(annot)
         self.modified = True
         return True
 
@@ -358,7 +374,7 @@ class PdfDocument:
             annot.set_line_ends(s, e)
         if opacity < 1.0:
             annot.set_opacity(opacity)
-        annot.update()
+        self._finish_annot(annot)
         self.modified = True
 
     def add_circle(self, index, rect, color=(0.9, 0.1, 0.1), width=2.0,
@@ -371,7 +387,7 @@ class PdfDocument:
         annot.set_border(width=width, dashes=dashes)
         if opacity < 1.0:
             annot.set_opacity(opacity)
-        annot.update()
+        self._finish_annot(annot)
         self.modified = True
 
     # --- 墨消し（Redaction：データごと削除） --------------------------
@@ -1690,7 +1706,10 @@ class PdfDocument:
             self._doc.save(tmp, **kwargs)
             self._doc.close()
             os.replace(tmp, out_path)
-            self._doc = fitz.open(out_path)
+            # 置き換え後もロックしないよう stream で開き直す（save_as と同じ）
+            with open(out_path, "rb") as f:
+                data = f.read()
+            self._doc = fitz.open(stream=data, filetype="pdf")
             self.path = out_path
             self.modified = False
         else:
