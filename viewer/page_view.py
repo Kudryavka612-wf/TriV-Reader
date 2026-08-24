@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QElapsedTimer, QEvent, QPoint, QRect, Qt, QTimer, Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QCursor,
@@ -34,6 +36,7 @@ from .document import _UNSET, PdfDocument
 from .govform_js import SIMPLE_CALL_RE
 
 PAGE_SPACING = 12  # ページ間の余白(px)
+GESTURE_MIN_PX = 40  # これ以上動かしたらマウスジェスチャーとみなす
 
 
 class _GovFormClickOverlay(QPushButton):
@@ -383,6 +386,13 @@ class _PageLabel(QLabel):
         self._box_start = None
         self._cur_box = None
         self._press = QPoint()
+        # 3連クリック（行選択）の判定用。Qt はトリプルクリックを通知しない
+        # ので、ダブルクリックの直後かどうかを自前で見る。
+        self._dclick_at: QPoint | None = None
+        self._dclick_timer = QElapsedTimer()
+        # マウスジェスチャー（右ボタンを押しながら動かす）
+        self._gesture_from: QPoint | None = None
+        self._skip_context_menu = False
 
     # --- マウス ---------------------------------------------------------
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -397,6 +407,9 @@ class _PageLabel(QLabel):
             event.accept()
             return
         tool = self._view.tool
+        if event.button() == Qt.MouseButton.RightButton:
+            self._gesture_from = (event.position().toPoint()
+                                  if self._view.gesture_enabled() else None)
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
             return
@@ -422,9 +435,15 @@ class _PageLabel(QLabel):
                 self._move_offset = QPoint()
             else:
                 self._view.clear_selection()
+                # ダブルクリック直後の3回目なら行をまるごと選ぶ
+                if self._is_triple_click(pos):
+                    self._dclick_at = None
+                    self._view.select_line_at(self._index, pos)
+                    return
                 self._text_selecting = True
                 self._start = pos
                 self._view.clear_text_selection()
+                self._view.begin_text_selection()
             return
         if tool in (TOOL_NOTE, TOOL_ERASE, TOOL_STAMP):
             self._view.commit_point(self._index, tool, pos)
@@ -457,6 +476,10 @@ class _PageLabel(QLabel):
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.RightButton:
+            if self._finish_gesture(event.position().toPoint()):
+                event.accept()
+                return
         if self._text_selecting:
             self._text_selecting = False
             return
@@ -489,7 +512,28 @@ class _PageLabel(QLabel):
         self._stroke = []
         self.update()
 
+    def _finish_gesture(self, pos: QPoint) -> bool:
+        """右ドラッグの向きからジェスチャーを決める。動かした量が少なければ
+        ジェスチャーとせず、通常の右クリック（メニュー）に任せる。"""
+        start, self._gesture_from = self._gesture_from, None
+        if start is None:
+            return False
+        dx, dy = pos.x() - start.x(), pos.y() - start.y()
+        if max(abs(dx), abs(dy)) < GESTURE_MIN_PX:
+            return False
+        if abs(dx) > abs(dy):
+            direction = "right" if dx > 0 else "left"
+        else:
+            direction = "down" if dy > 0 else "up"
+        self._skip_context_menu = True
+        self._view.gesture.emit(direction)
+        return True
+
     def contextMenuEvent(self, event) -> None:  # noqa: N802
+        if self._skip_context_menu:   # ジェスチャーの後にメニューを出さない
+            self._skip_context_menu = False
+            event.accept()
+            return
         if self._view.tool == TOOL_NONE and self._view.has_text_selection():
             menu = QMenu(self)
             act = menu.addAction("コピー")
@@ -516,7 +560,24 @@ class _PageLabel(QLabel):
                 self._view.set_selection(self._index, xref)
                 self._view.edit_selection_text()
                 return
+            # 注釈でなければ語を選ぶ（もう1回クリックすれば行選択）
+            self._dclick_at = pos
+            self._dclick_timer.restart()
+            if self._view.select_word_at(self._index, pos):
+                event.accept()
+                return
         super().mouseDoubleClickEvent(event)
+
+    def _is_triple_click(self, pos: QPoint) -> bool:
+        """ダブルクリックのすぐ後の、ほぼ同じ場所へのクリックか。"""
+        from PySide6.QtWidgets import QApplication
+
+        if self._dclick_at is None or not self._dclick_timer.isValid():
+            return False
+        if self._dclick_timer.elapsed() > QApplication.doubleClickInterval():
+            return False
+        d = pos - self._dclick_at
+        return abs(d.x()) <= 4 and abs(d.y()) <= 4
 
     def _handle_at(self, pos, box):
         for hid, (hx, hy) in _handle_centers(box).items():
@@ -665,6 +726,7 @@ class PageView(QScrollArea):
     text_selection_changed = Signal(bool)  # テキスト選択の有無が変わった
     zoom_changed = Signal(float)           # ズーム倍率が変わった
     form_changed = Signal()                # フォーム入力欄の値が変わった
+    gesture = Signal(str)   # マウスジェスチャー left/right/up/down
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -752,6 +814,7 @@ class PageView(QScrollArea):
         self._doc = doc
         self._index = 0
         self._zoom = 1.0
+        self._gesture_enabled = True   # 右ドラッグのジェスチャーを使うか
         # 「幅/縦に合わせる」を選んでいるか（None=手動倍率）。
         # 選んでいる間はウィンドウ幅が変わるたびに合わせ直す。
         self._fit_mode: str | None = None
@@ -1156,7 +1219,11 @@ class PageView(QScrollArea):
             return
         a = self._doc.label_to_pdf_point(index, p0.x(), p0.y(), self._zoom)
         b = self._doc.label_to_pdf_point(index, p1.x(), p1.y(), self._zoom)
-        text, rects = self._doc.select_text(index, a, b)
+        self._apply_text_selection(index, self._doc.select_text(index, a, b))
+
+    def _apply_text_selection(self, index: int, result) -> None:
+        """(文字列, 行ごとの矩形) を受け取って画面に反映する。"""
+        text, rects = result
         prev_index = self._text_sel_index
         had = bool(self._text_sel_text)
         self._text_sel_index = index
@@ -1168,6 +1235,42 @@ class PageView(QScrollArea):
             self._labels[index].update()
         if bool(text) != had:
             self.text_selection_changed.emit(bool(text))
+
+    def gesture_enabled(self) -> bool:
+        return self._gesture_enabled
+
+    def set_gesture_enabled(self, on: bool) -> None:
+        """マウスジェスチャーを使うかどうか（設定から切り替える）。"""
+        self._gesture_enabled = bool(on)
+
+    def begin_text_selection(self) -> None:
+        """選択を始めるときに、憶えている文字レイアウトを捨てる。
+
+        ドラッグ中は同じ解析結果を使い回して速くするので、開始時に一度だけ
+        捨てておけば編集後の古い情報を掴み続けることがない。
+        """
+        if self._doc and self._doc.is_open:
+            self._doc.invalidate_text_layout()
+
+    def select_word_at(self, index: int, pos: QPoint) -> bool:
+        """ダブルクリックした位置の語を選ぶ。選べたら True。"""
+        if not self._doc or not self._doc.is_open:
+            return False
+        self.begin_text_selection()
+        p = self._doc.label_to_pdf_point(index, pos.x(), pos.y(), self._zoom)
+        result = self._doc.select_word(index, p)
+        self._apply_text_selection(index, result)
+        return bool(result[0].strip())
+
+    def select_line_at(self, index: int, pos: QPoint) -> bool:
+        """トリプルクリックした位置の行を丸ごと選ぶ。選べたら True。"""
+        if not self._doc or not self._doc.is_open:
+            return False
+        self.begin_text_selection()
+        p = self._doc.label_to_pdf_point(index, pos.x(), pos.y(), self._zoom)
+        result = self._doc.select_line(index, p)
+        self._apply_text_selection(index, result)
+        return bool(result[0].strip())
 
     def clear_text_selection(self) -> None:
         idx = self._text_sel_index

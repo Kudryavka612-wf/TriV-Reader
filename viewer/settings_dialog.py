@@ -42,6 +42,7 @@ DEFAULTS: dict[str, object] = {
     "tray/resident": True,             # 閉じてもトレイに常駐
     "confirm_close": True,             # ウィンドウを閉じるときに尋ねる
     "recent/limit": 8,                 # 最近使ったファイルの記憶件数
+    "gesture/enabled": True,           # 右ドラッグのマウスジェスチャー
     # --- 表示 ---
     "dark": False,
     "default_zoom_mode": "fit",
@@ -143,6 +144,10 @@ class SettingsDialog(QDialog):
         self.cb_restore = QCheckBox("前回開いていたファイルを開き直す")
         self.cb_tray = QCheckBox("ウィンドウを閉じてもトレイに常駐する（次回の起動が速い）")
         self.cb_confirm_close = QCheckBox("ウィンドウを閉じるときに確認する")
+        self.cb_gesture = QCheckBox("マウスジェスチャーを使う")
+        self.cb_gesture.setToolTip(
+            "ページの上で右ボタンを押しながら動かします。\n"
+            "↓ タブを閉じる / ← 前のタブ / → 次のタブ / ↑ 先頭ページ")
         self.sp_recent = QSpinBox()
         self.sp_recent.setRange(0, 30)
         self.sp_recent.setSuffix(" 件")
@@ -151,6 +156,7 @@ class SettingsDialog(QDialog):
         form.addRow("起動時", self.cb_restore)
         form.addRow("", self.cb_tray)
         form.addRow("", self.cb_confirm_close)
+        form.addRow("マウス操作", self.cb_gesture)
         form.addRow("最近使ったファイル", self.sp_recent)
 
         row = QHBoxLayout()
@@ -283,6 +289,7 @@ class SettingsDialog(QDialog):
         self.cb_restore.setChecked(value(s, "startup/restore_session"))
         self.cb_tray.setChecked(value(s, "tray/resident"))
         self.cb_confirm_close.setChecked(value(s, "confirm_close"))
+        self.cb_gesture.setChecked(value(s, "gesture/enabled"))
         self.sp_recent.setValue(value(s, "recent/limit"))
 
         idx = self.cmb_theme.findData(value(s, "dark"))
@@ -321,6 +328,7 @@ class SettingsDialog(QDialog):
         s.setValue("startup/restore_session", self.cb_restore.isChecked())
         s.setValue("tray/resident", self.cb_tray.isChecked())
         s.setValue("confirm_close", self.cb_confirm_close.isChecked())
+        s.setValue("gesture/enabled", self.cb_gesture.isChecked())
         s.setValue("recent/limit", self.sp_recent.value())
 
         s.setValue("dark", self.cmb_theme.currentData())

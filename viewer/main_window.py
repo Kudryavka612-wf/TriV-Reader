@@ -1290,6 +1290,8 @@ class MainWindow(QMainWindow):
         pv.text_selection_changed.connect(self._on_text_selection_changed)
         pv.zoom_changed.connect(self._on_zoom_changed)
         pv.form_changed.connect(self._on_form_changed)
+        pv.gesture.connect(self._on_gesture)
+        pv.set_gesture_enabled(prefs.value(self.settings, "gesture/enabled"))
         org.reordered.connect(self._reorder_from_organizer)
         org.delete_requested.connect(self._delete_pages)
         org.extract_requested.connect(self._extract_indices)
@@ -2546,6 +2548,22 @@ class MainWindow(QMainWindow):
                 "手動で［設定 > アプリ > 既定のアプリ］を開いてください。",
             )
 
+    # --- マウスジェスチャー ---------------------------------------------
+    def _on_gesture(self, direction: str) -> None:
+        """右ドラッグの向きで、タブの開け閉めとページ移動を行う。"""
+        actions = {
+            "down": ("タブを閉じる", lambda: self._close_tab(self.tabs.currentIndex())),
+            "left": ("前のタブ", lambda: self._cycle_tab(-1)),
+            "right": ("次のタブ", lambda: self._cycle_tab(1)),
+            "up": ("先頭ページ", lambda: self.page_view.set_page(0)),
+        }
+        entry = actions.get(direction)
+        if entry is None:
+            return
+        label, run = entry
+        run()
+        self.statusBar().showMessage(f"マウスジェスチャー: {label}", 2000)
+
     # --- 設定ダイアログ -------------------------------------------------
     def open_settings(self) -> None:
         """設定ダイアログ（全般/表示/注釈/保存/更新/詳細）を開く。"""
@@ -2571,6 +2589,12 @@ class MainWindow(QMainWindow):
         self.annot_dock.setVisible(prefs.value(s, "annot_dock_visible"))
         if getattr(self, "act_tray_resident", None) is not None:
             self.act_tray_resident.setChecked(prefs.value(s, "tray/resident"))
+        on = prefs.value(s, "gesture/enabled")
+        for i in range(self.tabs.count()):
+            t = self.tabs.widget(i)
+            if isinstance(t, DocTab):
+                t.page_view.set_gesture_enabled(on)
+        self._spare_view.set_gesture_enabled(on)
         self._apply_annot_defaults()
         self._trim_recent()
         self._setup_autosave()

@@ -43,6 +43,33 @@ LINE_DASH_PATTERNS = {
 _UNSET = object()
 
 
+def _span_dist(lo: float, hi: float, v: float) -> float:
+    """区間 [lo, hi] と点 v の距離（中にあれば 0）。"""
+    if v < lo:
+        return lo - v
+    if v > hi:
+        return v - hi
+    return 0.0
+
+
+def _char_class(ch: str) -> str:
+    """ダブルクリックの語選択で使う文字種。同じ種類が続く範囲を 1 語とみなす。"""
+    if not ch or ch.isspace():
+        return "space"
+    if ch.isascii():
+        return "word" if (ch.isalnum() or ch == "_") else "symbol"
+    code = ord(ch)
+    if 0x3040 <= code <= 0x309F:
+        return "hira"
+    if 0x30A0 <= code <= 0x30FF or ch in "ー－":
+        return "kata"
+    if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
+        return "kanji"
+    if 0xFF10 <= code <= 0xFF5A:      # 全角英数
+        return "word"
+    return "symbol"
+
+
 class PdfDocument:
     """PyMuPDF の Document を薄くラップしたクラス。"""
 
@@ -57,6 +84,10 @@ class PdfDocument:
         self.modified: bool = False
         self._authenticated: bool = True
         self._doc_scripts_cache: dict[str, str] | None = None
+        # 文字選択用のレイアウト（直近1ページ分だけ）。ドラッグ中はマウスを
+        # 動かすたびに参照されるので、毎回 rawdict を解析すると重い。
+        self._layout_cache_index: int = -1
+        self._layout_cache = None
         # 注釈の Undo/Redo（ページ単位のスナップショット）
         self._undo: list = []   # [(page_index, [desc,...]), ...] 変更前の状態
         self._redo: list = []
@@ -1599,53 +1630,93 @@ class PdfDocument:
 
     def _page_chars(self, index):
         """ページの文字を読み取り順で [(rect, char, line_id), ...] にする。"""
-        page = self._doc.load_page(index)
-        raw = page.get_text("rawdict")
-        chars = []
-        line_id = 0
-        for block in raw.get("blocks", []):
-            if block.get("type", 0) != 0:  # 0 = テキストブロックのみ
-                continue
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    for ch in span.get("chars", []):
-                        chars.append((fitz.Rect(ch["bbox"]), ch["c"], line_id))
-                line_id += 1
-        return chars
+        return self._page_layout(index)[0]
 
-    def select_text(self, index, p0, p1):
-        """p0→p1（PDF座標）の間を「文字単位」で選択する。
+    def _page_layout(self, index):
+        """(chars, lines) を返す。
 
-        返り値 (text, rects)。text は選択文字列（行が変わると改行）、
-        rects は行ごとにまとめた矩形（PDF座標、描画用）。テキストが無ければ ("", [])。
-        クリック位置が文字の左右どちら寄りかでキャレット位置を決め、横方向も正確に。
+        chars は読み取り順の [(rect, 文字, 行ID), ...]、lines は行ごとの
+        [(行ID, [chars の添字...], 行のbbox), ...]。ドラッグ中に何度も使うので
+        直近1ページ分を憶えておき、選択を始めるときに捨てる
+        （invalidate_text_layout）。
         """
-        if not self._doc:
-            return ("", [])
-        chars = self._page_chars(index)
-        if not chars:
-            return ("", [])
+        if self._layout_cache_index == index and self._layout_cache is not None:
+            return self._layout_cache
+        chars = []
+        if self._doc:
+            page = self._doc.load_page(index)
+            raw = page.get_text("rawdict")
+            line_id = 0
+            for block in raw.get("blocks", []):
+                if block.get("type", 0) != 0:  # 0 = テキストブロックのみ
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        for ch in span.get("chars", []):
+                            chars.append((fitz.Rect(ch["bbox"]), ch["c"], line_id))
+                    line_id += 1
+        lines = []
+        for i, (r, _c, lid) in enumerate(chars):
+            if lines and lines[-1][0] == lid:
+                lines[-1][1].append(i)
+                lines[-1][2] |= r
+            else:
+                lines.append([lid, [i], fitz.Rect(r)])
+        self._layout_cache = (chars, lines)
+        self._layout_cache_index = index
+        return self._layout_cache
 
-        def caret(pt):
-            # 行(Y)を重視して最寄りの文字を選び、左右半分でキャレット位置を決める
-            best, bi = None, 0
-            for i, (r, _c, _lid) in enumerate(chars):
-                cy = (r.y0 + r.y1) / 2
-                cx = (r.x0 + r.x1) / 2
-                score = abs(cy - pt.y) * 3 + abs(cx - pt.x)
-                if best is None or score < best:
-                    best, bi = score, i
-            r = chars[bi][0]
-            mid = (r.x0 + r.x1) / 2
-            return bi + 1 if pt.x > mid else bi  # 右半分なら文字の後ろ
+    def invalidate_text_layout(self) -> None:
+        """憶えている文字レイアウトを捨てる（選択を始めるときに呼ぶ）。"""
+        self._layout_cache_index = -1
+        self._layout_cache = None
 
-        c0, c1 = caret(p0), caret(p1)
-        if c0 > c1:
-            c0, c1 = c1, c0
-        sel = chars[c0:c1]
+    @staticmethod
+    def _caret_at(chars, lines, pt) -> int:
+        """クリック位置に対応する「文字と文字の間」の位置を返す。
+
+        先に行を決めてから行内を探す。全文字から最寄りを選ぶと、行末より右を
+        クリックしたときに隣の行の文字を拾ってしまう。
+        """
+        if not lines:
+            return 0
+        # 1) 行を選ぶ。高さが重なる行を優先し、無ければ縦横の距離が近い行。
+        covering = [ln for ln in lines if ln[2].y0 <= pt.y <= ln[2].y1]
+        if covering:  # 段組みで同じ高さに複数行あるときは横位置で選ぶ
+            line = min(covering, key=lambda ln: _span_dist(ln[2].x0, ln[2].x1, pt.x))
+        else:
+            line = min(lines, key=lambda ln: (_span_dist(ln[2].y0, ln[2].y1, pt.y),
+                                              _span_dist(ln[2].x0, ln[2].x1, pt.x)))
+        _lid, idxs, box = line
+        # 2) 行の中で位置を決める。縦書きの行は上下で見る。
+        vertical = len(idxs) > 1 and box.height > box.width * 1.5
+        pos = pt.y if vertical else pt.x
+        lo, hi = (box.y0, box.y1) if vertical else (box.x0, box.x1)
+        if pos <= lo:
+            return idxs[0]          # 行頭より手前 → 行の先頭
+        if pos >= hi:
+            return idxs[-1] + 1     # 行末より先 → 行の末尾
+        for i in idxs:
+            r = chars[i][0]
+            mid = (r.y0 + r.y1) / 2 if vertical else (r.x0 + r.x1) / 2
+            if pos <= mid:
+                return i            # 文字の手前寄り
+        return idxs[-1] + 1
+
+    @staticmethod
+    def _line_of(lines, char_index):
+        """文字の添字からその行を返す。"""
+        for ln in lines:
+            if ln[1][0] <= char_index <= ln[1][-1]:
+                return ln
+        return lines[-1] if lines else None
+
+    @staticmethod
+    def _selection_from(chars, c0: int, c1: int):
+        """chars[c0:c1] を (文字列, 行ごとの矩形) にまとめる。"""
+        sel = chars[max(0, c0):max(0, c1)]
         if not sel:
             return ("", [])
-
         text_parts, rects = [], []
         cur, prev_line = None, None
         for r, c, lid in sel:
@@ -1660,6 +1731,58 @@ class PdfDocument:
         if cur is not None:
             rects.append(cur)
         return ("".join(text_parts), rects)
+
+    def select_word(self, index, pt):
+        """クリック位置の語を選ぶ（ダブルクリック用）。
+
+        日本語には語の区切りが無いので、文字種（英数字/ひらがな/カタカナ/漢字）
+        が続くまとまりを 1 語として扱う。行はまたがない。
+        """
+        chars, lines = self._page_layout(index)
+        if not chars:
+            return ("", [])
+        i = min(self._caret_at(chars, lines, pt), len(chars) - 1)
+        line = self._line_of(lines, i)
+        if line is None:
+            return ("", [])
+        first, last = line[1][0], line[1][-1]
+        cls = _char_class(chars[i][1])
+        start = end = i
+        while start > first and _char_class(chars[start - 1][1]) == cls:
+            start -= 1
+        while end < last and _char_class(chars[end + 1][1]) == cls:
+            end += 1
+        return self._selection_from(chars, start, end + 1)
+
+    def select_line(self, index, pt):
+        """クリック位置の行を丸ごと選ぶ（トリプルクリック用）。"""
+        chars, lines = self._page_layout(index)
+        if not chars:
+            return ("", [])
+        i = min(self._caret_at(chars, lines, pt), len(chars) - 1)
+        line = self._line_of(lines, i)
+        if line is None:
+            return ("", [])
+        return self._selection_from(chars, line[1][0], line[1][-1] + 1)
+
+    def select_text(self, index, p0, p1):
+        """p0→p1（PDF座標）の間を「文字単位」で選択する。
+
+        返り値 (text, rects)。text は選択文字列（行が変わると改行）、
+        rects は行ごとにまとめた矩形（PDF座標、描画用）。テキストが無ければ
+        ("", [])。どの行かを先に決めてから行内の文字境界を探すので、行末より
+        右や段組みの余白をクリックしても隣の行へ飛ばない。
+        """
+        if not self._doc:
+            return ("", [])
+        chars, lines = self._page_layout(index)
+        if not chars:
+            return ("", [])
+        c0 = self._caret_at(chars, lines, p0)
+        c1 = self._caret_at(chars, lines, p1)
+        if c0 > c1:
+            c0, c1 = c1, c0
+        return self._selection_from(chars, c0, c1)
 
     def add_search_highlights(self, hits: list, color=(1.0, 0.86, 0.18)) -> int:
         """検索ヒット [(page_index, rect), ...] をまとめてハイライト注釈にする。"""
