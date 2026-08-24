@@ -137,6 +137,17 @@ class SettingsDialog(QDialog):
         lay.addWidget(buttons)
         self._load()
 
+    @staticmethod
+    def _left(*widgets) -> QWidget:
+        """ウィジェットを左寄せに並べる（QFormLayout に直接置くと横に伸びる）。"""
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        for w in widgets:
+            row.addWidget(w)
+        row.addStretch(1)
+        return holder
+
     # --- タブの中身 ---------------------------------------------------
     def _build_general(self) -> QWidget:
         w = QWidget()
@@ -152,6 +163,7 @@ class SettingsDialog(QDialog):
         self.sp_recent.setRange(0, 30)
         self.sp_recent.setSuffix(" 件")
         self.sp_recent.setToolTip("0 にすると履歴を残しません")
+        self.sp_recent.setMaximumWidth(120)
 
         form.addRow("起動時", self.cb_restore)
         form.addRow("", self.cb_tray)
@@ -159,17 +171,11 @@ class SettingsDialog(QDialog):
         form.addRow("マウス操作", self.cb_gesture)
         form.addRow("最近使ったファイル", self.sp_recent)
 
-        row = QHBoxLayout()
         btn_clear = QPushButton("履歴を消去")
         btn_clear.clicked.connect(self._clear_recent)
         btn_default = QPushButton("既定の PDF アプリにする")
         btn_default.clicked.connect(lambda: self.window.act_set_default_pdf.trigger())
-        row.addWidget(btn_clear)
-        row.addWidget(btn_default)
-        row.addStretch(1)
-        holder = QWidget()
-        holder.setLayout(row)
-        form.addRow("", holder)
+        form.addRow("", self._left(btn_clear, btn_default))
         return w
 
     def _build_view(self) -> QWidget:
@@ -213,16 +219,19 @@ class SettingsDialog(QDialog):
         self._color = QColor(str(DEFAULTS["annot/color"]))
         self.sp_width = QSpinBox()
         self.sp_width.setRange(1, 20)
+        self.sp_width.setMaximumWidth(120)
         self.sp_width.setSuffix(" px")
         self.sp_opacity = QSpinBox()
         self.sp_opacity.setRange(10, 100)
+        self.sp_opacity.setMaximumWidth(120)
         self.sp_opacity.setSuffix(" %")
         self.sp_text = QSpinBox()
         self.sp_text.setRange(6, 96)
+        self.sp_text.setMaximumWidth(120)
         self.sp_text.setSuffix(" pt")
 
         form.addRow("作成者名", self.ed_author)
-        form.addRow("既定の色", self.btn_color)
+        form.addRow("既定の色", self._left(self.btn_color))
         form.addRow("線の太さ", self.sp_width)
         form.addRow("不透明度", self.sp_opacity)
         form.addRow("文字サイズ", self.sp_text)
@@ -240,6 +249,7 @@ class SettingsDialog(QDialog):
         self.sp_autosave.setSpecialValueText("しない")
         self.sp_autosave.setToolTip(
             "編集中のファイルを自動で上書き保存します（0 = しない）")
+        self.sp_autosave.setMaximumWidth(140)
 
         form.addRow("上書き", self.cb_confirm_overwrite)
         form.addRow("", self.cb_backup)
@@ -262,7 +272,7 @@ class SettingsDialog(QDialog):
         form.addRow("更新の確認先 URL", self.ed_update_url)
         btn = QPushButton("今すぐ更新を確認")
         btn.clicked.connect(self._check_update_now)
-        form.addRow("", btn)
+        form.addRow("", self._left(btn))
         form.addRow("プライバシー", self.cb_telemetry)
         return w
 
@@ -280,7 +290,7 @@ class SettingsDialog(QDialog):
         form.addRow("データフォルダ", QLabel(storage.data_dir()))
         btn = QPushButton("データフォルダを開く")
         btn.clicked.connect(self._open_data_dir)
-        form.addRow("", btn)
+        form.addRow("", self._left(btn))
         return w
 
     # --- 読み書き -------------------------------------------------------
