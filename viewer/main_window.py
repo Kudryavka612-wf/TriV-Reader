@@ -2549,19 +2549,32 @@ class MainWindow(QMainWindow):
             )
 
     # --- マウスジェスチャー ---------------------------------------------
-    def _on_gesture(self, direction: str) -> None:
-        """右ドラッグの向きで、タブの開け閉めとページ移動を行う。"""
-        actions = {
-            "down": ("タブを閉じる", lambda: self._close_tab(self.tabs.currentIndex())),
-            "left": ("前のタブ", lambda: self._cycle_tab(-1)),
-            "right": ("次のタブ", lambda: self._cycle_tab(1)),
-            "up": ("先頭ページ", lambda: self.page_view.set_page(0)),
+    def _gesture_runners(self) -> dict:
+        """ジェスチャーに割り当てられる操作の実体（設定の値 → 処理）。"""
+        return {
+            "close_tab": lambda: self._close_tab(self.tabs.currentIndex()),
+            "prev_tab": lambda: self._cycle_tab(-1),
+            "next_tab": lambda: self._cycle_tab(1),
+            "first_page": lambda: self.page_view.set_page(0),
+            "last_page": lambda: self.page_view.set_page(
+                max(0, self.doc.page_count - 1)),
+            "prev_page": lambda: self._goto(self.page_view.index - 1),
+            "next_page": lambda: self._goto(self.page_view.index + 1),
+            "open": self.open_file,
+            "none": lambda: None,
         }
-        entry = actions.get(direction)
-        if entry is None:
+
+    def _on_gesture(self, direction: str) -> None:
+        """右ドラッグの向きに割り当てられた操作を行う（割り当ては設定から）。"""
+        key = f"gesture/{direction}"
+        if key not in prefs.DEFAULTS:
             return
-        label, run = entry
+        action = prefs.value(self.settings, key)
+        run = self._gesture_runners().get(action)
+        if run is None or action == "none":
+            return
         run()
+        label = prefs.GESTURE_ACTIONS.get(action, action)
         self.statusBar().showMessage(f"マウスジェスチャー: {label}", 2000)
 
     # --- 設定ダイアログ -------------------------------------------------

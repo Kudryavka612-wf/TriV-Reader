@@ -1854,7 +1854,7 @@ class PageView(QScrollArea):
         return super().eventFilter(obj, event)
 
     def _auto_marker_widget(self) -> QLabel:
-        """オートスクロールの起点マーカー（丸に上下矢印）。有効中の目印。"""
+        """オートスクロールの起点マーカー（丸に上下左右の矢印）。有効中の目印。"""
         if getattr(self, "_auto_marker", None) is not None:
             return self._auto_marker
         size = 34
@@ -1868,9 +1868,13 @@ class PageView(QScrollArea):
         c = size // 2
         p.setBrush(QColor(60, 60, 60))
         p.setPen(Qt.PenStyle.NoPen)
+        # 上下左右の4方向（どちらへも動かせることが見て分かるように）
         p.drawPolygon(QPolygon([QPoint(c, 6), QPoint(c - 5, 13), QPoint(c + 5, 13)]))
         p.drawPolygon(QPolygon([QPoint(c, size - 6), QPoint(c - 5, size - 13),
                                 QPoint(c + 5, size - 13)]))
+        p.drawPolygon(QPolygon([QPoint(6, c), QPoint(13, c - 5), QPoint(13, c + 5)]))
+        p.drawPolygon(QPolygon([QPoint(size - 6, c), QPoint(size - 13, c - 5),
+                                QPoint(size - 13, c + 5)]))
         # 中央の点
         p.setBrush(QColor(60, 60, 60))
         p.drawEllipse(QRect(c - 2, c - 2, 4, 4))
@@ -1892,7 +1896,7 @@ class PageView(QScrollArea):
         marker.move(pos.x() - marker.width() // 2, pos.y() - marker.height() // 2)
         marker.show()
         marker.raise_()
-        self.viewport().setCursor(Qt.CursorShape.SizeVerCursor)
+        self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
         self._auto_timer.start()
 
     def _stop_autoscroll(self) -> None:
@@ -1902,18 +1906,26 @@ class PageView(QScrollArea):
             self._auto_marker.hide()
         self.viewport().unsetCursor()
 
+    def _auto_step(self, delta: int) -> int:
+        """開始点からのずれを、1 tick ぶんのスクロール量にする。
+
+        デッドゾーンの内側では動かさず、外に出た分だけ距離に比例して速くする。
+        """
+        if abs(delta) <= self.AUTO_DEADZONE:
+            return 0
+        offset = delta - self.AUTO_DEADZONE if delta > 0 else delta + self.AUTO_DEADZONE
+        return int(offset / self.AUTO_DIVISOR)
+
     def _auto_scroll_tick(self) -> None:
-        # 現在のカーソル位置（ビューポート基準）と開始点の差でスクロール速度を決める
+        # 現在のカーソル位置（ビューポート基準）と開始点の差で速度を決める。
+        # 上下だけでなく左右にも動かす（拡大して横にはみ出したページ用）。
         pos = self.viewport().mapFromGlobal(QCursor.pos())
-        dy = pos.y() - self._auto_origin.y()
-        if abs(dy) <= self.AUTO_DEADZONE:
-            return
-        # デッドゾーンを越えた分だけ、距離に比例した速度でスクロール
-        offset = dy - self.AUTO_DEADZONE if dy > 0 else dy + self.AUTO_DEADZONE
-        step = int(offset / self.AUTO_DIVISOR)
-        if step:
-            bar = self.verticalScrollBar()
-            bar.setValue(bar.value() + step)
+        for delta, bar in ((pos.y() - self._auto_origin.y(), self.verticalScrollBar()),
+                           (pos.x() - self._auto_origin.x(),
+                            self.horizontalScrollBar())):
+            step = self._auto_step(delta)
+            if step:
+                bar.setValue(bar.value() + step)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         if event.matches(QKeySequence.StandardKey.Copy) and self.has_text_selection():

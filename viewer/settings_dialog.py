@@ -43,6 +43,10 @@ DEFAULTS: dict[str, object] = {
     "confirm_close": True,             # ウィンドウを閉じるときに尋ねる
     "recent/limit": 8,                 # 最近使ったファイルの記憶件数
     "gesture/enabled": True,           # 右ドラッグのマウスジェスチャー
+    "gesture/up": "first_page",        # ジェスチャーの割り当て（向き→操作）
+    "gesture/down": "close_tab",
+    "gesture/left": "prev_tab",
+    "gesture/right": "next_tab",
     # --- 表示 ---
     "dark": False,
     "default_zoom_mode": "fit",
@@ -67,6 +71,28 @@ DEFAULTS: dict[str, object] = {
     # --- 詳細 ---
     "ocr/lang": "jpn+eng",
 }
+
+# マウスジェスチャーに割り当てられる操作（設定値 → 表示名）。
+# 実際の処理は MainWindow._on_gesture が持つ。
+GESTURE_ACTIONS = {
+    "close_tab": "タブを閉じる",
+    "prev_tab": "前のタブ",
+    "next_tab": "次のタブ",
+    "first_page": "先頭ページ",
+    "last_page": "最終ページ",
+    "prev_page": "前のページ",
+    "next_page": "次のページ",
+    "open": "ファイルを開く",
+    "none": "何もしない",
+}
+
+# 設定に出す向きの並びと見出し
+GESTURE_DIRECTIONS = [
+    ("up", "↑ 上へ"),
+    ("down", "↓ 下へ"),
+    ("left", "← 左へ"),
+    ("right", "→ 右へ"),
+]
 
 # 「開いた時の表示倍率」の選択肢（MainWindow のメニューと同じ並び）
 ZOOM_CHOICES = [
@@ -156,9 +182,9 @@ class SettingsDialog(QDialog):
         self.cb_tray = QCheckBox("ウィンドウを閉じてもトレイに常駐する（次回の起動が速い）")
         self.cb_confirm_close = QCheckBox("ウィンドウを閉じるときに確認する")
         self.cb_gesture = QCheckBox("マウスジェスチャーを使う")
-        self.cb_gesture.setToolTip(
-            "ページの上で右ボタンを押しながら動かします。\n"
-            "↓ タブを閉じる / ← 前のタブ / → 次のタブ / ↑ 先頭ページ")
+        self.cb_gesture.setToolTip("ページの上で右ボタンを押しながら動かします")
+        self.cb_gesture.toggled.connect(self._sync_gesture_rows)
+        self.gesture_combos: dict[str, QComboBox] = {}
         self.sp_recent = QSpinBox()
         self.sp_recent.setRange(0, 30)
         self.sp_recent.setSuffix(" 件")
@@ -169,6 +195,18 @@ class SettingsDialog(QDialog):
         form.addRow("", self.cb_tray)
         form.addRow("", self.cb_confirm_close)
         form.addRow("マウス操作", self.cb_gesture)
+
+        self.gesture_box = QGroupBox("ジェスチャーの割り当て")
+        grid = QFormLayout(self.gesture_box)
+        for key, arrow in GESTURE_DIRECTIONS:
+            cmb = QComboBox()
+            for action, label in GESTURE_ACTIONS.items():
+                cmb.addItem(label, action)
+            cmb.setMaximumWidth(200)
+            self.gesture_combos[key] = cmb
+            grid.addRow(arrow, cmb)
+        form.addRow("", self.gesture_box)
+
         form.addRow("最近使ったファイル", self.sp_recent)
 
         btn_clear = QPushButton("履歴を消去")
@@ -300,6 +338,10 @@ class SettingsDialog(QDialog):
         self.cb_tray.setChecked(value(s, "tray/resident"))
         self.cb_confirm_close.setChecked(value(s, "confirm_close"))
         self.cb_gesture.setChecked(value(s, "gesture/enabled"))
+        for key, cmb in self.gesture_combos.items():
+            idx = cmb.findData(value(s, f"gesture/{key}"))
+            cmb.setCurrentIndex(idx if idx >= 0 else cmb.findData("none"))
+        self._sync_gesture_rows(self.cb_gesture.isChecked())
         self.sp_recent.setValue(value(s, "recent/limit"))
 
         idx = self.cmb_theme.findData(value(s, "dark"))
@@ -339,6 +381,8 @@ class SettingsDialog(QDialog):
         s.setValue("tray/resident", self.cb_tray.isChecked())
         s.setValue("confirm_close", self.cb_confirm_close.isChecked())
         s.setValue("gesture/enabled", self.cb_gesture.isChecked())
+        for key, cmb in self.gesture_combos.items():
+            s.setValue(f"gesture/{key}", cmb.currentData())
         s.setValue("recent/limit", self.sp_recent.value())
 
         s.setValue("dark", self.cmb_theme.currentData())
@@ -385,6 +429,10 @@ class SettingsDialog(QDialog):
         reset_to_defaults(self.settings)
         self._load()
         self.window.apply_preferences()
+
+    def _sync_gesture_rows(self, on: bool) -> None:
+        """ジェスチャーを使わない設定なら、割り当ての選択も触れなくする。"""
+        self.gesture_box.setEnabled(bool(on))
 
     # --- 小物 -----------------------------------------------------------
     def _set_color(self, col: QColor) -> None:
