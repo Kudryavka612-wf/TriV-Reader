@@ -107,6 +107,9 @@ def main() -> int:
     # py_mini_racer はネイティブ V8 バイナリをパッケージデータとして同梱しており、
     # PyInstaller の自動解析では拾われないため collect-all で明示的に含める。
     args += ["--collect-all", "py_mini_racer"]
+    # 印刷はベクター（SVG 経由）で描く。QtSvg が入っていないと黙ってラスタに
+    # フォールバックし、凍結ビルドだけ印刷が粗くなるので明示的に同梱する。
+    args += ["--hidden-import", "PySide6.QtSvg"]
     # アイコン画像を同梱（実行時のウィンドウ/タスクバーアイコン用）
     assets_dir = os.path.join(HERE, "assets")
     if os.path.isdir(assets_dir):

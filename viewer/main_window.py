@@ -1365,6 +1365,9 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(idx)  # _on_tab_changed が読み込み・更新を行う
         QApplication.processEvents()
         self._apply_default_zoom(remembered_zoom)
+        # 初回表示直後はビューポートの幅がまだ確定していないことがあるので、
+        # レイアウトが落ち着いた次のループでもう一度当て直す。
+        QTimer.singleShot(0, lambda z=remembered_zoom: self._apply_default_zoom(z))
         self._add_recent(path)
         # 入力欄付き（フォーム）PDF は Adobe と同様、開いた時点で入力可能にする
         if doc.is_form():
@@ -1379,9 +1382,9 @@ class MainWindow(QMainWindow):
 
     def activate_and_open(self, path: str) -> None:
         """別インスタンスから渡されたパスを開き、ウィンドウを前面化する。"""
-        if path:
-            self.open_path(path)
-        # 最小化されていれば戻し、前面へ
+        # 先にウィンドウを出す。非表示のまま開くとビューポートの幅が確定して
+        # おらず、「幅に合わせる」が極端な倍率になる（トレイ常駐中にエクスプ
+        # ローラから開いたときに、ファイルごとに表示がばらつく原因）。
         self.setWindowState(
             (self.windowState() & ~Qt.WindowState.WindowMinimized)
             | Qt.WindowState.WindowActive
@@ -1389,6 +1392,8 @@ class MainWindow(QMainWindow):
         self.show()
         self.raise_()
         self.activateWindow()
+        if path:
+            self.open_path(path)
 
     # --- システムトレイ常駐 --------------------------------------------
     def _setup_tray(self) -> None:
@@ -2170,9 +2175,7 @@ class MainWindow(QMainWindow):
             return
         from PySide6.QtPrintSupport import QPrinterInfo
 
-        from .print_dialog import (
-            SIZE_ACTUAL, SIZE_CUSTOM, SIZE_FIT, SIZE_SHRINK, PrintDialog,
-        )
+        from .print_dialog import PrintDialog
 
         dlg = PrintDialog(self.doc, self.page_view.index, self.settings, self)
         if dlg.exec() != PrintDialog.DialogCode.Accepted:
@@ -2206,12 +2209,22 @@ class MainWindow(QMainWindow):
         if not pages:
             return
 
+        self._render_to_printer(printer, pages, opt)
+
+    def _render_to_printer(self, printer, pages: list[int], opt: dict) -> None:
+        """選んだページをプリンタへ描画する（ダイアログから切り離してある）。"""
         from PySide6.QtCore import QRectF
         from PySide6.QtGui import QPainter
 
+        from .print_dialog import SIZE_ACTUAL, SIZE_FIT, SIZE_SHRINK
+
         res = printer.resolution() or 300           # プリンタの dpi
-        render_dpi = min(res, 300)                   # 描画は 300dpi で頭打ち（高速・高画質）
-        zoom = render_dpi / 72.0
+        # 品質: "vector" ならベクターで描く。数値ならラスタライズの上限 dpi
+        # （0 は頭打ちなし＝プリンタ解像度まで）。
+        quality = opt.get("quality", "vector")
+        vector = quality == "vector"
+        max_dpi = 0 if vector else (int(quality) or 0)
+        grayscale = opt["grayscale"]
         size_mode = opt["size_mode"]
         custom_scale = opt["custom_scale"]
         auto_rotate = opt["orientation"] == "auto"
@@ -2254,22 +2267,59 @@ class MainWindow(QMainWindow):
                 tgt_h = eff_h * s
                 x = page_rect.left() + (page_rect.width() - tgt_w) / 2
                 y = page_rect.top() + (page_rect.height() - tgt_h) / 2
-                pix = self.doc.render_page(i, zoom=zoom)
-                src = QRectF(0, 0, pix.width(), pix.height())
+                if vector and self._draw_page_vector(
+                        painter, i, x, y, tgt_w, tgt_h, rotate):
+                    continue
+                # 紙に出る大きさから必要な解像度を決める。プリンタ解像度と
+                # 違う細かさで描くと、その差を補間で埋めることになり、ぼやける
+                # うえに巨大ビットマップの拡大縮小でとても遅くなる。
+                out_dpi = res * s
+                if max_dpi:
+                    out_dpi = min(out_dpi, max_dpi)
+                zoom = max(72.0, out_dpi) / 72.0
+                img = self.doc.render_page_image(i, zoom=zoom, gray=grayscale)
+                src = QRectF(0, 0, img.width(), img.height())
                 if rotate:
                     painter.save()
                     painter.translate(x + tgt_w / 2, y + tgt_h / 2)
                     painter.rotate(90)
-                    painter.drawPixmap(
-                        QRectF(-tgt_h / 2, -tgt_w / 2, tgt_h, tgt_w), pix, src)
+                    painter.drawImage(
+                        QRectF(-tgt_h / 2, -tgt_w / 2, tgt_h, tgt_w), img, src)
                     painter.restore()
                 else:
-                    painter.drawPixmap(QRectF(x, y, tgt_w, tgt_h), pix, src)
+                    painter.drawImage(QRectF(x, y, tgt_w, tgt_h), img, src)
             progress.setValue(len(pages))
         finally:
             if painter.isActive():
                 painter.end()
         self.statusBar().showMessage("印刷ジョブを送信しました", 3000)
+
+    def _draw_page_vector(self, painter, index: int, x: float, y: float,
+                          w: float, h: float, rotate: bool) -> bool:
+        """ページをベクター（SVG 経由）で描く。描けなければ False を返す。
+
+        QSvgRenderer は SVG のすべてを解釈できるわけではないので、少しでも
+        怪しければラスタ描画に任せる（印刷が白紙になるより確実）。
+        """
+        try:
+            from PySide6.QtCore import QRectF
+            from PySide6.QtSvg import QSvgRenderer
+
+            svg = self.doc.page_svg(index)
+            renderer = QSvgRenderer(svg.encode("utf-8"))
+            if not renderer.isValid():
+                return False
+            if rotate:
+                painter.save()
+                painter.translate(x + w / 2, y + h / 2)
+                painter.rotate(90)
+                renderer.render(painter, QRectF(-h / 2, -w / 2, h, w))
+                painter.restore()
+            else:
+                renderer.render(painter, QRectF(x, y, w, h))
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     # --- 外部アプリで開く（Acrobat） -----------------------------------
     def open_in_acrobat(self) -> None:

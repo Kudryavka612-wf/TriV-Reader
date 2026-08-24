@@ -119,6 +119,32 @@ class PrintDialog(QDialog):
 
         self.gray_check = QCheckBox("グレースケール（白黒）で印刷")
         left.addWidget(self.gray_check)
+
+        # 印刷品質（ラスタライズの解像度）。プリンタ解像度より粗く描くと、
+        # 紙面へ拡大されるぶんだけ文字の輪郭が甘くなる。
+        row = QHBoxLayout()
+        row.addWidget(QLabel("品質:"))
+        self.quality_combo = QComboBox()
+        # ベクターはプリンタのネイティブ解像度で出るので、拡大してもぼやけず
+        # データ量も小さい。画像化は、ベクターで崩れる特殊な PDF 向けの逃げ道。
+        self.quality_combo.addItem("ベクター（文字がくっきり・既定）", "vector")
+        self.quality_combo.addItem("画像化 600dpi（高品質）", 600)
+        self.quality_combo.addItem("画像化 300dpi（軽い）", 300)
+        self.quality_combo.addItem("画像化 プリンター解像度（最高精細・重い）", 0)
+        saved = settings.value("print/quality", "vector")
+        if saved not in ("vector",):
+            try:
+                saved = int(saved)
+            except (TypeError, ValueError):
+                saved = "vector"
+        idx = self.quality_combo.findData(saved)
+        self.quality_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.quality_combo.setToolTip(
+            "ベクターは拡大してもぼやけず、印刷データも小さくなります。\n"
+            "図版が崩れるときだけ画像化を選んでください。")
+        row.addWidget(self.quality_combo)
+        row.addStretch(1)
+        left.addLayout(row)
         left.addStretch(1)
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
@@ -185,12 +211,14 @@ class PrintDialog(QDialog):
             "custom_scale": self.scale_spin.value() / 100.0,
             "orientation": ori,
             "grayscale": self.gray_check.isChecked(),
+            "quality": self.quality_combo.currentData(),
         }
 
     def _on_accept(self) -> None:
         # 使った設定を記憶
         self._settings.setValue("print/size_mode", self.size_combo.currentIndex())
         self._settings.setValue("print/custom_scale", self.scale_spin.value())
+        self._settings.setValue("print/quality", self.quality_combo.currentData())
         self.accept()
 
     # --- プレビュー -------------------------------------------------------

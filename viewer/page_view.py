@@ -752,6 +752,10 @@ class PageView(QScrollArea):
         self._doc = doc
         self._index = 0
         self._zoom = 1.0
+        # 「幅/縦に合わせる」を選んでいるか（None=手動倍率）。
+        # 選んでいる間はウィンドウ幅が変わるたびに合わせ直す。
+        self._fit_mode: str | None = None
+        self._in_fit = False   # 合わせ直し中の再入防止
         self._form_mode = False
         self._clear_form_overlays()
         self._rebuild(fit=True, target=0)
@@ -1373,7 +1377,10 @@ class PageView(QScrollArea):
         self._set_index(index)
         self._render_visible()
 
-    def set_zoom(self, zoom: float) -> None:
+    def set_zoom(self, zoom: float, _keep_fit: bool = False) -> None:
+        """倍率を指定する。手動指定なら「幅/縦に合わせる」の追従はやめる。"""
+        if not _keep_fit:
+            self._fit_mode = None
         zoom = max(0.1, min(zoom, 8.0))
         if not self._doc or not self._doc.is_open:
             self._zoom = zoom
@@ -1390,23 +1397,28 @@ class PageView(QScrollArea):
         self.zoom_changed.emit(self._zoom)
 
     def fit_width(self) -> None:
+        """ページの幅がビューポートに収まる倍率にする（幅に合わせる）。"""
+        self._fit_mode = "width"
         if not self._doc or not self._doc.is_open:
             return
         w, _ = self._doc.page_pixel_size(self._index, zoom=1.0)
         if w:
             # 見開き時は横に self._cols ページ＋ページ間余白が並ぶ
             margin = PAGE_SPACING * (self._cols + 2) + 8
-            avail = self.viewport().width() - margin
-            self.set_zoom(avail / (w * self._cols))
+            # ウィンドウが未表示だとビューポートが極小のことがある。そのまま
+            # 割ると極端な倍率になるので下限を置き、表示後に合わせ直す。
+            avail = max(120, self.viewport().width() - margin)
+            self.set_zoom(avail / (w * self._cols), _keep_fit=True)
 
     def fit_height(self) -> None:
         """ページ全体が縦に収まる倍率にする（縦に合わせる）。"""
+        self._fit_mode = "height"
         if not self._doc or not self._doc.is_open:
             return
         _, h = self._doc.page_pixel_size(self._index, zoom=1.0)
         if h:
-            avail = self.viewport().height() - PAGE_SPACING * 2
-            self.set_zoom(max(0.1, avail / h))
+            avail = max(160, self.viewport().height() - PAGE_SPACING * 2)
+            self.set_zoom(max(0.1, avail / h), _keep_fit=True)
 
     WHEEL_ZOOM_STEP = 1.1  # Ctrl+ホイール1ノッチあたりの倍率変化
 
@@ -1837,6 +1849,18 @@ class PageView(QScrollArea):
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         super().resizeEvent(event)
+        # 「幅/縦に合わせる」は選んだ瞬間だけでなく、ウィンドウやパネルの幅が
+        # 変わっても追従させる（一般的な PDF リーダーと同じ挙動）。合わせ直しが
+        # スクロールバーの出入りを起こして再び resize が飛ぶので再入を止める。
+        if self._fit_mode and not self._in_fit:
+            self._in_fit = True
+            try:
+                if self._fit_mode == "width":
+                    self.fit_width()
+                else:
+                    self.fit_height()
+            finally:
+                self._in_fit = False
         self._render_visible()
 
     # --- 遅延描画 -------------------------------------------------------

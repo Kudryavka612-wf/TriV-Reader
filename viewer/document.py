@@ -167,6 +167,38 @@ class PdfDocument:
         pix = page.get_pixmap(matrix=matrix, alpha=False)
         return self._pixmap_from_fitz(pix)
 
+    def page_svg(self, index: int, text_as_path: bool = True) -> str:
+        """ページを SVG（ベクター）で書き出す。
+
+        印刷でそのまま拡大してもぼやけない。text_as_path=True だと文字も図形
+        として出すので、描く側にそのフォントが無くても字形が変わらない。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        page = self._doc.load_page(index)
+        return page.get_svg_image(text_as_path=text_as_path)
+
+    def render_page_image(self, index: int, zoom: float = 1.0,
+                          gray: bool = False) -> "QImage":
+        """印刷用に QImage で描画する。
+
+        画面表示と違って QPixmap（描画デバイス側の資源）にする必要がなく、
+        変換のぶんだけ遅くなるので QImage のまま返す。グレースケール指定なら
+        1画素1バイトで描くので、データ量は 1/3・転送も速い。
+        """
+        from PySide6.QtGui import QImage
+
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        page = self._doc.load_page(index)
+        cs = fitz.csGRAY if gray else fitz.csRGB
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False,
+                              colorspace=cs)
+        fmt = (QImage.Format.Format_Grayscale8 if gray
+               else QImage.Format.Format_RGB888)
+        img = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
+        return img.copy()  # PyMuPDF 側のバッファは後で解放されるので複製する
+
     def render_thumbnail(self, index: int, max_width: int = 160) -> QPixmap:
         """サムネイル用の小さな描画。横幅 max_width に合わせて縮小する。"""
         if not self._doc:
