@@ -292,7 +292,9 @@ class SettingsDialog(QDialog):
         form.addRow("上書き", self.cb_confirm_overwrite)
         form.addRow("", self.cb_backup)
         form.addRow("自動保存", self.sp_autosave)
-        form.addRow("", QLabel("※ 自動保存は開いているファイル自身を書き換えます"))
+        form.addRow("", QLabel(
+            "※ 自動保存は開いているファイル自身を書き換えます\n"
+            "　（元に戻せるよう、最初の1回は必ず .bak を残します）"))
         return w
 
     def _build_update(self) -> QWidget:

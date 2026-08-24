@@ -175,6 +175,32 @@ def test_autosave(app: QApplication, w: MainWindow, root: str) -> None:
     check(n == 1, f"ファイルに注釈が書き込まれている（{n}件）")
 
 
+def test_autosave_backup(app: QApplication, w: MainWindow, root: str) -> None:
+    """自動保存は、そのファイルの初回だけ設定に関係なく .bak を残す。"""
+    pdf = os.path.join(root, "autosave_bak.pdf")
+    build_sample(pdf, pages=1)
+    w.settings.setValue("save/backup", False)     # 手動保存のバックアップは切る
+    w.settings.setValue("save/autosave_min", 1)
+    w.apply_preferences()
+    w.open_path(pdf)
+    app.processEvents()
+
+    w.doc.add_highlight(0, fitz.Rect(72, 100, 300, 130))
+    w._autosave_tick()
+    check(os.path.exists(pdf + ".bak"), "自動保存の初回に .bak が残る")
+    with fitz.open(pdf + ".bak") as bak:
+        n = len(list(bak[0].annots()))
+    check(n == 0, f"バックアップは書き換え前の内容（注釈 {n} 件）")
+
+    os.remove(pdf + ".bak")
+    w.doc.add_highlight(0, fitz.Rect(72, 200, 300, 230))
+    w._autosave_tick()
+    check(not os.path.exists(pdf + ".bak"),
+          "2回目以降は設定に従う（オフなら作らない）")
+    w.settings.setValue("save/autosave_min", 0)
+    w.apply_preferences()
+
+
 def test_session(app: QApplication, w: MainWindow, root: str) -> None:
     """開いていたファイルを憶えて復元する。"""
     w.settings.setValue("startup/restore_session", True)
@@ -217,6 +243,7 @@ def main() -> int:
         test_annot_author(app, w, root)
         test_backup(app, w, root)
         test_autosave(app, w, root)
+        test_autosave_backup(app, w, root)
         test_session(app, w, root)
         test_restore_defaults(app, w)
         for i in range(w.tabs.count()):

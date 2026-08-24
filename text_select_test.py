@@ -15,8 +15,12 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import fitz
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QKeyEvent, QMouseEvent
+from PySide6.QtWidgets import QApplication
 
 from viewer.document import PdfDocument
+from viewer.main_window import MainWindow
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 results: list[bool] = []
@@ -181,7 +185,169 @@ def test_cache_invalidation(root: str) -> None:
     doc.close()
 
 
+def build_pages(path: str, pages: int = 3) -> None:
+    """1ページに1行だけ書いた、ページまたぎ確認用の PDF。"""
+    doc = fitz.open()
+    for n in range(pages):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((72, 100), f"Page{n + 1} alpha bravo", fontsize=14,
+                         fontname="japan")
+    doc.save(path)
+    doc.close()
+
+
+def test_select_across_pages(root: str) -> None:
+    """ページをまたぐ選択で、間のページも含めて取れる。"""
+    path = os.path.join(root, "multi.pdf")
+    build_pages(path, 3)
+    doc = PdfDocument()
+    doc.open(path)
+
+    text, per_page = doc.select_across(0, fitz.Point(72, 95),
+                                       2, fitz.Point(400, 95))
+    check(set(per_page) == {0, 1, 2}, f"3ページ分の矩形が返る（{sorted(per_page)}）")
+    check(all(w in text for w in ("Page1", "Page2", "Page3")),
+          f"またいだページの文字が全部入る（{text!r}）")
+
+    # 逆向きのドラッグでも同じ範囲になる
+    back, back_pages = doc.select_across(2, fitz.Point(400, 95),
+                                         0, fitz.Point(72, 95))
+    check(back == text and set(back_pages) == set(per_page),
+          "下から上へ引いても同じ結果")
+
+    # 途中で止めれば、その範囲だけ
+    part, part_pages = doc.select_across(0, fitz.Point(72, 95),
+                                         1, fitz.Point(400, 95))
+    check(set(part_pages) == {0, 1} and "Page3" not in part,
+          f"またいでいないページは含まない（{sorted(part_pages)}）")
+    doc.close()
+
+
+def test_select_all(root: str) -> None:
+    """全選択で全ページのテキストが取れる。"""
+    path = os.path.join(root, "multi.pdf")
+    doc = PdfDocument()
+    doc.open(path)
+    text, per_page = doc.select_all_text()
+    check(set(per_page) == {0, 1, 2}, f"全ページが対象（{sorted(per_page)}）")
+    check(text.count("Page") == 3, f"各ページの文字が入る（{text!r}）")
+    doc.close()
+
+
+def test_markup_rects(root: str) -> None:
+    """選択済みの範囲に、ハイライト/下線/取消線を付けられる。"""
+    path = os.path.join(root, "markup.pdf")
+    build_pages(path, 1)
+    doc = PdfDocument()
+    doc.open(path)
+    _text, rects = doc.select_line(0, fitz.Point(120, 95))
+    for kind, want in (("highlight", "Highlight"), ("underline", "Underline"),
+                       ("strikeout", "StrikeOut")):
+        ok = doc.markup_rects(0, rects, kind, (1.0, 0.86, 0.18))
+        check(ok, f"{kind} を付けられる")
+    kinds = [a.type[1] for a in doc._doc.load_page(0).annots()]
+    check(kinds == ["Highlight", "Underline", "StrikeOut"],
+          f"3種類の注釈ができる（{kinds}）")
+    doc.close()
+
+
+def label_bottom(view, index: int) -> QPoint:
+    lbl = view._labels[index]
+    return QPoint(lbl.width() - 30, lbl.height() - 10)
+
+
+def test_drag_across_pages_in_view(app: QApplication, root: str) -> None:
+    """連続スクロール表示で、ページをまたいでドラッグ選択できる。"""
+    path = os.path.join(root, "multi.pdf")
+    w = MainWindow()
+    w.resize(1000, 780)
+    w.show()
+    app.processEvents()
+    w.open_path(path)
+    app.processEvents()
+
+    pv = w.page_view
+    first, second = pv._labels[0], pv._labels[1]
+    start = QPoint(60, 40)
+    end = QPoint(300, 60)
+    app.sendEvent(first, QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPointF(start),
+        QPointF(first.mapToGlobal(start)),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    # 終点は2ページ目の上（マウスは1ページ目にグラブされたまま動く）
+    app.sendEvent(first, QMouseEvent(
+        QEvent.Type.MouseMove, QPointF(first.mapFromGlobal(second.mapToGlobal(end))),
+        QPointF(second.mapToGlobal(end)),
+        Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    app.processEvents()
+
+    check(pv.has_text_selection(), "ページをまたいでも選択できている")
+    check(pv.selection_pages() == [0, 1],
+          f"2ページ分が選択される（{pv.selection_pages()}）")
+    text = pv.selection_text()
+    check("Page1" in text and "Page2" in text, f"両ページの文字が入る（{text!r}）")
+    check(bool(pv.text_sel_boxes_label(1)), "2ページ目にも選択の塗りが出る")
+
+    app.sendEvent(first, QMouseEvent(
+        QEvent.Type.MouseButtonRelease, QPointF(end),
+        QPointF(second.mapToGlobal(end)),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier))
+    app.processEvents()
+    for i in range(w.tabs.count()):
+        t = w.tabs.widget(i)
+        if hasattr(t, "doc"):
+            t.doc.close()
+
+
+def test_select_all_and_menu_actions(app: QApplication, root: str) -> None:
+    """Ctrl+A と、右クリックメニューから使う操作。"""
+    path = os.path.join(root, "multi.pdf")
+    w = MainWindow()
+    w.resize(1000, 780)
+    w.show()
+    app.processEvents()
+    w.open_path(path)
+    app.processEvents()
+    pv = w.page_view
+
+    app.sendEvent(pv, QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_A,
+        Qt.KeyboardModifier.ControlModifier, "a"))
+    app.processEvents()
+    check(pv.selection_pages() == [0, 1, 2],
+          f"Ctrl+A で全ページが選ばれる（{pv.selection_pages()}）")
+
+    # メニューの「選択文字列を検索」
+    got = []
+    pv.search_requested.connect(got.append)
+    pv.search_requested.emit("alpha")
+    app.processEvents()
+    check(w.search_edit.text() == "alpha", "検索欄に選択文字列が入る")
+
+    # メニューの「ハイライト」（選択したページすべてに付く）
+    check(pv.markup_selection("highlight"), "選択範囲にハイライトを付けられる")
+    counts = [len(list(w.doc._doc.load_page(i).annots())) for i in range(3)]
+    check(all(c == 1 for c in counts), f"各ページに1件ずつ付く（{counts}）")
+    check(not pv.has_text_selection(), "付けたら選択は解除される")
+
+    # メニューの「右に回転」
+    before = w.doc.rotation(0)
+    pv.rotate_requested.emit(90)
+    app.processEvents()
+    check(w.doc.rotation(0) == (before + 90) % 360,
+          f"メニューからページを回転できる（{before} → {w.doc.rotation(0)}）")
+
+    for i in range(w.tabs.count()):
+        t = w.tabs.widget(i)
+        if hasattr(t, "doc"):
+            t.doc.close()
+
+
 def main() -> int:
+    app = QApplication(sys.argv)
     root = tempfile.mkdtemp(prefix="trv_sel_")
     try:
         pdf = os.path.join(root, "text.pdf")
@@ -202,6 +368,11 @@ def main() -> int:
         test_layout_cache_speed(doc)
         doc.close()
         test_cache_invalidation(root)
+        test_select_across_pages(root)
+        test_select_all(root)
+        test_markup_rects(root)
+        test_drag_across_pages_in_view(app, root)
+        test_select_all_and_menu_actions(app, root)
     finally:
         shutil.rmtree(root, ignore_errors=True)
     ok = sum(results)

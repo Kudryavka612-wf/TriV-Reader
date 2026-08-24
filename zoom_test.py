@@ -107,6 +107,39 @@ def test_fit_height_follows(app: QApplication, w: MainWindow) -> None:
           f"高さを増やすと倍率が上がる（{before:.3f} → {w.page_view._zoom:.3f}）")
 
 
+def test_mixed_page_sizes(app: QApplication, w: MainWindow, root: str) -> None:
+    """ページごとに大きさが違う PDF でも、送るたびに幅が合う。"""
+    path = os.path.join(root, "mixed.pdf")
+    doc = fitz.open()
+    for pw, ph in ((595, 842), (1191, 842), (283, 420)):   # A4縦 / A3横 / はがき
+        page = doc.new_page(width=pw, height=ph)
+        page.insert_text((40, 80), f"{pw}x{ph}", fontsize=20)
+    doc.save(path)
+    doc.close()
+
+    w.settings.setValue("default_zoom_mode", "fit")
+    w.open_path(path)
+    app.processEvents()
+    shown = []
+    for i in range(3):
+        w.page_view.set_page(i)
+        app.processEvents()
+        page_w = w.doc.page_pixel_size(i, 1.0)[0]
+        shown.append(round(page_w * w.page_view._zoom))
+    check(max(shown) - min(shown) <= 2,
+          f"大きさの違うページでも表示幅が揃う（{shown}）")
+
+    # 同じ大きさのページを行き来しても倍率が暴れないこと
+    w.page_view.set_page(0)
+    app.processEvents()
+    z0 = w.page_view._zoom
+    w.page_view.set_page(2)
+    w.page_view.set_page(0)
+    app.processEvents()
+    check(abs(w.page_view._zoom - z0) < 0.001,
+          f"戻ってきたら同じ倍率（{z0:.3f} → {w.page_view._zoom:.3f}）")
+
+
 def test_open_while_hidden(app: QApplication, root: str) -> None:
     """非表示（トレイ常駐）から開いても、表示後に妥当な倍率になる。"""
     w = MainWindow()
@@ -142,6 +175,7 @@ def main() -> int:
         test_fit_follows_resize(app, w, root)
         test_manual_zoom_stops_following(app, w)
         test_fit_height_follows(app, w)
+        test_mixed_page_sizes(app, w, root)
         test_open_while_hidden(app, root)
         for i in range(w.tabs.count()):
             t = w.tabs.widget(i)

@@ -455,8 +455,8 @@ class _PageLabel(QLabel):
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         if self._text_selecting:
-            self._view.update_text_selection(
-                self._index, self._start, event.position().toPoint()
+            self._view.update_text_selection_to(
+                self._index, self._start, event.globalPosition().toPoint()
             )
             return
         if self._resizing:
@@ -534,13 +534,42 @@ class _PageLabel(QLabel):
             self._skip_context_menu = False
             event.accept()
             return
-        if self._view.tool == TOOL_NONE and self._view.has_text_selection():
-            menu = QMenu(self)
-            act = menu.addAction("コピー")
-            if menu.exec(event.globalPos()) == act:
-                self._view.copy_selection()
+        if self._view.tool != TOOL_NONE:   # 注釈ツール使用中は邪魔しない
+            super().contextMenuEvent(event)
             return
-        super().contextMenuEvent(event)
+
+        view = self._view
+        menu = QMenu(self)
+        run = {}          # QAction → 実行する処理
+
+        def add(text: str, func) -> None:
+            run[menu.addAction(text)] = func
+
+        if view.has_text_selection():
+            add("コピー", view.copy_selection)
+            menu.addSeparator()
+            add("ハイライト", lambda: view.markup_selection("highlight"))
+            add("下線", lambda: view.markup_selection("underline"))
+            add("取消線", lambda: view.markup_selection("strikeout"))
+            menu.addSeparator()
+            snippet = " ".join(view.selection_text().split())[:18]
+            if snippet:
+                add(f"「{snippet}」を検索",
+                    lambda: view.search_requested.emit(view.selection_text()))
+                menu.addSeparator()
+
+        add("すべて選択", view.select_all_text)
+        menu.addSeparator()
+        add("幅に合わせる", view.fit_width)
+        add("縦に合わせる", view.fit_height)
+        menu.addSeparator()
+        add("左に回転", lambda: view.rotate_requested.emit(-90))
+        add("右に回転", lambda: view.rotate_requested.emit(90))
+
+        chosen = menu.exec(event.globalPos())
+        func = run.get(chosen)
+        if func is not None:
+            func()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         # 連続した中クリックの2回目はダブルクリックとして届くため、ここでも処理する
@@ -727,6 +756,8 @@ class PageView(QScrollArea):
     zoom_changed = Signal(float)           # ズーム倍率が変わった
     form_changed = Signal()                # フォーム入力欄の値が変わった
     gesture = Signal(str)   # マウスジェスチャー left/right/up/down
+    search_requested = Signal(str)   # 右クリックメニューから検索
+    rotate_requested = Signal(int)   # 右クリックメニューからページ回転(±90)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -783,8 +814,8 @@ class PageView(QScrollArea):
         self._search_hits: list = []   # [(page_index, fitz.Rect)]
         self._search_cur = -1
         # テキスト選択
-        self._text_sel_index = -1
-        self._text_sel_rects: list = []   # PDF座標の矩形
+        # 選択中のテキスト。ページをまたげるよう {ページ番号: PDF座標の矩形}
+        self._text_sel: dict[int, list] = {}
         self._text_sel_text = ""
 
         # 中クリックによるオートスクロール（ブラウザ風）
@@ -818,6 +849,7 @@ class PageView(QScrollArea):
         # 「幅/縦に合わせる」を選んでいるか（None=手動倍率）。
         # 選んでいる間はウィンドウ幅が変わるたびに合わせ直す。
         self._fit_mode: str | None = None
+        self._fit_page_size: tuple | None = None  # 合わせた時のページの大きさ
         self._in_fit = False   # 合わせ直し中の再入防止
         self._form_mode = False
         self._clear_form_overlays()
@@ -1215,26 +1247,88 @@ class PageView(QScrollArea):
 
     # --- テキスト選択 / コピー ----------------------------------------
     def update_text_selection(self, index: int, p0: QPoint, p1: QPoint) -> None:
+        """同じページの中でのドラッグ選択。"""
         if not self._doc:
             return
         a = self._doc.label_to_pdf_point(index, p0.x(), p0.y(), self._zoom)
         b = self._doc.label_to_pdf_point(index, p1.x(), p1.y(), self._zoom)
-        self._apply_text_selection(index, self._doc.select_text(index, a, b))
+        text, rects = self._doc.select_text(index, a, b)
+        self._apply_selection(text, {index: rects} if rects else {})
 
-    def _apply_text_selection(self, index: int, result) -> None:
-        """(文字列, 行ごとの矩形) を受け取って画面に反映する。"""
-        text, rects = result
-        prev_index = self._text_sel_index
+    def update_text_selection_to(self, start_index: int, start_pos: QPoint,
+                                 global_pos) -> None:
+        """ドラッグ選択の更新。終点が別のページに入っていてもよい。
+
+        マウスは押したページがグラブし続けるので、終点は画面座標で受け取って
+        どのページの上かを調べ直す。
+        """
+        if not self._doc or not self._doc.is_open:
+            return
+        end_index, end_pos = self._page_at_global(global_pos)
+        a = self._doc.label_to_pdf_point(
+            start_index, start_pos.x(), start_pos.y(), self._zoom)
+        b = self._doc.label_to_pdf_point(
+            end_index, end_pos.x(), end_pos.y(), self._zoom)
+        text, per_page = self._doc.select_across(start_index, a, end_index, b)
+        self._apply_selection(text, per_page)
+
+    def _page_at_global(self, global_pos) -> tuple:
+        """画面座標がどのページのどこかを返す。外れていれば最寄りのページ。"""
+        nearest = None
+        for i, label in enumerate(self._labels):
+            local = label.mapFromGlobal(global_pos)
+            if label.rect().contains(local):
+                return i, local
+            if local.y() < 0:
+                dist = -local.y()
+            elif local.y() >= label.height():
+                dist = local.y() - label.height()
+            else:
+                dist = 0
+            if nearest is None or dist < nearest[0]:
+                nearest = (dist, i, local)
+        if nearest is None:
+            return self._index, QPoint(0, 0)
+        _d, i, local = nearest
+        label = self._labels[i]
+        return i, QPoint(max(0, min(local.x(), label.width() - 1)),
+                         max(0, min(local.y(), label.height() - 1)))
+
+    def _apply_selection(self, text: str, per_page: dict) -> None:
+        """選択結果（文字列と、ページごとの矩形）を画面に反映する。"""
         had = bool(self._text_sel_text)
-        self._text_sel_index = index
-        self._text_sel_rects = rects
+        touched = set(self._text_sel) | set(per_page)
+        self._text_sel = {i: r for i, r in per_page.items() if r}
         self._text_sel_text = text
-        if 0 <= prev_index < len(self._labels) and prev_index != index:
-            self._labels[prev_index].update()
-        if 0 <= index < len(self._labels):
-            self._labels[index].update()
+        for i in touched:
+            if 0 <= i < len(self._labels):
+                self._labels[i].update()
         if bool(text) != had:
             self.text_selection_changed.emit(bool(text))
+
+    def select_all_text(self) -> bool:
+        """文書全体のテキストを選ぶ（Ctrl+A）。"""
+        if not self._doc or not self._doc.is_open:
+            return False
+        self.begin_text_selection()
+        text, per_page = self._doc.select_all_text()
+        self._apply_selection(text, per_page)
+        return bool(text.strip())
+
+    def markup_selection(self, kind: str) -> bool:
+        """選択中のテキストにハイライト/下線/取消線を付ける。"""
+        if not self._doc or not self._text_sel:
+            return False
+        color = (self.color.redF(), self.color.greenF(), self.color.blueF())
+        done = False
+        for index, rects in sorted(self._text_sel.items()):
+            if self._doc.markup_rects(index, rects, kind, color):
+                done = True
+                self.refresh_page(index)
+                self.annotation_changed.emit(index)
+        if done:
+            self.clear_text_selection()
+        return done
 
     def gesture_enabled(self) -> bool:
         return self._gesture_enabled
@@ -1258,9 +1352,9 @@ class PageView(QScrollArea):
             return False
         self.begin_text_selection()
         p = self._doc.label_to_pdf_point(index, pos.x(), pos.y(), self._zoom)
-        result = self._doc.select_word(index, p)
-        self._apply_text_selection(index, result)
-        return bool(result[0].strip())
+        text, rects = self._doc.select_word(index, p)
+        self._apply_selection(text, {index: rects} if rects else {})
+        return bool(text.strip())
 
     def select_line_at(self, index: int, pos: QPoint) -> bool:
         """トリプルクリックした位置の行を丸ごと選ぶ。選べたら True。"""
@@ -1268,20 +1362,12 @@ class PageView(QScrollArea):
             return False
         self.begin_text_selection()
         p = self._doc.label_to_pdf_point(index, pos.x(), pos.y(), self._zoom)
-        result = self._doc.select_line(index, p)
-        self._apply_text_selection(index, result)
-        return bool(result[0].strip())
+        text, rects = self._doc.select_line(index, p)
+        self._apply_selection(text, {index: rects} if rects else {})
+        return bool(text.strip())
 
     def clear_text_selection(self) -> None:
-        idx = self._text_sel_index
-        had = bool(self._text_sel_text)
-        self._text_sel_index = -1
-        self._text_sel_rects = []
-        self._text_sel_text = ""
-        if 0 <= idx < len(self._labels):
-            self._labels[idx].update()
-        if had:
-            self.text_selection_changed.emit(False)
+        self._apply_selection("", {})
 
     def has_text_selection(self) -> bool:
         return bool(self._text_sel_text)
@@ -1297,10 +1383,15 @@ class PageView(QScrollArea):
         return True
 
     def text_sel_boxes_label(self, index: int) -> list:
-        if index != self._text_sel_index or not self._doc:
+        rects = self._text_sel.get(index)
+        if not rects or not self._doc:
             return []
         return [self._doc.pdf_rect_to_label(index, r, self._zoom)
-                for r in self._text_sel_rects]
+                for r in rects]
+
+    def selection_pages(self) -> list:
+        """選択がまたがっているページ番号（若い順）。"""
+        return sorted(self._text_sel)
 
     # --- 注釈の選択・移動・編集 ---------------------------------------
     def hit_annot(self, index: int, pos: QPoint):
@@ -1511,6 +1602,7 @@ class PageView(QScrollArea):
             # ウィンドウが未表示だとビューポートが極小のことがある。そのまま
             # 割ると極端な倍率になるので下限を置き、表示後に合わせ直す。
             avail = max(120, self.viewport().width() - margin)
+            self._fit_page_size = self._doc.page_pixel_size(self._index, zoom=1.0)
             self.set_zoom(avail / (w * self._cols), _keep_fit=True)
 
     def fit_height(self) -> None:
@@ -1521,6 +1613,7 @@ class PageView(QScrollArea):
         _, h = self._doc.page_pixel_size(self._index, zoom=1.0)
         if h:
             avail = max(160, self.viewport().height() - PAGE_SPACING * 2)
+            self._fit_page_size = self._doc.page_pixel_size(self._index, zoom=1.0)
             self.set_zoom(max(0.1, avail / h), _keep_fit=True)
 
     WHEEL_ZOOM_STEP = 1.1  # Ctrl+ホイール1ノッチあたりの倍率変化
@@ -1931,6 +2024,9 @@ class PageView(QScrollArea):
         if event.matches(QKeySequence.StandardKey.Copy) and self.has_text_selection():
             self.copy_selection()
             return
+        if event.matches(QKeySequence.StandardKey.SelectAll):
+            self.select_all_text()
+            return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.has_selection():
             self.delete_selection()
             return
@@ -2025,4 +2121,28 @@ class PageView(QScrollArea):
     def _set_index(self, index: int) -> None:
         if index != self._index:
             self._index = index
+            self._refit_for_page()
             self.page_changed.emit(index)
+
+    def _refit_for_page(self) -> None:
+        """ページごとに大きさが違う PDF で、送った先の大きさに合わせ直す。
+
+        「幅/縦に合わせる」は現在ページの寸法で倍率を決めるので、A4 と A3 が
+        混ざった文書ではページを送るたびに幅がずれる。大きさが変わったときだけ
+        測り直す（同じ大きさなら何もしないので、普通の文書では無駄がない）。
+        """
+        if not self._fit_mode or self._in_fit:
+            return
+        if not self._doc or not self._doc.is_open:
+            return
+        size = self._doc.page_pixel_size(self._index, zoom=1.0)
+        if size == self._fit_page_size:
+            return
+        self._in_fit = True
+        try:
+            if self._fit_mode == "width":
+                self.fit_width()
+            else:
+                self.fit_height()
+        finally:
+            self._in_fit = False

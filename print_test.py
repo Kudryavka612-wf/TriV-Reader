@@ -131,6 +131,25 @@ def test_grayscale(w: MainWindow, root: str) -> None:
     check(content_of(out)[0] == 1, "グレースケール指定でも印刷できる")
 
 
+def test_preview_is_vector(w: MainWindow) -> None:
+    """印刷プレビューも本番と同じベクター描画で、中身が出ている。"""
+    from viewer.print_dialog import PrintDialog
+
+    dlg = PrintDialog(w.doc, 0, w.settings)
+    pm = dlg._preview_pixmap(0, 0.5)
+    check(not pm.isNull() and pm.width() > 100,
+          f"プレビューが描ける（{pm.width()}x{pm.height()}）")
+    img = pm.toImage()
+    inked = sum(1 for y in range(0, img.height(), 5)
+                for x in range(0, img.width(), 5)
+                if img.pixelColor(x, y).value() < 250)
+    check(inked > 20, f"白紙になっていない（描画された点 {inked}）")
+
+    svg = w.doc.page_svg(0)
+    check(svg.lstrip().startswith("<?xml") or "<svg" in svg[:200],
+          "ページを SVG として取り出せる")
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     root = tempfile.mkdtemp(prefix="trv_print_")
@@ -149,6 +168,7 @@ def main() -> int:
         test_raster_dpi_scales(w, root)
         test_vector_is_faster_than_hi_raster(w, root)
         test_grayscale(w, root)
+        test_preview_is_vector(w)
 
         for i in range(w.tabs.count()):
             t = w.tabs.widget(i)

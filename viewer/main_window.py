@@ -1291,6 +1291,8 @@ class MainWindow(QMainWindow):
         pv.zoom_changed.connect(self._on_zoom_changed)
         pv.form_changed.connect(self._on_form_changed)
         pv.gesture.connect(self._on_gesture)
+        pv.search_requested.connect(self._search_selection)
+        pv.rotate_requested.connect(self._rotate)
         pv.set_gesture_enabled(prefs.value(self.settings, "gesture/enabled"))
         org.reordered.connect(self._reorder_from_organizer)
         org.delete_requested.connect(self._delete_pages)
@@ -2548,6 +2550,14 @@ class MainWindow(QMainWindow):
                 "手動で［設定 > アプリ > 既定のアプリ］を開いてください。",
             )
 
+    def _search_selection(self, text: str) -> None:
+        """右クリックメニューの「選択文字列を検索」。"""
+        word = " ".join(text.split())
+        if not word:
+            return
+        self.search_edit.setText(word)
+        self._do_search()
+
     # --- マウスジェスチャー ---------------------------------------------
     def _gesture_runners(self) -> dict:
         """ジェスチャーに割り当てられる操作の実体（設定の値 → 処理）。"""
@@ -2627,9 +2637,12 @@ class MainWindow(QMainWindow):
 
     def _backup_if_enabled(self, path: str | None) -> None:
         """設定が有効なら、上書きの前に元ファイルを .bak として残す。"""
-        if not path or not prefs.value(self.settings, "save/backup"):
-            return
-        if not os.path.exists(path):
+        if prefs.value(self.settings, "save/backup"):
+            self._make_backup(path)
+
+    def _make_backup(self, path: str | None) -> None:
+        """元ファイルを .bak として残す（設定に関わらず実行する）。"""
+        if not path or not os.path.exists(path):
             return
         try:
             shutil.copy2(path, path + ".bak")
@@ -2640,6 +2653,8 @@ class MainWindow(QMainWindow):
     # --- 自動保存 ---------------------------------------------------------
     def _setup_autosave(self) -> None:
         """自動保存タイマーを設定どおりに張り直す（0 分なら止める）。"""
+        if getattr(self, "_autosaved", None) is None:
+            self._autosaved: set[str] = set()   # 初回バックアップ済みのファイル
         minutes = prefs.value(self.settings, "save/autosave_min")
         if getattr(self, "_autosave_timer", None) is None:
             self._autosave_timer = QTimer(self)
@@ -2660,7 +2675,14 @@ class MainWindow(QMainWindow):
             if not (doc.is_open and doc.modified and doc.path):
                 continue
             try:
-                self._backup_if_enabled(doc.path)
+                # 自動保存は本人が押していないのに元ファイルを書き換える。
+                # 元の内容へ戻れるよう、そのファイルの初回だけは設定に関係なく
+                # .bak を残す（2回目以降は設定に従う）。
+                if doc.path in self._autosaved:
+                    self._backup_if_enabled(doc.path)
+                else:
+                    self._make_backup(doc.path)
+                    self._autosaved.add(doc.path)
                 doc.save()
                 saved += 1
             except Exception as exc:  # noqa: BLE001

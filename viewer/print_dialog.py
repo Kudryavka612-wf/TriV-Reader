@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtPrintSupport import QPrinterInfo
 from PySide6.QtWidgets import (
@@ -234,13 +234,37 @@ class PrintDialog(QDialog):
             return False
         return False  # 自動: 用紙は縦のまま（内容側を回す）
 
+    def _preview_pixmap(self, index: int, zoom: float) -> QPixmap:
+        """プレビュー用の描画。実際の印刷と同じくベクターで描く。
+
+        印刷がベクターなのにプレビューだけ画像だと、細い線や小さな文字の見え方が
+        食い違う。QSvgRenderer が使えないときは従来どおり画像で描く。
+        """
+        try:
+            from PySide6.QtSvg import QSvgRenderer
+
+            renderer = QSvgRenderer(self._doc.page_svg(index).encode("utf-8"))
+            if renderer.isValid():
+                box = renderer.viewBoxF()
+                pm = QPixmap(max(1, int(box.width() * zoom)),
+                             max(1, int(box.height() * zoom)))
+                pm.fill(Qt.GlobalColor.white)
+                p = QPainter(pm)
+                p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                renderer.render(p, QRectF(0, 0, pm.width(), pm.height()))
+                p.end()
+                return pm
+        except Exception:  # noqa: BLE001
+            pass
+        return self._doc.render_page(index, zoom=zoom)
+
     def _refresh(self) -> None:
         i = self._preview_index
         n = self._doc.page_count
         self.page_pos_label.setText(f"{i + 1} / {n}")
         try:
             nat_w, nat_h = self._doc.page_pixel_size(i, 1.0)
-            pix = self._doc.render_page(i, zoom=0.5)
+            pix = self._preview_pixmap(i, 0.5)
         except Exception:  # noqa: BLE001
             return
         # 用紙（A4想定のアスペクト。実寸比較はポイント換算で行う）

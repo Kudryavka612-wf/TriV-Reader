@@ -74,6 +74,7 @@ class PdfDocument:
     """PyMuPDF の Document を薄くラップしたクラス。"""
 
     _UNDO_MAX = 60
+    _LAYOUT_CACHE_MAX = 8   # 文字レイアウトを憶えておくページ数
     # 注釈に記録する作成者名。設定ダイアログから
     # PdfDocument.annot_author = "..." で全ドキュメントに効かせる。
     annot_author: str = ""
@@ -84,10 +85,10 @@ class PdfDocument:
         self.modified: bool = False
         self._authenticated: bool = True
         self._doc_scripts_cache: dict[str, str] | None = None
-        # 文字選択用のレイアウト（直近1ページ分だけ）。ドラッグ中はマウスを
-        # 動かすたびに参照されるので、毎回 rawdict を解析すると重い。
-        self._layout_cache_index: int = -1
-        self._layout_cache = None
+        # 文字選択用のレイアウト。ドラッグ中はマウスを動かすたびに参照される
+        # ので、毎回 rawdict を解析すると重い。ページをまたぐ選択でも効くよう
+        # 数ページ分を憶えておく。
+        self._layout_cache: dict[int, tuple] = {}
         # 注釈の Undo/Redo（ページ単位のスナップショット）
         self._undo: list = []   # [(page_index, [desc,...]), ...] 変更前の状態
         self._redo: list = []
@@ -1640,8 +1641,9 @@ class PdfDocument:
         直近1ページ分を憶えておき、選択を始めるときに捨てる
         （invalidate_text_layout）。
         """
-        if self._layout_cache_index == index and self._layout_cache is not None:
-            return self._layout_cache
+        cached = self._layout_cache.get(index)
+        if cached is not None:
+            return cached
         chars = []
         if self._doc:
             page = self._doc.load_page(index)
@@ -1662,14 +1664,14 @@ class PdfDocument:
                 lines[-1][2] |= r
             else:
                 lines.append([lid, [i], fitz.Rect(r)])
-        self._layout_cache = (chars, lines)
-        self._layout_cache_index = index
-        return self._layout_cache
+        if len(self._layout_cache) >= self._LAYOUT_CACHE_MAX:
+            self._layout_cache.clear()   # 溜まりすぎたらまとめて捨てる
+        self._layout_cache[index] = (chars, lines)
+        return self._layout_cache[index]
 
     def invalidate_text_layout(self) -> None:
         """憶えている文字レイアウトを捨てる（選択を始めるときに呼ぶ）。"""
-        self._layout_cache_index = -1
-        self._layout_cache = None
+        self._layout_cache.clear()
 
     @staticmethod
     def _caret_at(chars, lines, pt) -> int:
@@ -1731,6 +1733,81 @@ class PdfDocument:
         if cur is not None:
             rects.append(cur)
         return ("".join(text_parts), rects)
+
+    def _select_whole_page(self, index):
+        """そのページの文字を全部選ぶ。"""
+        chars, _lines = self._page_layout(index)
+        return self._selection_from(chars, 0, len(chars))
+
+    def _select_from_point(self, index, pt):
+        """クリック位置からページの終わりまで。"""
+        chars, lines = self._page_layout(index)
+        return self._selection_from(chars, self._caret_at(chars, lines, pt),
+                                    len(chars))
+
+    def _select_to_point(self, index, pt):
+        """ページの先頭からクリック位置まで。"""
+        chars, lines = self._page_layout(index)
+        return self._selection_from(chars, 0, self._caret_at(chars, lines, pt))
+
+    def select_across(self, i0: int, p0, i1: int, p1):
+        """ページをまたいだ選択。(文字列, {ページ番号: 矩形リスト}) を返す。
+
+        始点より終点が前なら入れ替える。途中のページは丸ごと選ぶ。
+        """
+        if not self._doc:
+            return ("", {})
+        if i1 < i0:
+            i0, p0, i1, p1 = i1, p1, i0, p0
+        if i0 == i1:
+            text, rects = self.select_text(i0, p0, p1)
+            return (text, {i0: rects} if rects else {})
+
+        parts, out = [], {}
+        for i in range(i0, min(i1, self.page_count - 1) + 1):
+            if i == i0:
+                text, rects = self._select_from_point(i, p0)
+            elif i == i1:
+                text, rects = self._select_to_point(i, p1)
+            else:
+                text, rects = self._select_whole_page(i)
+            if rects:
+                out[i] = rects
+                parts.append(text)
+        return ("\n".join(parts), out)
+
+    def select_all_text(self):
+        """文書全体のテキストを選ぶ。(文字列, {ページ番号: 矩形リスト})。"""
+        if not self._doc:
+            return ("", {})
+        parts, out = [], {}
+        for i in range(self.page_count):
+            text, rects = self._select_whole_page(i)
+            if rects:
+                out[i] = rects
+                parts.append(text)
+        return ("\n".join(parts), out)
+
+    def markup_rects(self, index: int, rects, kind: str, color) -> bool:
+        """すでに決まっている矩形に、ハイライト/下線/取消線を付ける。
+
+        右クリックメニューのように「選択済みの範囲」へ注釈を付ける経路で使う。
+        """
+        if not self._doc or not rects:
+            return False
+        self._push_undo(index)
+        page = self._doc.load_page(index)
+        quads = [fitz.Rect(r).quad for r in rects]
+        if kind == "underline":
+            annot = page.add_underline_annot(quads)
+        elif kind == "strikeout":
+            annot = page.add_strikeout_annot(quads)
+        else:
+            annot = page.add_highlight_annot(quads)
+        annot.set_colors(stroke=color)
+        self._finish_annot(annot)
+        self.modified = True
+        return True
 
     def select_word(self, index, pt):
         """クリック位置の語を選ぶ（ダブルクリック用）。
