@@ -48,6 +48,12 @@ jobs:
           python govform_input_test.py
           python annot_interact_test.py
           python annot_list_test.py
+          python folder_lock_test.py
+          python settings_test.py
+          python zoom_test.py
+          python print_test.py
+          python text_select_test.py
+          python gesture_test.py
 
       - name: ビルド（exe 化）
         run: python build_exe.py
