@@ -43,34 +43,15 @@ from .document import PdfDocument
 from .organizer import PageOrganizer
 from .page_view import PageView
 from .thumbnail_list import ThumbnailList
+from .mw_convert import ConvertMixin
+from .mw_print import PrintMixin
+from .mw_update import UpdateMixin
+from .util import parse_ranges
 from .welcome import WelcomeWidget
 
 ZOOM_STEP = 1.25
 
 
-def _parse_ranges(text: str, page_count: int) -> list[int]:
-    """"1-3,5,8" のような 1 始まりの指定を 0 始まりのインデックス列にする。
-
-    順序は入力どおり保持する（並べ替え抽出に使えるよう）。
-    """
-    indices: list[int] = []
-    for token in text.replace(" ", "").split(","):
-        if not token:
-            continue
-        if "-" in token:
-            a, b = token.split("-", 1)
-            start, end = int(a), int(b)
-            step = 1 if end >= start else -1
-            for p in range(start, end + step, step):
-                indices.append(p - 1)
-        else:
-            indices.append(int(token) - 1)
-    if not indices:
-        raise ValueError("ページが指定されていません")
-    for i in indices:
-        if i < 0 or i >= page_count:
-            raise ValueError(f"範囲外のページ番号です（1〜{page_count}）")
-    return indices
 
 
 def _find_acrobat() -> str | None:
@@ -122,7 +103,7 @@ class DocTab(QStackedWidget):
         self.addWidget(self.organizer)   # index 1
 
 
-class MainWindow(QMainWindow):
+class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("TriV-Reader")
@@ -1830,27 +1811,6 @@ class MainWindow(QMainWindow):
         self._update_title()
         self.statusBar().showMessage("メタデータを更新しました", 3000)
 
-    def _export_text(self, as_html: bool) -> None:
-        if not self.doc.is_open:
-            return
-        base = os.path.splitext(self.doc.path or "document")[0]
-        if as_html:
-            out, _ = QFileDialog.getSaveFileName(
-                self, "HTMLに書き出し", base + ".html", "HTML (*.html)")
-        else:
-            out, _ = QFileDialog.getSaveFileName(
-                self, "テキストに書き出し", base + ".txt", "テキスト (*.txt)")
-        if not out:
-            return
-        try:
-            if as_html:
-                self.doc.export_html(out)
-            else:
-                self.doc.export_text(out)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"書き出せませんでした:\n{exc}")
-            return
-        self.statusBar().showMessage(f"書き出しました: {out}", 4000)
 
     # --- しおり / 目次 -------------------------------------------------
     def _add_bookmark(self) -> None:
@@ -2031,299 +1991,11 @@ class MainWindow(QMainWindow):
         self.page_view.set_facing(on)
         self.page_view.fit_width()
 
-    def deskew_document(self) -> None:
-        if not self.doc.is_open:
-            return
-        ret = QMessageBox.question(
-            self, "傾き補正",
-            "スキャン（画像）ページの傾きを補正します。\n"
-            "対象ページは画像として作り直されます（テキストのあるページは変更しません）。続行しますか？",
-        )
-        if ret != QMessageBox.StandardButton.Yes:
-            return
-        dlg = QProgressDialog("傾き補正中…", "キャンセル", 0, self.doc.page_count, self)
-        dlg.setWindowTitle("傾き補正")
-        dlg.setMinimumDuration(0)
 
-        def progress(done, total):
-            dlg.setMaximum(total)
-            dlg.setValue(done)
-            QApplication.processEvents()
-            return not dlg.wasCanceled()
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            n = self.doc.deskew_all(progress=progress)
-        except Exception as exc:  # noqa: BLE001
-            dlg.close()
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "エラー", f"傾き補正に失敗:\n{exc}")
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-        dlg.close()
-        if n < 0:
-            self.statusBar().showMessage("傾き補正をキャンセルしました", 3000)
-            return
-        self._reload(self.page_view.index)
-        self.thumbnails.load(self.doc)
-        self._update_title()
-        self.statusBar().showMessage(f"{n} ページの傾きを補正しました", 4000)
 
-    # --- バッチ処理 / 比較 ---------------------------------------------
-    def batch_dialog(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "処理する PDF を選択（複数可）", self._last_dir(), "PDF (*.pdf)"
-        )
-        if not paths:
-            return
-        op, ok = QInputDialog.getItem(
-            self, "バッチ処理", "操作:",
-            ["最適化(圧縮)", "各ページ画像化(PNG 150dpi)", "OCR(日本語+英語)"], 0, False
-        )
-        if not ok:
-            return
-        out_dir = QFileDialog.getExistingDirectory(self, "出力先フォルダ")
-        if not out_dir:
-            return
-        tessdata = None
-        if op.startswith("OCR"):
-            try:
-                tessdata = ocr.ensure_languages(["jpn", "eng"])
-            except Exception as exc:  # noqa: BLE001
-                QMessageBox.critical(self, "エラー", f"OCR準備に失敗:\n{exc}")
-                return
 
-        dlg = QProgressDialog("バッチ処理中…", "キャンセル", 0, len(paths), self)
-        dlg.setWindowTitle("バッチ処理")
-        dlg.setMinimumDuration(0)
-        done, errors = 0, []
-        for n, p in enumerate(paths):
-            dlg.setValue(n)
-            dlg.setLabelText(f"{os.path.basename(p)} ({n + 1}/{len(paths)})")
-            QApplication.processEvents()
-            if dlg.wasCanceled():
-                break
-            stem = os.path.splitext(os.path.basename(p))[0]
-            try:
-                d = PdfDocument()
-                d.open(p)
-                if d.needs_password:
-                    d.close()
-                    errors.append(f"{stem}: パスワード保護のためスキップ")
-                    continue
-                if op.startswith("最適化"):
-                    d.compress_to(os.path.join(out_dir, f"{stem}_optimized.pdf"))
-                elif op.startswith("各ページ"):
-                    d.export_page_images(list(range(d.page_count)), out_dir,
-                                         "png", 150, stem)
-                else:  # OCR
-                    d.ocr_to(os.path.join(out_dir, f"{stem}_ocr.pdf"),
-                             "jpn+eng", tessdata, dpi=300)
-                d.close()
-                done += 1
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{stem}: {exc}")
-        dlg.setValue(len(paths))
-        msg = f"{done} 件を処理しました。\n出力先: {out_dir}"
-        if errors:
-            msg += "\n\n[スキップ/失敗]\n" + "\n".join(errors[:10])
-        QMessageBox.information(self, "バッチ処理 完了", msg)
 
-    def diff_dialog(self) -> None:
-        from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QPlainTextEdit,
-                                       QVBoxLayout)
-        import difflib
-        a, _ = QFileDialog.getOpenFileName(self, "比較するPDF①", self._last_dir(), "PDF (*.pdf)")
-        if not a:
-            return
-        b, _ = QFileDialog.getOpenFileName(self, "比較するPDF②", self._last_dir(), "PDF (*.pdf)")
-        if not b:
-            return
-
-        def text_of(path):
-            d = PdfDocument(); d.open(path)
-            if d.needs_password:
-                d.close()
-                raise RuntimeError("パスワード保護されています")
-            t = d.full_text(); d.close()
-            return t
-
-        try:
-            ta, tb = text_of(a), text_of(b)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"比較できませんでした:\n{exc}")
-            return
-        diff = list(difflib.unified_diff(
-            ta.splitlines(), tb.splitlines(),
-            fromfile=os.path.basename(a), tofile=os.path.basename(b), lineterm=""
-        ))
-        dlg = QDialog(self)
-        dlg.setWindowTitle("PDF テキスト比較")
-        dlg.resize(720, 560)
-        lay = QVBoxLayout(dlg)
-        view = QPlainTextEdit()
-        view.setReadOnly(True)
-        view.setStyleSheet("font-family: Consolas, monospace;")
-        view.setPlainText("\n".join(diff) if diff else "差分はありません（テキストは一致）。")
-        lay.addWidget(view)
-        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        box.rejected.connect(dlg.reject)
-        box.accepted.connect(dlg.accept)
-        lay.addWidget(box)
-        dlg.exec()
-
-    def print_document(self) -> None:
-        """Adobe 風の印刷ダイアログ（プレビュー付き）で印刷する。"""
-        if not self.doc.is_open:
-            return
-        from PySide6.QtPrintSupport import QPrinterInfo
-
-        from .print_dialog import PrintDialog
-
-        dlg = PrintDialog(self.doc, self.page_view.index, self.settings, self)
-        if dlg.exec() != PrintDialog.DialogCode.Accepted:
-            return
-        opt = dlg.options()
-
-        # プリンタを構成
-        info = QPrinterInfo.printerInfo(opt["printer"])
-        printer = (QPrinter(info, QPrinter.PrinterMode.HighResolution)
-                   if not info.isNull() else QPrinter(QPrinter.PrinterMode.HighResolution))
-        printer.setCopyCount(opt["copies"])
-        if opt["grayscale"]:
-            printer.setColorMode(QPrinter.ColorMode.GrayScale)
-        if opt["orientation"] == "landscape":
-            from PySide6.QtGui import QPageLayout
-            printer.setPageOrientation(QPageLayout.Orientation.Landscape)
-
-        # 対象ページ
-        total = self.doc.page_count
-        if opt["page_mode"] == "current":
-            pages = [self.page_view.index]
-        elif opt["page_mode"] == "range":
-            try:
-                pages = _parse_ranges(opt["range_text"], total)
-            except ValueError as exc:
-                QMessageBox.information(self, "入力エラー", str(exc))
-                return
-        else:
-            pages = list(range(total))
-        pages = [i for i in pages if 0 <= i < total]
-        if not pages:
-            return
-
-        self._render_to_printer(printer, pages, opt)
-
-    def _render_to_printer(self, printer, pages: list[int], opt: dict) -> None:
-        """選んだページをプリンタへ描画する（ダイアログから切り離してある）。"""
-        from PySide6.QtCore import QRectF
-        from PySide6.QtGui import QPainter
-
-        from .print_dialog import SIZE_ACTUAL, SIZE_FIT, SIZE_SHRINK
-
-        res = printer.resolution() or 300           # プリンタの dpi
-        # 品質: "vector" ならベクターで描く。数値ならラスタライズの上限 dpi
-        # （0 は頭打ちなし＝プリンタ解像度まで）。
-        quality = opt.get("quality", "vector")
-        vector = quality == "vector"
-        max_dpi = 0 if vector else (int(quality) or 0)
-        grayscale = opt["grayscale"]
-        size_mode = opt["size_mode"]
-        custom_scale = opt["custom_scale"]
-        auto_rotate = opt["orientation"] == "auto"
-
-        painter = QPainter(printer)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)  # 印刷可能領域(px)
-        progress = QProgressDialog("印刷を準備中…", "キャンセル", 0, len(pages), self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(400)
-        try:
-            for n, i in enumerate(pages):
-                progress.setValue(n)
-                if progress.wasCanceled():
-                    painter.end()
-                    self.statusBar().showMessage("印刷をキャンセルしました", 3000)
-                    return
-                if n > 0:
-                    printer.newPage()
-                # ページの実寸(pt) → 紙面ピクセル数（1pt = 1/72inch）
-                w_pt, h_pt = self.doc.page_pixel_size(i, 1.0)
-                nat_w = w_pt / 72.0 * res
-                nat_h = h_pt / 72.0 * res
-                if nat_w <= 0 or nat_h <= 0:
-                    continue
-                # 向き=自動: 内容と用紙の縦横が食い違うときは内容を 90° 回して印刷
-                rotate = auto_rotate and (
-                    (nat_w > nat_h) != (page_rect.width() > page_rect.height()))
-                eff_w, eff_h = (nat_h, nat_w) if rotate else (nat_w, nat_h)
-                fit = min(page_rect.width() / eff_w, page_rect.height() / eff_h)
-                if size_mode == SIZE_ACTUAL:
-                    s = 1.0
-                elif size_mode == SIZE_FIT:
-                    s = fit
-                elif size_mode == SIZE_SHRINK:
-                    s = min(1.0, fit)
-                else:  # SIZE_CUSTOM
-                    s = custom_scale
-                tgt_w = eff_w * s
-                tgt_h = eff_h * s
-                x = page_rect.left() + (page_rect.width() - tgt_w) / 2
-                y = page_rect.top() + (page_rect.height() - tgt_h) / 2
-                if vector and self._draw_page_vector(
-                        painter, i, x, y, tgt_w, tgt_h, rotate):
-                    continue
-                # 紙に出る大きさから必要な解像度を決める。プリンタ解像度と
-                # 違う細かさで描くと、その差を補間で埋めることになり、ぼやける
-                # うえに巨大ビットマップの拡大縮小でとても遅くなる。
-                out_dpi = res * s
-                if max_dpi:
-                    out_dpi = min(out_dpi, max_dpi)
-                zoom = max(72.0, out_dpi) / 72.0
-                img = self.doc.render_page_image(i, zoom=zoom, gray=grayscale)
-                src = QRectF(0, 0, img.width(), img.height())
-                if rotate:
-                    painter.save()
-                    painter.translate(x + tgt_w / 2, y + tgt_h / 2)
-                    painter.rotate(90)
-                    painter.drawImage(
-                        QRectF(-tgt_h / 2, -tgt_w / 2, tgt_h, tgt_w), img, src)
-                    painter.restore()
-                else:
-                    painter.drawImage(QRectF(x, y, tgt_w, tgt_h), img, src)
-            progress.setValue(len(pages))
-        finally:
-            if painter.isActive():
-                painter.end()
-        self.statusBar().showMessage("印刷ジョブを送信しました", 3000)
-
-    def _draw_page_vector(self, painter, index: int, x: float, y: float,
-                          w: float, h: float, rotate: bool) -> bool:
-        """ページをベクター（SVG 経由）で描く。描けなければ False を返す。
-
-        QSvgRenderer は SVG のすべてを解釈できるわけではないので、少しでも
-        怪しければラスタ描画に任せる（印刷が白紙になるより確実）。
-        """
-        try:
-            from PySide6.QtCore import QRectF
-            from PySide6.QtSvg import QSvgRenderer
-
-            svg = self.doc.page_svg(index)
-            renderer = QSvgRenderer(svg.encode("utf-8"))
-            if not renderer.isValid():
-                return False
-            if rotate:
-                painter.save()
-                painter.translate(x + w / 2, y + h / 2)
-                painter.rotate(90)
-                renderer.render(painter, QRectF(-h / 2, -w / 2, h, w))
-                painter.restore()
-            else:
-                renderer.render(painter, QRectF(x, y, w, h))
-            return True
-        except Exception:  # noqa: BLE001
-            return False
 
     # --- 外部アプリで開く（Acrobat） -----------------------------------
     def open_in_acrobat(self) -> None:
@@ -2382,131 +2054,12 @@ class MainWindow(QMainWindow):
                 ["rundll32.exe", "shell32.dll,OpenAs_RunDLL", path], close_fds=True
             )
 
-    # --- 未対応フォーム機能の検知・報告 --------------------------------
-    def _check_unsupported_govform(self, doc) -> None:
-        """開いたフォームに未対応の入力補助があれば、そっと知らせる。
 
-        官公庁フォームは共有 JS ライブラリで作られており、稀にこのアプリが
-        まだ対応していない補助関数を使う。その場合は「選べない/丸がつかない」
-        欄が出るため、ユーザーが気づけるよう通知し、報告用に書き出せるように
-        アクションを有効化する。
-        """
-        self._unsupported_helpers = []
-        try:
-            names = doc.govform_unsupported_helpers()
-        except Exception:  # noqa: BLE001
-            names = []
-        self._unsupported_helpers = names
-        self.act_report_govform.setEnabled(bool(names))
-        if names:
-            self.statusBar().showMessage(
-                f"このフォームには未対応の入力補助が {len(names)} 件あります。"
-                "［ヘルプ > 未対応フォーム機能を報告用に保存］で書き出せます。", 8000)
-            self._maybe_send_govform_telemetry(doc)
 
-    def _telemetry_url(self) -> str:
-        """テレメトリ送信先（version.py の定数を設定で上書き可）。空=送信しない。"""
-        from .version import TELEMETRY_URL
-        return self.settings.value("telemetry_url", "", str) or TELEMETRY_URL
 
-    def _maybe_send_govform_telemetry(self, doc) -> None:
-        """同意済みなら、未対応フォームの匿名レポートを自動送信する。
 
-        送信先URL未設定なら何もしない（同意も尋ねない）。未決定なら初回だけ
-        同意を尋ね、既定は「送らない」。送るのは関数名＋フォーム定義＋版＋指紋
-        だけで、利用者の入力値・氏名・ファイル名は含めない。
-        """
-        from . import telemetry
-        url = self._telemetry_url()
-        if not url:
-            return  # 配布者が受け口を設定していない → 送信機能そのものが無効
-        state = telemetry.consent_state(self.settings)
-        if state == "":  # 未決定 → 初回だけ同意を尋ねる
-            state = "yes" if self._ask_telemetry_consent() else "no"
-        if state != "yes":
-            return
-        try:
-            payload = doc.govform_telemetry_payload(app_version=self._app_version())
-        except Exception:  # noqa: BLE001
-            payload = None
-        if not payload:
-            return
-        fp = payload.get("form_fingerprint", "")
-        if fp and telemetry.already_sent(self.settings, fp):
-            return  # 同じフォームは一度だけ
-        telemetry.send_async(url, payload)
-        if fp:
-            telemetry.mark_sent(self.settings, fp)
-        self.statusBar().showMessage("未対応フォームの匿名レポートを送信しました", 4000)
 
-    def _ask_telemetry_consent(self) -> bool:
-        """初回の同意確認。既定（Escや×）は「送らない」。"""
-        from . import telemetry
-        box = QMessageBox(self)
-        box.setWindowTitle("匿名レポートの送信")
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setText(
-            "未対応の入力補助を含むフォームを開きました。\n"
-            "改善のため、匿名レポートを開発元へ送信してもよろしいですか？")
-        box.setInformativeText(
-            "送信する内容: 未対応の関数名 / フォーム側の定義 / アプリ・ライブラリ版 /\n"
-            "　フォームの指紋（同一判定用）\n"
-            "送信しない内容: あなたが入力した値・氏名・住所等の個人情報・ファイル名\n\n"
-            "この選択は［ヘルプ > 匿名レポートを送信する］でいつでも変更できます。")
-        yes = box.addButton("送信する", QMessageBox.ButtonRole.YesRole)
-        no = box.addButton("送信しない", QMessageBox.ButtonRole.NoRole)
-        box.setDefaultButton(no)
-        box.exec()
-        agreed = box.clickedButton() is yes
-        telemetry.set_consent(self.settings, agreed)
-        self.act_telemetry_toggle.blockSignals(True)
-        self.act_telemetry_toggle.setChecked(agreed)
-        self.act_telemetry_toggle.blockSignals(False)
-        return agreed
 
-    def _app_version(self) -> str:
-        from .version import APP_VERSION
-        return APP_VERSION
-
-    def _toggle_telemetry(self, on: bool) -> None:
-        from . import telemetry
-        telemetry.set_consent(self.settings, on)
-        self.statusBar().showMessage(
-            "匿名レポートの送信を{}にしました".format("オン" if on else "オフ"), 4000)
-
-    def report_govform_unsupported(self) -> None:
-        """未対応ヘルパーの診断テキストを保存する（報告用）。
-
-        ネットワークへは送らない。書き出したファイルをユーザーが開発元へ
-        送ることで対応追加できる、という導線。
-        """
-        if not self.doc.is_open:
-            return
-        names = getattr(self, "_unsupported_helpers", []) or []
-        if not names:
-            QMessageBox.information(
-                self, "未対応フォーム機能の報告",
-                "このフォームに未対応の入力補助は見つかりませんでした。")
-            return
-        base = "TriVReader_未対応フォーム機能.txt"
-        if self.doc.path:
-            base = os.path.splitext(os.path.basename(self.doc.path))[0] + "_未対応機能.txt"
-        out, _ = QFileDialog.getSaveFileName(
-            self, "報告用に保存", os.path.join(self._last_dir(), base),
-            "テキスト (*.txt)")
-        if not out:
-            return
-        try:
-            from .version import APP_VERSION
-            written = self.doc.write_govform_diagnostic(out, app_version=APP_VERSION)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "報告用に保存", f"書き出しに失敗しました:\n{exc}")
-            return
-        QMessageBox.information(
-            self, "報告用に保存",
-            f"未対応の入力補助 {len(written)} 件を書き出しました:\n{out}\n\n"
-            "このファイルを開発元へお送りいただくと、対応追加を検討できます。\n"
-            "（フォーム側の定義のみを含み、入力した値は含まれません）")
 
     def set_as_default_pdf_app(self) -> None:
         """TriV-Reader を .pdf の候補アプリとして登録し、既定アプリ設定を開く。
@@ -2708,42 +2261,8 @@ class MainWindow(QMainWindow):
             if os.path.exists(p):
                 self.open_path(p)
 
-    def check_update_on_startup(self) -> None:
-        """設定が有効なら、起動直後に静かに更新を確認する。"""
-        if prefs.value(self.settings, "startup/check_update"):
-            QTimer.singleShot(3000, self._silent_update_check)
 
-    def _silent_update_check(self) -> None:
-        """更新があるときだけステータスバーで知らせる（無ければ黙る）。
 
-        通信でUIを止めないようワーカースレッドで確認し、結果だけ後から拾う。
-        """
-        import threading
-
-        from . import updater
-
-        if not updater.is_frozen():
-            return
-        url = updater.manifest_url(self.settings)
-        if not url:
-            return
-
-        def _worker() -> None:
-            try:
-                self._pending_update = updater.check(url, timeout=8)
-            except Exception:  # noqa: BLE001
-                self._pending_update = None  # ネットワーク不通で起動を邪魔しない
-
-        self._pending_update = None
-        threading.Thread(target=_worker, daemon=True).start()
-        QTimer.singleShot(9000, self._notify_pending_update)
-
-    def _notify_pending_update(self) -> None:
-        info = getattr(self, "_pending_update", None)
-        if info:
-            self.statusBar().showMessage(
-                f"新しいバージョン {info.get('version', '')} があります"
-                "（ファイル > 設定 > 更新 から更新できます）", 15000)
 
     # --- 設定の永続化 / 最近のファイル / D&D --------------------------
     def _trim_recent(self) -> None:
@@ -2857,102 +2376,8 @@ class MainWindow(QMainWindow):
                 self.open_path(p)
                 break
 
-    # --- 更新 / バージョン情報 ----------------------------------------
-    def show_about(self) -> None:
-        from . import updater
-        from .version import APP_VERSION
 
-        QMessageBox.information(
-            self, "バージョン情報",
-            f"TriV-Reader\nバージョン {APP_VERSION}\n"
-            f"{'（凍結ビルド）' if updater.is_frozen() else '（ソース実行）'}",
-        )
 
-    def set_update_url(self) -> None:
-        from . import updater
-
-        cur = updater.manifest_url(self.settings)
-        url, ok = QInputDialog.getText(
-            self, "更新元URLを設定",
-            "update.json の公開URL（GitHub Releases 等）:", text=cur
-        )
-        if ok:
-            self.settings.setValue("update_url", url.strip())
-            self.statusBar().showMessage("更新元URLを保存しました", 3000)
-
-    def check_for_update(self) -> None:
-        from . import updater
-
-        if not updater.is_frozen():
-            QMessageBox.information(
-                self, "更新の確認",
-                "ソース実行では自動更新は不要です。\n"
-                "依存の更新は update.ps1（pip 更新＋再ビルド）をご利用ください。",
-            )
-            return
-        url = updater.manifest_url(self.settings)
-        if not url:
-            QMessageBox.information(
-                self, "更新元が未設定",
-                "更新元URLが設定されていません。\n"
-                "［ヘルプ > 更新元URLを設定］で update.json のURLを設定してください。",
-            )
-            return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            info = updater.check(url)
-        except Exception as exc:  # noqa: BLE001
-            QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "更新の確認", f"確認できませんでした:\n{exc}")
-            return
-        QApplication.restoreOverrideCursor()
-        if not info:
-            QMessageBox.information(self, "更新の確認", "お使いのバージョンは最新です。")
-            return
-
-        notes = info.get("notes", "")
-        ret = QMessageBox.question(
-            self, "更新があります",
-            f"新しいバージョン {info['version']} があります。\n\n{notes}\n\n"
-            "今すぐ更新しますか？（ダウンロード後、アプリを再起動します）",
-        )
-        if ret != QMessageBox.StandardButton.Yes:
-            return
-
-        dlg = QProgressDialog("ダウンロード中…", "キャンセル", 0, 100, self)
-        dlg.setWindowTitle("更新")
-        dlg.setMinimumDuration(0)
-
-        def progress(done, total):
-            if total > 0:
-                dlg.setValue(int(done * 100 / total))
-            QApplication.processEvents()
-            return not dlg.wasCanceled()
-
-        try:
-            zip_path = updater.download(info["url"], progress=progress)
-        except Exception as exc:  # noqa: BLE001
-            dlg.close()
-            QMessageBox.warning(self, "更新", f"ダウンロードに失敗しました:\n{exc}")
-            return
-        dlg.close()
-        # 改ざん検証（update.json に sha256 があれば照合）
-        if not updater.verify(zip_path, info.get("sha256", "")):
-            QMessageBox.critical(
-                self, "更新",
-                "ダウンロードしたファイルの検証(SHA256)に失敗しました。\n"
-                "更新を中止します。",
-            )
-            return
-        try:
-            updater.apply_and_restart(zip_path)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "更新", f"更新の適用に失敗しました:\n{exc}")
-            return
-        QMessageBox.information(
-            self, "更新", "アプリを終了して更新を適用します。\n自動的に再起動します。"
-        )
-        QApplication.instance().quit()
 
     # --- テーマ --------------------------------------------------------
     def _toggle_dark(self, on: bool) -> None:
@@ -3003,48 +2428,7 @@ class MainWindow(QMainWindow):
         self._update_title()
         self.statusBar().showMessage("ページ番号を追加しました", 3000)
 
-    # --- 最適化 / PDF-A ------------------------------------------------
-    def compress_save(self) -> None:
-        if not self.doc.is_open:
-            return
-        before = os.path.getsize(self.doc.path) if self.doc.path and os.path.exists(self.doc.path) else 0
-        base = os.path.splitext(self.doc.path or "document")[0]
-        out, _ = QFileDialog.getSaveFileName(
-            self, "最適化して保存", base + "_optimized.pdf", "PDF ファイル (*.pdf)"
-        )
-        if not out:
-            return
-        try:
-            self.doc.compress_to(out)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"最適化できませんでした:\n{exc}")
-            return
-        after = os.path.getsize(out)
-        msg = f"最適化して保存しました:\n{out}\n\nサイズ: {after:,} バイト"
-        if before:
-            msg += f"（元 {before:,} バイト / {100 * after // before}%）"
-        QMessageBox.information(self, "完了", msg)
 
-    def export_pdfa(self) -> None:
-        if not self.doc.is_open:
-            return
-        base = os.path.splitext(self.doc.path or "document")[0]
-        out, _ = QFileDialog.getSaveFileName(
-            self, "PDF/A で書き出し", base + "_pdfa.pdf", "PDF ファイル (*.pdf)"
-        )
-        if not out:
-            return
-        try:
-            self.doc.export_pdfa(out)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"PDF/A 化できませんでした:\n{exc}")
-            return
-        QMessageBox.information(
-            self, "PDF/A 完了",
-            f"PDF/A-2b として書き出しました:\n{out}\n\n"
-            "※ sRGB の OutputIntent と PDF/A 識別情報を付与しています。"
-            "厳密な準拠検証は専用バリデータの利用を推奨します。",
-        )
 
     # --- ページ整理画面の切り替え -------------------------------------
     def _toggle_organize(self, on: bool) -> None:
@@ -3206,7 +2590,7 @@ class MainWindow(QMainWindow):
         if not ok or not text.strip():
             return
         try:
-            indices = _parse_ranges(text, self.doc.page_count)
+            indices = parse_ranges(text, self.doc.page_count)
         except ValueError as exc:
             QMessageBox.information(self, "入力エラー", str(exc))
             return
@@ -3252,168 +2636,10 @@ class MainWindow(QMainWindow):
             self, "分割完了", f"{len(outputs)} 個のファイルを出力しました。\n{out_dir}"
         )
 
-    # --- 画像変換（Step 4） --------------------------------------------
-    def export_images_dialog(self) -> None:
-        """PDF→画像。ページ範囲を指定して書き出す（ツールバーから）。"""
-        if not self.doc.is_open:
-            return
-        text, ok = QInputDialog.getText(
-            self,
-            "画像に書き出し",
-            "対象ページ（例: 1-3,5 / 空欄で全ページ）:",
-            text=f"1-{self.doc.page_count}",
-        )
-        if not ok:
-            return
-        try:
-            indices = (
-                _parse_ranges(text, self.doc.page_count)
-                if text.strip()
-                else list(range(self.doc.page_count))
-            )
-        except ValueError as exc:
-            QMessageBox.information(self, "入力エラー", str(exc))
-            return
-        self._export_indices_images(indices)
 
-    def _export_indices_images(self, indices: list) -> None:
-        """指定ページを画像として書き出す（整理画面の選択からも呼ばれる）。"""
-        if not self.doc.is_open or not indices:
-            return
-        indices = [int(i) for i in indices]
-        fmt, ok = QInputDialog.getItem(
-            self, "形式", "画像形式:", ["PNG", "JPEG"], 0, False
-        )
-        if not ok:
-            return
-        dpi, ok = QInputDialog.getInt(
-            self, "解像度", "DPI（大きいほど高精細）:", value=150, minValue=36, maxValue=600
-        )
-        if not ok:
-            return
-        out_dir = QFileDialog.getExistingDirectory(self, "出力先フォルダを選択")
-        if not out_dir:
-            return
-        stem = os.path.splitext(os.path.basename(self.doc.path or "page"))[0]
-        try:
-            outputs = self.doc.export_page_images(indices, out_dir, fmt, dpi, stem)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"書き出せませんでした:\n{exc}")
-            return
-        QMessageBox.information(
-            self, "完了", f"{len(outputs)} 枚の画像を出力しました。\n{out_dir}"
-        )
 
-    def images_to_pdf_dialog(self) -> None:
-        """画像→PDF。複数画像から新しい PDF を作る（開いていなくても可）。"""
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "PDF にする画像を選択（複数可）", "",
-            "画像 (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff)",
-        )
-        if not paths:
-            return
-        out, _ = QFileDialog.getSaveFileName(
-            self, "保存先 PDF", "images.pdf", "PDF ファイル (*.pdf)"
-        )
-        if not out:
-            return
-        try:
-            PdfDocument.images_to_pdf(paths, out)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"作成できませんでした:\n{exc}")
-            return
-        ret = QMessageBox.question(
-            self, "完了", f"PDF を作成しました:\n{out}\n\n今すぐ開きますか？"
-        )
-        if ret == QMessageBox.StandardButton.Yes:
-            self.open_path(out)  # 新しいタブで開く
 
-    def add_images_as_pages(self) -> None:
-        """画像を現在の PDF にページとして取り込む。"""
-        if not self.doc.is_open:
-            return
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "ページとして追加する画像を選択（複数可）", "",
-            "画像 (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff)",
-        )
-        if not paths:
-            return
-        try:
-            added = self.doc.insert_images_as_pages(paths)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"追加できませんでした:\n{exc}")
-            return
-        self._reload(self.doc.page_count - 1)
-        self.statusBar().showMessage(f"{added} ページ（画像）を追加しました", 3000)
 
-    # --- OCR（Step 5） --------------------------------------------------
-    def run_ocr(self) -> None:
-        """全ページを OCR し、検索可能 PDF を別名で書き出す。"""
-        if not self.doc.is_open:
-            return
-        labels = list(ocr.LANGUAGE_CHOICES.keys())
-        codes = list(ocr.LANGUAGE_CHOICES.values())
-        try:  # 設定の既定言語を最初から選んでおく
-            start = codes.index(prefs.value(self.settings, "ocr/lang"))
-        except ValueError:
-            start = 0
-        label, ok = QInputDialog.getItem(
-            self, "文字認識(OCR)", "認識する言語:", labels, start, False
-        )
-        if not ok:
-            return
-        language = ocr.LANGUAGE_CHOICES[label]
-
-        # 必要な言語データを用意（不足分はダウンロード）
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            tessdata = ocr.ensure_languages(language.split("+"))
-        except Exception as exc:  # noqa: BLE001
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(
-                self, "OCR 準備エラー",
-                f"言語データを用意できませんでした:\n{exc}\n\n"
-                "ネットワーク接続をご確認ください。",
-            )
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-
-        base = os.path.splitext(self.doc.path or "document")[0]
-        out, _ = QFileDialog.getSaveFileName(
-            self, "検索可能 PDF の保存先", base + "_ocr.pdf", "PDF ファイル (*.pdf)"
-        )
-        if not out:
-            return
-
-        dlg = QProgressDialog("OCR 処理中…", "キャンセル", 0, self.doc.page_count, self)
-        dlg.setWindowTitle("文字認識(OCR)")
-        dlg.setMinimumDuration(0)
-        dlg.setValue(0)
-
-        def progress(done: int, total: int) -> bool:
-            dlg.setMaximum(total)
-            dlg.setValue(done)
-            dlg.setLabelText(f"OCR 処理中… {done}/{total} ページ")
-            QApplication.processEvents()
-            return not dlg.wasCanceled()
-
-        try:
-            done = self.doc.ocr_to(out, language, tessdata, dpi=300, progress=progress)
-        except Exception as exc:  # noqa: BLE001
-            dlg.close()
-            QMessageBox.critical(self, "OCR エラー", f"OCR に失敗しました:\n{exc}")
-            return
-        dlg.close()
-        if not done:
-            self.statusBar().showMessage("OCR をキャンセルしました", 3000)
-            return
-        ret = QMessageBox.question(
-            self, "OCR 完了",
-            f"検索可能 PDF を作成しました:\n{out}\n\n今すぐ開きますか？",
-        )
-        if ret == QMessageBox.StandardButton.Yes:
-            self.open_path(out)  # 新しいタブで開く
 
     def save(self) -> None:
         if not self.doc.is_open:

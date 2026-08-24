@@ -98,12 +98,12 @@ def main() -> int:
     print(f"OK: UI削除→5ページ, 並べ替え後ラベル数={len(pv._labels)}")
 
     # --- 範囲指定パーサ --------------------------------------------
-    from viewer.main_window import _parse_ranges
+    from viewer.util import parse_ranges
 
-    assert _parse_ranges("1-3,5", 10) == [0, 1, 2, 4]
-    assert _parse_ranges("3-1", 10) == [2, 1, 0]  # 逆順も保持
+    assert parse_ranges("1-3,5", 10) == [0, 1, 2, 4]
+    assert parse_ranges("3-1", 10) == [2, 1, 0]  # 逆順も保持
     try:
-        _parse_ranges("99", 10)
+        parse_ranges("99", 10)
         raise AssertionError("範囲外を弾けていない")
     except ValueError:
         pass
