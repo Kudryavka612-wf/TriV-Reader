@@ -82,30 +82,34 @@ class PrintMixin:
         from PySide6.QtCore import QRectF
         from PySide6.QtGui import QPainter
 
-        from .print_dialog import SIZE_ACTUAL, SIZE_FIT, SIZE_SHRINK
+        from .print_dialog import nup_slots
 
         res = printer.resolution() or 300           # プリンタの dpi
-        # 品質: "vector" ならベクターで描く。数値ならラスタライズの上限 dpi
-        # （0 は頭打ちなし＝プリンタ解像度まで）。
-        quality = opt.get("quality", "vector")
-        vector = quality == "vector"
-        max_dpi = 0 if vector else (int(quality) or 0)
-        grayscale = opt["grayscale"]
-        size_mode = opt["size_mode"]
-        custom_scale = opt["custom_scale"]
-        auto_rotate = opt["orientation"] == "auto"
-
         auto_paper = opt.get("paper") == "auto"
-        if auto_paper and pages:
-            self._set_paper_from_page(printer, pages[0])
+        nup = max(1, int(opt.get("nup", 1) or 1))   # 1 枚に載せるページ数
+
+        # 「文書のみ」なら注釈を外した複製から描く。入力欄（Widget）は
+        # annots() に出てこないので、フォームに入れた値はそのまま残る。
+        source = self.doc
+        stripped = None
+        if not opt.get("annots", True):
+            try:
+                stripped = self.doc.stripped_copy()
+                source = stripped
+            except Exception:  # noqa: BLE001  作れなければ注釈込みで出す
+                source = self.doc
+
+        sheets = [pages[i:i + nup] for i in range(0, len(pages), nup)]
+        if auto_paper and sheets:
+            self._set_paper_from_page(printer, sheets[0][0])
+
         painter = QPainter(printer)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)  # 印刷可能領域(px)
-        progress = QProgressDialog("印刷を準備中…", "キャンセル", 0, len(pages), self)
+        progress = QProgressDialog("印刷を準備中…", "キャンセル", 0, len(sheets), self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(400)
         try:
-            for n, i in enumerate(pages):
+            for n, sheet in enumerate(sheets):
                 progress.setValue(n)
                 if progress.wasCanceled():
                     painter.end()
@@ -114,57 +118,24 @@ class PrintMixin:
                 if n > 0:
                     # 用紙をページごとに変える場合、newPage の前に指定する
                     if auto_paper:
-                        self._set_paper_from_page(printer, i)
+                        self._set_paper_from_page(printer, sheet[0])
                     printer.newPage()
-                    page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
-                # ページの実寸(pt) → 紙面ピクセル数（1pt = 1/72inch）
-                w_pt, h_pt = self.doc.page_pixel_size(i, 1.0)
-                nat_w = w_pt / 72.0 * res
-                nat_h = h_pt / 72.0 * res
-                if nat_w <= 0 or nat_h <= 0:
+                # 印刷可能領域はページごとに取り直す（用紙が変わることがある）
+                area = QRectF(printer.pageRect(QPrinter.Unit.DevicePixel))
+                if nup == 1:
+                    self._draw_page_in(painter, source, sheet[0], area, opt, res)
                     continue
-                # 向き=自動: 内容と用紙の縦横が食い違うときは内容を 90° 回して印刷
-                rotate = auto_rotate and (
-                    (nat_w > nat_h) != (page_rect.width() > page_rect.height()))
-                eff_w, eff_h = (nat_h, nat_w) if rotate else (nat_w, nat_h)
-                fit = min(page_rect.width() / eff_w, page_rect.height() / eff_h)
-                if size_mode == SIZE_ACTUAL:
-                    s = 1.0
-                elif size_mode == SIZE_FIT:
-                    s = fit
-                elif size_mode == SIZE_SHRINK:
-                    s = min(1.0, fit)
-                else:  # SIZE_CUSTOM
-                    s = custom_scale
-                tgt_w = eff_w * s
-                tgt_h = eff_h * s
-                x = page_rect.left() + (page_rect.width() - tgt_w) / 2
-                y = page_rect.top() + (page_rect.height() - tgt_h) / 2
-                if vector and self._draw_page_vector(
-                        painter, i, x, y, tgt_w, tgt_h, rotate):
-                    continue
-                # 紙に出る大きさから必要な解像度を決める。プリンタ解像度と
-                # 違う細かさで描くと、その差を補間で埋めることになり、ぼやける
-                # うえに巨大ビットマップの拡大縮小でとても遅くなる。
-                out_dpi = res * s
-                if max_dpi:
-                    out_dpi = min(out_dpi, max_dpi)
-                zoom = max(72.0, out_dpi) / 72.0
-                img = self.doc.render_page_image(i, zoom=zoom, gray=grayscale)
-                src = QRectF(0, 0, img.width(), img.height())
-                if rotate:
-                    painter.save()
-                    painter.translate(x + tgt_w / 2, y + tgt_h / 2)
-                    painter.rotate(90)
-                    painter.drawImage(
-                        QRectF(-tgt_h / 2, -tgt_w / 2, tgt_h, tgt_w), img, src)
-                    painter.restore()
-                else:
-                    painter.drawImage(QRectF(x, y, tgt_w, tgt_h), img, src)
-            progress.setValue(len(pages))
+                # 割り付け: 区画に分けて、それぞれに収まるよう縮小して並べる
+                w_pt, h_pt = source.page_pixel_size(sheet[0], 1.0)
+                for slot, index in zip(nup_slots(area, nup, w_pt, h_pt), sheet):
+                    self._draw_page_in(painter, source, index, slot, opt, res,
+                                       fit_only=True)
+            progress.setValue(len(sheets))
         finally:
             if painter.isActive():
                 painter.end()
+            if stripped is not None:
+                stripped.close()
         self.statusBar().showMessage("印刷ジョブを送信しました", 3000)
 
     def _set_paper_from_page(self, printer, index: int) -> None:
@@ -182,7 +153,73 @@ class PrintMixin:
         except Exception:  # noqa: BLE001  受け付けないプリンターは既定のまま
             pass
 
-    def _draw_page_vector(self, painter, index: int, x: float, y: float,
+    def _draw_page_in(self, painter, source, index: int, area, opt: dict,
+                      res: int, fit_only: bool = False) -> None:
+        """1 ページを area（紙面のピクセル座標）に描く。
+
+        fit_only=True（割り付け）のときは、ページサイズ処理を無視して区画に
+        収まるよう縮小する。区画に対して縦横が食い違うページは 90 度回す。
+        """
+        from PySide6.QtCore import QRectF
+
+        from .print_dialog import SIZE_ACTUAL, SIZE_FIT, SIZE_SHRINK
+
+        quality = opt.get("quality", "vector")
+        vector = quality == "vector"
+        max_dpi = 0 if vector else (int(quality) or 0)
+        grayscale = opt["grayscale"]
+        auto_rotate = fit_only or opt["orientation"] == "auto"
+
+        # ページの実寸(pt) → 紙面ピクセル数（1pt = 1/72inch）
+        w_pt, h_pt = source.page_pixel_size(index, 1.0)
+        nat_w = w_pt / 72.0 * res
+        nat_h = h_pt / 72.0 * res
+        if nat_w <= 0 or nat_h <= 0:
+            return
+        pad = (min(area.width(), area.height()) * 0.01) if fit_only else 0.0
+        box = area.adjusted(pad, pad, -pad, -pad)
+        # 向き=自動: 内容と紙（区画）の縦横が食い違うときは内容を 90° 回す
+        rotate = auto_rotate and (
+            (nat_w > nat_h) != (box.width() > box.height()))
+        eff_w, eff_h = (nat_h, nat_w) if rotate else (nat_w, nat_h)
+        fit = min(box.width() / eff_w, box.height() / eff_h)
+        if fit_only:
+            s = fit
+        elif opt["size_mode"] == SIZE_ACTUAL:
+            s = 1.0
+        elif opt["size_mode"] == SIZE_FIT:
+            s = fit
+        elif opt["size_mode"] == SIZE_SHRINK:
+            s = min(1.0, fit)
+        else:  # SIZE_CUSTOM
+            s = opt["custom_scale"]
+        tgt_w = eff_w * s
+        tgt_h = eff_h * s
+        x = box.left() + (box.width() - tgt_w) / 2
+        y = box.top() + (box.height() - tgt_h) / 2
+        if vector and self._draw_page_vector(
+                painter, source, index, x, y, tgt_w, tgt_h, rotate):
+            return
+        # 紙に出る大きさから必要な解像度を決める。プリンタ解像度と違う細かさで
+        # 描くと、その差を補間で埋めることになり、ぼやけるうえに巨大ビット
+        # マップの拡大縮小でとても遅くなる。
+        out_dpi = res * s
+        if max_dpi:
+            out_dpi = min(out_dpi, max_dpi)
+        zoom = max(72.0, out_dpi) / 72.0
+        img = source.render_page_image(index, zoom=zoom, gray=grayscale)
+        src = QRectF(0, 0, img.width(), img.height())
+        if rotate:
+            painter.save()
+            painter.translate(x + tgt_w / 2, y + tgt_h / 2)
+            painter.rotate(90)
+            painter.drawImage(
+                QRectF(-tgt_h / 2, -tgt_w / 2, tgt_h, tgt_w), img, src)
+            painter.restore()
+        else:
+            painter.drawImage(QRectF(x, y, tgt_w, tgt_h), img, src)
+
+    def _draw_page_vector(self, painter, source, index: int, x: float, y: float,
                           w: float, h: float, rotate: bool) -> bool:
         """ページをベクター（SVG 経由）で描く。描けなければ False を返す。
 
@@ -193,7 +230,7 @@ class PrintMixin:
             from PySide6.QtCore import QRectF
             from PySide6.QtSvg import QSvgRenderer
 
-            svg = self.doc.page_svg(index)
+            svg = source.page_svg(index)
             renderer = QSvgRenderer(svg.encode("utf-8"))
             if not renderer.isValid():
                 return False

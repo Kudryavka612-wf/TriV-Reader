@@ -30,6 +30,37 @@ from PySide6.QtWidgets import (
 # サイズ処理モード
 SIZE_FIT, SIZE_ACTUAL, SIZE_SHRINK, SIZE_CUSTOM = range(4)
 
+#: 1 枚に載せるページ数の選択肢
+NUP_CHOICES = (1, 2, 4, 6, 9)
+
+
+def nup_slots(rect: QRectF, count: int, page_w: float, page_h: float) -> list[QRectF]:
+    """rect を count 個の区画に分ける（読む順＝左上から右へ）。
+
+    列×行の割り方は「そのページがいちばん大きく載る」ものを選ぶ。縦のページを
+    2 面付けするときは、90 度回して上下に並べた方が大きく載る（一般的な
+    プリンタードライバーの 2 ページ/枚と同じ見え方）ので、回転も含めて比べる。
+    """
+    if count <= 1:
+        return [rect]
+    page_w = max(1.0, page_w)
+    page_h = max(1.0, page_h)
+    best = None
+    for cols in range(1, count + 1):
+        if count % cols:
+            continue
+        rows = count // cols
+        w = rect.width() / cols
+        h = rect.height() / rows
+        scale = max(min(w / page_w, h / page_h), min(w / page_h, h / page_w))
+        if best is None or scale > best[0]:
+            best = (scale, cols, rows)
+    _s, cols, rows = best
+    w = rect.width() / cols
+    h = rect.height() / rows
+    return [QRectF(rect.x() + c * w, rect.y() + r * h, w, h)
+            for r in range(rows) for c in range(cols)]
+
 
 class PrintDialog(QDialog):
     """印刷設定＋プレビュー。"""
@@ -140,8 +171,28 @@ class PrintDialog(QDialog):
             row.addWidget(rb)
         left.addWidget(gb_ori)
 
+        # 割り付け（1 枚に複数ページ）。紙を減らしたいときに使う。
+        row = QHBoxLayout()
+        row.addWidget(QLabel("割り付け:"))
+        self.nup_combo = QComboBox()
+        for n in NUP_CHOICES:
+            self.nup_combo.addItem("1ページ/枚（そのまま）" if n == 1
+                                   else f"{n}ページ/枚", n)
+        self.nup_combo.setToolTip(
+            "1 枚の紙に何ページ載せるか。2 以上のときは、それぞれの区画に"
+            "収まるよう自動で縮小します（ページサイズ処理は使いません）。")
+        row.addWidget(self.nup_combo)
+        row.addStretch(1)
+        left.addLayout(row)
+
         self.gray_check = QCheckBox("グレースケール（白黒）で印刷")
         left.addWidget(self.gray_check)
+        self.annots_check = QCheckBox("注釈も印刷する（外すと文書のみ）")
+        self.annots_check.setChecked(True)
+        self.annots_check.setToolTip(
+            "ハイライトや付箋、ペンなどの注釈を紙に出すかどうか。"
+            "外しても、フォームに入力した値は印刷されます。")
+        left.addWidget(self.annots_check)
 
         # 印刷品質（ラスタライズの解像度）。プリンタ解像度より粗く描くと、
         # 紙面へ拡大されるぶんだけ文字の輪郭が甘くなる。
@@ -211,6 +262,8 @@ class PrintDialog(QDialog):
         self.scale_spin.setEnabled(self.size_combo.currentIndex() == SIZE_CUSTOM)
         self.printer_combo.currentTextChanged.connect(self._on_printer_changed)
         self.paper_combo.currentIndexChanged.connect(self._refresh)
+        self.nup_combo.currentIndexChanged.connect(self._refresh)
+        self.annots_check.toggled.connect(self._on_annots_toggled)
 
         self._printer_name = None
         self._sync_printer_caps()
@@ -219,11 +272,47 @@ class PrintDialog(QDialog):
             self.duplex_combo.setCurrentIndex(max(0, idx))
             self.collate_check.setChecked(
                 settings.value("print/collate", True, bool))
+            idx = self.nup_combo.findData(int(settings.value("print/nup", 1, int)))
+            self.nup_combo.setCurrentIndex(max(0, idx))
+            self.annots_check.setChecked(
+                settings.value("print/annots", True, bool))
         self._refresh()
 
     def _on_printer_changed(self, _name: str) -> None:
         self._sync_printer_caps()
         self._refresh()
+
+    def _on_annots_toggled(self, _on: bool) -> None:
+        self._release_stripped()
+        self._refresh()
+
+    # --- プレビューに使う文書（注釈なしのときは複製から描く）------------
+    def _release_stripped(self) -> None:
+        doc = getattr(self, "_stripped", None)
+        if doc is not None:
+            doc.close()
+        self._stripped = None
+
+    def _preview_doc(self):
+        """プレビュー用の文書。「文書のみ」なら注釈を外した複製を使う。"""
+        if self.annots_check.isChecked():
+            return self._doc
+        if getattr(self, "_stripped", None) is None:
+            try:
+                self._stripped = self._doc.stripped_copy()
+            except Exception:  # noqa: BLE001  作れなければ元のまま出す
+                return self._doc
+        return self._stripped
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        self._release_stripped()
+        super().closeEvent(event)
+
+    def done(self, result: int) -> None:
+        # accept()/reject() では closeEvent が飛ばないので、ここで後始末する
+        # （プレビュー用に作った複製を残さない）。
+        self._release_stripped()
+        super().done(result)
 
     # --- プリンターの能力 -------------------------------------------------
     def _printer(self) -> QPrinter:
@@ -323,6 +412,8 @@ class PrintDialog(QDialog):
             "grayscale": self.gray_check.isChecked(),
             "quality": self.quality_combo.currentData(),
             "paper": self.paper_combo.currentData(),
+            "nup": self.nup_combo.currentData(),
+            "annots": self.annots_check.isChecked(),
             "duplex": self.duplex_combo.currentData() if self.duplex_combo.isEnabled() else "none",
             "collate": self.collate_check.isChecked(),
         }
@@ -339,6 +430,8 @@ class PrintDialog(QDialog):
             "auto" if paper == "auto" else (paper.name() if paper else ""))
         self._settings.setValue("print/duplex", self.duplex_combo.currentData())
         self._settings.setValue("print/collate", self.collate_check.isChecked())
+        self._settings.setValue("print/nup", self.nup_combo.currentData())
+        self._settings.setValue("print/annots", self.annots_check.isChecked())
         self.accept()
 
     # --- プレビュー -------------------------------------------------------
@@ -346,6 +439,28 @@ class PrintDialog(QDialog):
         n = self._doc.page_count
         self._preview_index = max(0, min(self._preview_index + step, n - 1))
         self._refresh()
+
+    @staticmethod
+    def _draw_fitted(painter, pixmap, slot: QRectF,
+                     page_w: float, page_h: float) -> None:
+        """区画 slot にページを収まるように（必要なら 90 度回して）描く。"""
+        pad = 2.0
+        box = slot.adjusted(pad, pad, -pad, -pad)
+        s_plain = min(box.width() / max(1.0, page_w), box.height() / max(1.0, page_h))
+        s_rot = min(box.width() / max(1.0, page_h), box.height() / max(1.0, page_w))
+        rotate = s_rot > s_plain
+        s = max(s_plain, s_rot)
+        tw, th = page_w * s, page_h * s
+        cx, cy = box.center().x(), box.center().y()
+        src = QRectF(0, 0, pixmap.width(), pixmap.height())
+        if rotate:
+            painter.save()
+            painter.translate(cx, cy)
+            painter.rotate(90)
+            painter.drawPixmap(QRectF(-tw / 2, -th / 2, tw, th), pixmap, src)
+            painter.restore()
+        else:
+            painter.drawPixmap(QRectF(cx - tw / 2, cy - th / 2, tw, th), pixmap, src)
 
     def _paper_is_landscape(self, nat_w: float, nat_h: float) -> bool:
         if self.rb_landscape.isChecked():
@@ -363,7 +478,8 @@ class PrintDialog(QDialog):
         try:
             from PySide6.QtSvg import QSvgRenderer
 
-            renderer = QSvgRenderer(self._doc.page_svg(index).encode("utf-8"))
+            renderer = QSvgRenderer(
+                self._preview_doc().page_svg(index).encode("utf-8"))
             if renderer.isValid():
                 box = renderer.viewBoxF()
                 pm = QPixmap(max(1, int(box.width() * zoom)),
@@ -376,7 +492,7 @@ class PrintDialog(QDialog):
                 return pm
         except Exception:  # noqa: BLE001
             pass
-        return self._doc.render_page(index, zoom=zoom)
+        return self._preview_doc().render_page(index, zoom=zoom)
 
     def _refresh(self) -> None:
         i = self._preview_index
@@ -404,6 +520,30 @@ class PrintDialog(QDialog):
         margin_rect = QRectF(printable.x() * px_per_pt, printable.y() * px_per_pt,
                              printable.width() * px_per_pt,
                              printable.height() * px_per_pt)
+        nup = self.nup_combo.currentData() or 1
+        if nup > 1:
+            # 割り付け: 区画ごとに 1 ページずつ、収まるように縮小して並べる
+            start = (i // nup) * nup
+            slots = nup_slots(margin_rect, nup, nat_w, nat_h)
+            zoom = max(0.12, 0.5 / (nup ** 0.5))
+            for slot, idx in zip(slots, range(start, min(start + nup, n))):
+                try:
+                    pm = self._preview_pixmap(idx, zoom)
+                except Exception:  # noqa: BLE001
+                    continue
+                pw_pt, ph_pt = self._doc.page_pixel_size(idx, 1.0)
+                self._draw_fitted(p, pm, slot, pw_pt, ph_pt)
+            pen = QPen(Qt.GlobalColor.gray)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(margin_rect.adjusted(0, 0, -1, -1))
+            p.end()
+            self.preview.setPixmap(canvas)
+            self.page_pos_label.setText(
+                f"{start + 1}-{min(start + nup, n)} / {n}")
+            return
+
         rotate = (self.rb_auto.isChecked()
                   and (nat_w > nat_h) != (paper_w_pt > paper_h_pt))
         eff_w, eff_h = (nat_h, nat_w) if rotate else (nat_w, nat_h)

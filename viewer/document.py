@@ -2204,6 +2204,22 @@ class PdfDocument:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(friendly_error(exc, saving=True)) from exc
 
+    def stripped_copy(self) -> "PdfDocument":
+        """注釈（コメント類）を外した使い捨ての複製を返す。
+
+        印刷の「文書のみ」用。入力欄（Widget）は annots() に出てこないので
+        そのまま残る＝フォームに入力した値は消えない。使い終わったら close()。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        copy = PdfDocument()
+        copy._doc = fitz.open("pdf", self._doc.tobytes())
+        copy.path = self.path
+        for page in copy._doc:
+            for annot in list(page.annots()):
+                page.delete_annot(annot)
+        return copy
+
     # --- 画像を再圧縮する「圧縮」 -------------------------------------
     #: 圧縮プリセット（キー → (表示名, 画像の最大DPI, JPEG品質, 説明)）
     COMPRESS_PRESETS = {
