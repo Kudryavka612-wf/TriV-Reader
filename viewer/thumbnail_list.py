@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem, QMenu
 
 from .document import PdfDocument
@@ -39,6 +39,17 @@ class ThumbnailList(QListWidget):
         self._doc: PdfDocument | None = None
         self._gen = 0            # ロード世代（古いロードのキャンセル用）
         self._pending: list[int] = []  # これから実描画する index のキュー
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        """空のときは白い箱にせず、何を待っている場所かを書いておく。"""
+        super().paintEvent(event)
+        if self.count():
+            return
+        p = QPainter(self.viewport())
+        p.setPen(self.palette().color(QPalette.ColorRole.Mid))
+        p.drawText(self.viewport().rect(),
+                   Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                   "PDF を開くとページの一覧がここに並びます")
 
     # --- 遅延サムネイル描画 ---------------------------------------------
     # 全ページのサムネイルを一気に同期描画すると、PDF を開いた瞬間に

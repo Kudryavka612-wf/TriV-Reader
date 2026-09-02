@@ -128,7 +128,14 @@ def main() -> int:
     # 実際の終了は MainWindow 側で QApplication.quit() を明示的に呼ぶ。
     app.setQuitOnLastWindowClosed(False)
     app._jp_translators = _install_japanese(app)  # 標準ボタン等を日本語化
-    theme.apply_theme(app, dark=False)  # 既定はライト（設定があれば後で切替）
+    # 保存済みのテーマで最初から描く。ライトで作ってから切り替えると、
+    # 起動のたびに白い画面が一瞬見えるうえ、全ウィジェットの再スタイルで
+    # 起動が 50ms ほど遅くなる。
+    try:
+        _dark = storage.make_settings().value("dark", False, bool)
+    except Exception:  # noqa: BLE001  設定が読めなければライトで出す
+        _dark = False
+    theme.apply_theme(app, dark=bool(_dark))
 
     window = MainWindow()
     window.show()

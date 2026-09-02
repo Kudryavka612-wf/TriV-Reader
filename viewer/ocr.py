@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import os
 import shutil
-import urllib.request
+
+# urllib は起動時間の 1 割ほどを占めるわりに、言語データが足りないときにしか
+# 使わない。ここでは読み込まず、実際にダウンロードする直前に import する。
 
 TESSDATA_FAST_URL = (
     "https://github.com/tesseract-ocr/tessdata_fast/raw/main/{lang}.traineddata"
@@ -60,6 +62,8 @@ def ensure_languages(langs: list[str], on_download=None) -> str:
             continue
         if on_download:
             on_download(lang)
+        import urllib.request
+
         urllib.request.urlretrieve(TESSDATA_FAST_URL.format(lang=lang), target)
     return dst
 

@@ -32,10 +32,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import theme
 from .document import _UNSET, PdfDocument
 from .govform_js import SIMPLE_CALL_RE
 
-PAGE_SPACING = 12  # ページ間の余白(px)
+PAGE_SPACING = 16  # ページ間の余白(px)。落ち影が乗るので少し広めに取る
 GESTURE_MIN_PX = 40  # これ以上動かしたらマウスジェスチャーとみなす
 
 
@@ -372,7 +373,8 @@ class _PageLabel(QLabel):
         self._index = index
         self._view = view
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet("background:#e6e6e6; border:1px solid #b0b0b0;")
+        # 未描画のあいだも「紙」に見えるようにしておく（灰色の板を出さない）
+        self.apply_theme(False)
         self.setCursor(Qt.CursorShape.IBeamCursor)  # 既定(選択ツール)=テキスト選択
         self._drawing = False
         self._start = QPoint()
@@ -393,6 +395,10 @@ class _PageLabel(QLabel):
         # マウスジェスチャー（右ボタンを押しながら動かす）
         self._gesture_from: QPoint | None = None
         self._skip_context_menu = False
+
+    def apply_theme(self, dark: bool) -> None:
+        """紙（未描画時のプレースホルダ）の色をテーマに合わせる。"""
+        self.setStyleSheet(f"background: {theme.paper_color(dark)}; border: 0;")
 
     # --- マウス ---------------------------------------------------------
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -746,6 +752,55 @@ class _PageLabel(QLabel):
             painter.drawPolygon(QPolygon(pts))
 
 
+class _PageCanvas(QWidget):
+    """ページを並べる土台。背景色と、各ページの落ち影を描く。
+
+    影は QGraphicsDropShadowEffect（ページごとにオフスクリーン描画＋ぼかしが
+    走って重い）を使わず、外側ほど薄い角丸矩形を数枚重ねて表現する。見えて
+    いるページの分だけなので、スクロールしても描画コストはほぼ増えない。
+    """
+
+    LAYERS = 7      # 影の層数。多いほど滑らかで、そのぶん少しだけ重い
+    SPREAD = 9      # 影の広がり(px)
+    DROP = 3        # 影を下にずらす量(px)
+
+    def __init__(self, view: "PageView") -> None:
+        super().__init__()
+        self._view = view
+        self._bg = QColor(theme.canvas_color(False))
+        self._shadow = QColor(0, 0, 0)
+        self._shadow_alpha = 0.28
+
+    def apply_theme(self, dark: bool) -> None:
+        self._bg = QColor(theme.canvas_color(dark))
+        rgb, alpha = theme.page_shadow(dark)
+        r, g, b = (int(v) for v in rgb.split(","))
+        self._shadow = QColor(r, g, b)
+        self._shadow_alpha = alpha
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        p = QPainter(self)
+        p.fillRect(event.rect(), self._bg)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        area = event.rect().adjusted(-self.SPREAD * 3, -self.SPREAD * 3,
+                                     self.SPREAD * 3, self.SPREAD * 3)
+        for label in self._view._labels:
+            rect = label.geometry()
+            if not rect.intersects(area):
+                continue
+            for i in range(self.LAYERS, 0, -1):
+                # 外側の層ほど薄く。重ねることで縁がぼけて見える。
+                a = self._shadow_alpha * (0.9 / self.LAYERS) * (self.LAYERS - i + 1)
+                self._shadow.setAlphaF(min(1.0, a))
+                p.setBrush(self._shadow)
+                grow = self.SPREAD * i // self.LAYERS
+                p.drawRoundedRect(
+                    rect.adjusted(-grow, -grow + self.DROP, grow, grow + self.DROP),
+                    grow + 2, grow + 2)
+
+
 class PageView(QScrollArea):
     """縦スクロールで全ページを連続表示する。"""
 
@@ -761,7 +816,7 @@ class PageView(QScrollArea):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._container = QWidget()
+        self._container = _PageCanvas(self)
         # グリッド配置（1列=通常、2列=見開き）。ラベルはコンテナ直下なので
         # label.y() はコンテナ基準のままで、遅延描画ロジックがそのまま使える。
         self._layout = QGridLayout(self._container)
@@ -788,10 +843,22 @@ class PageView(QScrollArea):
         self._overlay_rebuild_timer.setSingleShot(True)
         self._overlay_rebuild_timer.setInterval(140)
         self._overlay_rebuild_timer.timeout.connect(self._build_form_overlays)
+        # スクロールが落ち着いたら、次に見えそうなページを先に描いておく
+        # （描画キャッシュに入れるだけ。送ったときに待たされない）。
+        self._prefetch_timer = QTimer(self)
+        self._prefetch_timer.setSingleShot(True)
+        self._prefetch_timer.setInterval(120)
+        self._prefetch_timer.timeout.connect(self._prefetch_around)
         self._index: int = 0
         self._zoom: float = 1.0
         self._cols = 1  # 1=通常 / 2=見開き
         self._suspend_scroll = False
+        self._dark = False
+        # 「幅/縦に合わせる」の状態。文書を開く前でもリサイズが飛んでくる
+        # （予備ビューや作った直後の表示）ので、ここで用意しておく。
+        self._fit_mode: str | None = None
+        self._fit_page_size: tuple | None = None
+        self._in_fit = False
 
         # 注釈ツールの状態
         self.tool = TOOL_NONE
@@ -848,8 +915,8 @@ class PageView(QScrollArea):
         self._gesture_enabled = True   # 右ドラッグのジェスチャーを使うか
         # 「幅/縦に合わせる」を選んでいるか（None=手動倍率）。
         # 選んでいる間はウィンドウ幅が変わるたびに合わせ直す。
-        self._fit_mode: str | None = None
-        self._fit_page_size: tuple | None = None  # 合わせた時のページの大きさ
+        self._fit_mode = None
+        self._fit_page_size = None  # 合わせた時のページの大きさ
         self._in_fit = False   # 合わせ直し中の再入防止
         self._form_mode = False
         self._clear_form_overlays()
@@ -872,9 +939,13 @@ class PageView(QScrollArea):
     def zoom(self) -> float:
         return self._zoom
 
-    def set_canvas_color(self, color: str) -> None:
-        """ページ周辺(余白)の背景色をテーマに合わせる。"""
-        self.viewport().setStyleSheet(f"background: {color};")
+    def apply_theme(self, dark: bool) -> None:
+        """ページ周辺の背景・落ち影・紙の色をテーマに合わせる。"""
+        self._dark = dark
+        self.viewport().setStyleSheet(f"background: {theme.canvas_color(dark)};")
+        self._container.apply_theme(dark)
+        for label in self._labels:
+            label.apply_theme(dark)
 
     # --- 注釈ツール -----------------------------------------------------
     def set_tool(self, tool: str) -> None:
@@ -2104,9 +2175,30 @@ class PageView(QScrollArea):
                 label.setPixmap(pixmap)
                 self._rendered.add(i)
             elif not visible and i in self._rendered:
-                # 画面外はメモリ解放（プレースホルダに戻す）
+                # 画面外はラベルの参照を外す（実体は描画キャッシュが持つ）
                 label.clear()
                 self._rendered.discard(i)
+        self._prefetch_timer.start()
+
+    #: 先読みするページ数（前後それぞれ）
+    PREFETCH = 2
+
+    def _prefetch_around(self) -> None:
+        """表示中の前後のページを、描画キャッシュに載せておく。
+
+        スクロールが止まってから動くので、操作の邪魔はしない。描くだけで
+        ラベルには渡さない（画面に出るときはキャッシュから即座に返る）。
+        """
+        if not self._doc or not self._doc.is_open or not self._rendered:
+            return
+        lo, hi = min(self._rendered), max(self._rendered)
+        targets = [i for i in range(lo - self.PREFETCH, hi + self.PREFETCH + 1)
+                   if 0 <= i < self._doc.page_count and i not in self._rendered]
+        for i in targets:
+            try:
+                self._doc.render_page(i, zoom=self._zoom)
+            except Exception:  # noqa: BLE001  先読みは失敗しても無視
+                return
 
     def _update_current_page(self) -> None:
         """ビューポート中央にあるページを現在ページとして扱う。"""

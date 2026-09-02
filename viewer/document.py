@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections import OrderedDict
 
 import fitz  # PyMuPDF
 from PySide6.QtGui import QImage, QPixmap
@@ -79,10 +80,22 @@ class PdfDocument:
     # PdfDocument.annot_author = "..." で全ドキュメントに効かせる。
     annot_author: str = ""
 
+    # ページ描画キャッシュの上限（バイト）。A4 を等倍表示で 20 ページ強。
+    RENDER_CACHE_BYTES: int = 128 * 1024 * 1024
+
     def __init__(self) -> None:
         self._doc: fitz.Document | None = None
         self.path: str | None = None
-        self.modified: bool = False
+        self._modified: bool = False
+        # 表示内容の版。中身が変わるたびに増え、描画キャッシュの鍵に使う。
+        self._epoch: int = 0
+        # ページ描画のキャッシュ（LRU）。スクロールで画面外に出たページを
+        # 戻ったときに描き直さずに済ませる。合計バイト数で上限を決める。
+        self._render_cache: "OrderedDict[tuple, QPixmap]" = OrderedDict()
+        self._render_bytes: int = 0
+        # フォーム欄の一覧。ズームのたびに overlay を作り直すので、
+        # 中身が変わらない限り widgets() の再走査を避ける。
+        self._fields_cache: dict[int, list] = {}
         self._authenticated: bool = True
         self._doc_scripts_cache: dict[str, str] | None = None
         # 文字選択用のレイアウト。ドラッグ中はマウスを動かすたびに参照される
@@ -92,6 +105,38 @@ class PdfDocument:
         # 注釈の Undo/Redo（ページ単位のスナップショット）
         self._undo: list = []   # [(page_index, [desc,...]), ...] 変更前の状態
         self._redo: list = []
+
+    # --- 変更フラグと表示キャッシュ -------------------------------------
+    # 「中身が変わった＝描いてあるものも変わった」ので、modified を立てる箇所
+    # すべてでキャッシュを捨てられるよう、代入をプロパティで受ける。
+    @property
+    def modified(self) -> bool:
+        return self._modified
+
+    @modified.setter
+    def modified(self, value: bool) -> None:
+        if value:
+            self._invalidate_view_caches()
+        self._modified = bool(value)
+
+    def _invalidate_view_caches(self) -> None:
+        """描画・フォーム欄のキャッシュを捨てて版を進める。"""
+        self._epoch += 1
+        self._render_cache.clear()
+        self._render_bytes = 0
+        self._fields_cache.clear()
+
+    def _cache_render(self, key: tuple, pixmap: "QPixmap") -> None:
+        """描画結果を LRU に入れ、上限を超えた分を古い順に捨てる。"""
+        size = pixmap.width() * pixmap.height() * max(1, pixmap.depth()) // 8
+        if size > self.RENDER_CACHE_BYTES:
+            return  # 1 枚で上限を超える巨大ページはキャッシュしない
+        self._render_cache[key] = pixmap
+        self._render_bytes += size
+        while self._render_bytes > self.RENDER_CACHE_BYTES and self._render_cache:
+            _k, old = self._render_cache.popitem(last=False)
+            self._render_bytes -= (old.width() * old.height()
+                                   * max(1, old.depth()) // 8)
 
     def _finish_annot(self, annot) -> None:
         """注釈の仕上げ。作成者名を入れてから外観を確定する。
@@ -114,6 +159,7 @@ class PdfDocument:
         with open(path, "rb") as f:
             data = f.read()
         self._doc = fitz.open(stream=data, filetype="pdf")
+        self._invalidate_view_caches()  # 別の中身に差し替えた
         self.path = path
         self.modified = False
         self._authenticated = not self._doc.needs_pass
@@ -167,6 +213,7 @@ class PdfDocument:
             self.path = None
             self.modified = False
             self._doc_scripts_cache = None
+            self._invalidate_view_caches()  # 前のファイルの絵を残さない
 
     @property
     def is_open(self) -> bool:
@@ -190,14 +237,26 @@ class PdfDocument:
 
     # --- レンダリング ---------------------------------------------------
     def render_page(self, index: int, zoom: float = 1.0) -> QPixmap:
-        """指定ページを zoom 倍で描画して QPixmap を返す。"""
+        """指定ページを zoom 倍で描画して QPixmap を返す。
+
+        同じページを同じ倍率で描く要求はキャッシュから返す（スクロールで
+        往復したときや、開いた直後にレイアウトが数回決め直されるときに効く）。
+        中身が変わればキャッシュは丸ごと捨てられるので、古い絵は出ない。
+        """
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        key = (index, round(zoom, 4))
+        cached = self._render_cache.get(key)
+        if cached is not None:
+            self._render_cache.move_to_end(key)
+            return cached
         page = self._doc.load_page(index)
         matrix = fitz.Matrix(zoom, zoom)
         # alpha=False で不透明背景にする（白紙が透過にならない）
         pix = page.get_pixmap(matrix=matrix, alpha=False)
-        return self._pixmap_from_fitz(pix)
+        pixmap = self._pixmap_from_fitz(pix)
+        self._cache_render(key, pixmap)
+        return pixmap
 
     def page_svg(self, index: int, text_as_path: bool = True) -> str:
         """ページを SVG（ベクター）で書き出す。
@@ -685,9 +744,18 @@ class PdfDocument:
         }.get(field_type, "text")
 
     def page_fields(self, index: int) -> list:
-        """指定ページのフォーム欄一覧。各要素は dict（rect は fitz.Rect）。"""
+        """指定ページのフォーム欄一覧。各要素は dict（rect は fitz.Rect）。
+
+        ズームのたびに入力欄の overlay を作り直すため、同じ内容に対しては
+        widgets() の再走査を避けてキャッシュを返す（欄が数百あるフォームでは
+        1 回 0.1 秒以上かかる）。中身が変われば modified 経由で捨てられる。
+        戻り値は共有される想定なので、呼び出し側は書き換えないこと。
+        """
         if not self._doc:
             return []
+        cached = self._fields_cache.get(index)
+        if cached is not None:
+            return cached
         COMB = 1 << 24       # 1文字ずつマス目に入れる欄
         MULTILINE = 1 << 12  # 複数行欄
         page = self._doc.load_page(index)
@@ -721,6 +789,7 @@ class PdfDocument:
                 # かどうかの判定に使う（_PRINT 欄など画面非表示の欄を除外）。
                 "display": int(getattr(w, "field_display", 0) or 0),
             })
+        self._fields_cache[index] = out
         return out
 
     def set_field_value(self, index: int, xref: int, value) -> bool:
@@ -1462,6 +1531,7 @@ class PdfDocument:
         # 元ドキュメントを差し替える
         self._doc.close()
         self._doc = new
+        self._invalidate_view_caches()  # 別の中身に差し替えた
         self.modified = True
         return corrected
 
@@ -1577,6 +1647,7 @@ class PdfDocument:
             with open(out_path, "rb") as f:
                 data = f.read()
             self._doc = fitz.open(stream=data, filetype="pdf")
+            self._invalidate_view_caches()  # 別の中身に差し替えた
         else:
             self._doc.save(out_path, garbage=4, deflate=True)
         self.path = out_path
@@ -1945,6 +2016,7 @@ class PdfDocument:
             with open(out_path, "rb") as f:
                 data = f.read()
             self._doc = fitz.open(stream=data, filetype="pdf")
+            self._invalidate_view_caches()  # 別の中身に差し替えた
             self.path = out_path
             self.modified = False
         else:
@@ -2129,6 +2201,7 @@ class PdfDocument:
                 with open(out_path, "rb") as f:
                     data = f.read()
                 self._doc = fitz.open(stream=data, filetype="pdf")
+                self._invalidate_view_caches()  # 別の中身に差し替えた
                 self.path = out_path
                 self.modified = False
             else:

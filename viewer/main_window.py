@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-import shutil
+import sys
 
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import (
@@ -118,7 +118,9 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
 
         self.welcome = WelcomeWidget()
         self.welcome.open_requested.connect(self.open_file)
+        self.welcome.file_requested.connect(self.open_path)
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("docTabs")  # テーマ側のスタイル対象
         self.tabs.setDocumentMode(True)
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
@@ -730,7 +732,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         from PySide6.QtGui import QIntValidator
         from PySide6.QtWidgets import QToolButton
 
-        from .ribbon import RIBBON_QSS, Ribbon
+        from .ribbon import Ribbon
 
         # リボン用の短縮ラベル（長い action 名は iconText で短く表示。見切れ防止）
         short = {
@@ -887,7 +889,6 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
 
         # リボンを最上部に据え、従来のメニューバー/ツールバーは隠す
         self.setMenuWidget(r)
-        r.setStyleSheet(RIBBON_QSS)
         # 太さ・線種・始点/終点・不透明・ズーム等のコントロールは、元々ツールバーへ
         # addWidget で置いてからリボンへ移設している。addWidget が内部で作る
         # QWidgetAction はウィジェットを「所有」し続けるため、この後 tb.hide() すると
@@ -1297,7 +1298,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         org.properties_requested.connect(lambda: self.act_metadata.trigger())
         org.security_requested.connect(lambda: self.act_protect.trigger())
         dark = self.act_dark.isChecked()
-        pv.set_canvas_color(theme.canvas_color(dark))
+        pv.apply_theme(dark)
         org.apply_theme(dark)
         return tab
 
@@ -1367,14 +1368,20 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         self._add_recent(path)
         # 入力欄付き（フォーム）PDF は Adobe と同様、開いた時点で入力可能にする
         if doc.is_form():
-            tab.page_view.set_form_mode(True)
             self.act_form.blockSignals(True)
             self.act_form.setChecked(True)
             self.act_form.blockSignals(False)
             self.statusBar().showMessage(
                 "入力欄のある PDF です。欄をクリックしてそのまま入力できます"
                 "（リボン「ページ > フォーム入力」でオフ）", 6000)
-            self._check_unsupported_govform(doc)
+            # 入力欄の overlay 生成（数百個）と未対応補助の走査は、合わせて
+            # 1 秒近くかかることがある。開いた直後にページが出ないと固まった
+            # ように見えるので、1 回描画してから続きをやる。
+            def _finish_form_setup(d=doc, t=tab):
+                if t.doc is d and d.is_open:
+                    t.page_view.set_form_mode(True)
+                    self._check_unsupported_govform(d)
+            QTimer.singleShot(0, _finish_form_setup)
 
     def activate_and_open(self, path: str) -> None:
         """別インスタンスから渡されたパスを開き、ウィンドウを前面化する。"""
@@ -2209,6 +2216,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         if not path or not os.path.exists(path):
             return
         try:
+            import shutil
+
             shutil.copy2(path, path + ".bak")
         except OSError as exc:
             self.statusBar().showMessage(
@@ -2299,6 +2308,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
     def _rebuild_recent_menu(self) -> None:
         self.recent_menu.clear()
         recent = self.settings.value("recent", [], list) or []
+        self.welcome.set_recent(recent)  # ウェルカム画面のカードも同じ内容に
         for p in recent:
             act = self.recent_menu.addAction(os.path.basename(p))
             act.setData(p)
@@ -2313,7 +2323,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         if dark:
             self.act_dark.setChecked(True)  # toggled シグナルでテーマ適用
         # キャンバス背景色を現在テーマに合わせる（ライト起動時も適用）
-        self.page_view.set_canvas_color(theme.canvas_color(dark))
+        self.page_view.apply_theme(dark)
+        self._apply_title_bar_theme(dark)
         if self.settings.value("compact", False, bool):
             self.act_compact.setChecked(True)  # toggled で適用
         # ツールバーの表示/非表示（折りたたみ）を復元
@@ -2391,16 +2402,39 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
 
 
     # --- テーマ --------------------------------------------------------
+    def _apply_title_bar_theme(self, dark: bool) -> None:
+        """Windows のタイトルバーもテーマに合わせる。
+
+        これをやらないと、ダークにしても上端だけ白いままで浮いて見える。
+        DWMWA_USE_IMMERSIVE_DARK_MODE は Windows 10 20H1 以降が 20、
+        1809〜1903 が 19 なので、通った方を採用する。
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            hwnd = int(self.winId())
+            value = ctypes.c_int(1 if dark else 0)
+            for attr in (20, 19):
+                ok = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value))
+                if ok == 0:
+                    break
+        except Exception:  # noqa: BLE001  古い Windows では単に効かないだけ
+            pass
+
     def _toggle_dark(self, on: bool) -> None:
         theme.apply_theme(QApplication.instance(), on)
-        canvas = theme.canvas_color(on)
         # 全タブ＋予備ビューに反映
-        self._spare_view.set_canvas_color(canvas)
+        self._spare_view.apply_theme(on)
         for i in range(self.tabs.count()):
             t = self.tabs.widget(i)
             if isinstance(t, DocTab):
-                t.page_view.set_canvas_color(canvas)
+                t.page_view.apply_theme(on)
                 t.organizer.apply_theme(on)
+        self.welcome.apply_theme(on)
+        self._apply_title_bar_theme(on)  # Windows のタイトルバーも合わせる
         self._assign_icons()  # 記号アイコンの色をテーマに追従させる
 
     # --- ページ番号 ----------------------------------------------------

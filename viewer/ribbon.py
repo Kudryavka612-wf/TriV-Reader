@@ -9,6 +9,9 @@ Office / Foxit などで一般的な「リボン」レイアウトを、この�
 - big ボタン: 幅はラベルに合わせて自動（文字は見切れない）。主要機能のみに使う。
 - 長い action 名は action.setIconText("短い名前") でリボン用の短縮表示にできる。
 - 折りたたみ: 右上の ▴ ボタン / タブのダブルクリック。折りたたみ中はタブバーのみ。
+
+見た目（配色・角丸・タブの下線など）は theme.py の #ribbon セレクタで当てる。
+ここで setStyleSheet すると、テーマ切替のときに取り残されるため置かない。
 """
 from __future__ import annotations
 
@@ -236,22 +239,3 @@ class Ribbon(QTabWidget):
 
     def end_page(self, page: QWidget) -> None:
         page._ribbon_row.addStretch(1)  # type: ignore[attr-defined]
-
-
-RIBBON_QSS = """
-#ribbon { background: palette(window); }
-#ribbon > QTabBar::tab { padding: 4px 16px; }
-#ribbonGroupTitle { color: palette(mid); font-size: 11px; }
-#ribbonSep { color: rgba(0,0,0,0.10); margin: 4px 2px; }
-#ribbon QToolButton { padding: 2px 6px; border-radius: 4px; }
-#ribbon QToolButton:hover { background: rgba(37,99,235,0.12); }
-#ribbon QToolButton:checked { background: rgba(37,99,235,0.20); }
-#ribbon QScrollArea { background: transparent; }
-#ribbon QScrollArea > QWidget > QWidget { background: transparent; }
-/* 幅不足時のみ出る横スクロールバー。グループの高さを圧迫しないよう薄くする */
-#ribbon QScrollBar:horizontal { height: 8px; background: transparent; }
-#ribbon QScrollBar::handle:horizontal {
-    background: rgba(120,120,120,0.45); border-radius: 4px; min-width: 24px; }
-#ribbon QScrollBar::add-line:horizontal, #ribbon QScrollBar::sub-line:horizontal {
-    width: 0px; }
-"""
