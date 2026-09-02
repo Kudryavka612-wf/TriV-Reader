@@ -6,9 +6,9 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QPainter, QPixmap
-from PySide6.QtPrintSupport import QPrinterInfo
+from PySide6.QtCore import QRectF, QSizeF, Qt
+from PySide6.QtGui import QPageLayout, QPageSize, QPainter, QPen, QPixmap
+from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
@@ -53,13 +53,36 @@ class PrintDialog(QDialog):
         default = QPrinterInfo.defaultPrinter()
         names = [p.printerName() for p in QPrinterInfo.availablePrinters()]
         self.printer_combo.addItems(names)
-        if default and default.printerName() in names:
+        # 前回使ったプリンターを憶えておく（毎回選び直さなくて済むように）
+        last = settings.value("print/printer", "", str) if settings else ""
+        if last in names:
+            self.printer_combo.setCurrentText(last)
+        elif default and default.printerName() in names:
             self.printer_combo.setCurrentText(default.printerName())
         form.addRow("プリンター:", self.printer_combo)
         self.copies = QSpinBox()
         self.copies.setRange(1, 999)
         self.copies.setValue(1)
         form.addRow("部数:", self.copies)
+
+        # 用紙。既定はプリンター任せ。「PDF のページサイズに合わせる」は
+        # B5 の届出書やはがきなど、用紙が A4 でないものをそのまま出すため。
+        self.paper_combo = QComboBox()
+        form.addRow("用紙:", self.paper_combo)
+
+        # 両面。対応していないプリンターでは選べないようにする。
+        self.duplex_combo = QComboBox()
+        self.duplex_combo.addItem("片面", "none")
+        self.duplex_combo.addItem("両面（長辺とじ）", "long")
+        self.duplex_combo.addItem("両面（短辺とじ）", "short")
+        form.addRow("両面:", self.duplex_combo)
+
+        self.collate_check = QCheckBox("部ごとにまとめて印刷（1部ずつ）")
+        self.collate_check.setChecked(True)
+        self.collate_check.setToolTip(
+            "2 部以上刷るとき、1・2・3／1・2・3 の順に出します。"
+            "外すと 1・1／2・2／3・3 の順（同じページをまとめて刷る）です。")
+        form.addRow("", self.collate_check)
         left.addLayout(form)
 
         # 印刷するページ
@@ -186,7 +209,94 @@ class PrintDialog(QDialog):
         self.size_combo.currentIndexChanged.connect(
             lambda i: self.scale_spin.setEnabled(i == SIZE_CUSTOM))
         self.scale_spin.setEnabled(self.size_combo.currentIndex() == SIZE_CUSTOM)
+        self.printer_combo.currentTextChanged.connect(self._on_printer_changed)
+        self.paper_combo.currentIndexChanged.connect(self._refresh)
+
+        self._printer_name = None
+        self._sync_printer_caps()
+        if settings:
+            idx = self.duplex_combo.findData(settings.value("print/duplex", "none", str))
+            self.duplex_combo.setCurrentIndex(max(0, idx))
+            self.collate_check.setChecked(
+                settings.value("print/collate", True, bool))
         self._refresh()
+
+    def _on_printer_changed(self, _name: str) -> None:
+        self._sync_printer_caps()
+        self._refresh()
+
+    # --- プリンターの能力 -------------------------------------------------
+    def _printer(self) -> QPrinter:
+        """選択中のプリンターの QPrinter（用紙と余白を実際の値で得るため）。"""
+        name = self.printer_combo.currentText()
+        if getattr(self, "_printer_name", None) != name:
+            info = QPrinterInfo.printerInfo(name)
+            self._printer_obj = (
+                QPrinter(info, QPrinter.PrinterMode.HighResolution)
+                if not info.isNull()
+                else QPrinter(QPrinter.PrinterMode.HighResolution))
+            self._printer_name = name
+        return self._printer_obj
+
+    def _sync_printer_caps(self) -> None:
+        """選んだプリンターに合わせて、用紙の一覧と両面の可否を作り直す。"""
+        info = QPrinterInfo.printerInfo(self.printer_combo.currentText())
+        prev = self.paper_combo.currentData()
+        self.paper_combo.blockSignals(True)
+        self.paper_combo.clear()
+        self.paper_combo.addItem("プリンターの既定", None)
+        self.paper_combo.addItem("PDF のページサイズに合わせる", "auto")
+        seen = set()
+        for size in ([] if info.isNull() else info.supportedPageSizes()):
+            if size.name() in seen:
+                continue
+            seen.add(size.name())
+            self.paper_combo.addItem(size.name(), size)
+        saved = (self._settings.value("print/paper", "", str)
+                 if self._settings else "")
+        target = prev if prev is not None else (saved or None)
+        idx = -1
+        if isinstance(target, QPageSize):
+            idx = self.paper_combo.findText(target.name())
+        elif target == "auto" or saved == "auto":
+            idx = self.paper_combo.findData("auto")
+        elif saved:
+            idx = self.paper_combo.findText(saved)
+        self.paper_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.paper_combo.blockSignals(False)
+
+        modes = [] if info.isNull() else info.supportedDuplexModes()
+        can_duplex = any(m != QPrinter.DuplexMode.DuplexNone for m in modes)
+        self.duplex_combo.setEnabled(can_duplex)
+        if not can_duplex:
+            self.duplex_combo.setCurrentIndex(0)
+            self.duplex_combo.setToolTip("このプリンターは両面印刷に対応していません")
+        else:
+            self.duplex_combo.setToolTip("")
+
+    def _paper_rects(self, nat_w: float, nat_h: float):
+        """(用紙, 印刷可能領域) をポイントで返す。
+
+        用紙は「プリンターの既定 / PDF に合わせる / 指定」で決まる。プレビューを
+        A4 決め打ちにすると、B5 やはがきを選んだときに実際の刷り上がりと
+        食い違うので、必ずプリンター側の値を使う。
+        """
+        pr = self._printer()
+        choice = self.paper_combo.currentData()
+        try:
+            if isinstance(choice, QPageSize):
+                pr.setPageSize(choice)
+            elif choice == "auto":
+                pr.setPageSize(QPageSize(QSizeF(nat_w, nat_h), QPageSize.Unit.Point,
+                                         "PDF", QPageSize.SizeMatchPolicy.ExactMatch))
+            pr.setPageOrientation(
+                QPageLayout.Orientation.Landscape
+                if self.rb_landscape.isChecked()
+                else QPageLayout.Orientation.Portrait)
+        except Exception:  # noqa: BLE001  用紙を変えられないプリンターもある
+            pass
+        return (pr.paperRect(QPrinter.Unit.Point),
+                pr.pageRect(QPrinter.Unit.Point))
 
     # --- 公開: 選択内容 --------------------------------------------------
     def options(self) -> dict:
@@ -212,6 +322,9 @@ class PrintDialog(QDialog):
             "orientation": ori,
             "grayscale": self.gray_check.isChecked(),
             "quality": self.quality_combo.currentData(),
+            "paper": self.paper_combo.currentData(),
+            "duplex": self.duplex_combo.currentData() if self.duplex_combo.isEnabled() else "none",
+            "collate": self.collate_check.isChecked(),
         }
 
     def _on_accept(self) -> None:
@@ -219,6 +332,13 @@ class PrintDialog(QDialog):
         self._settings.setValue("print/size_mode", self.size_combo.currentIndex())
         self._settings.setValue("print/custom_scale", self.scale_spin.value())
         self._settings.setValue("print/quality", self.quality_combo.currentData())
+        self._settings.setValue("print/printer", self.printer_combo.currentText())
+        paper = self.paper_combo.currentData()
+        self._settings.setValue(
+            "print/paper",
+            "auto" if paper == "auto" else (paper.name() if paper else ""))
+        self._settings.setValue("print/duplex", self.duplex_combo.currentData())
+        self._settings.setValue("print/collate", self.collate_check.isChecked())
         self.accept()
 
     # --- プレビュー -------------------------------------------------------
@@ -267,22 +387,30 @@ class PrintDialog(QDialog):
             pix = self._preview_pixmap(i, 0.5)
         except Exception:  # noqa: BLE001
             return
-        # 用紙（A4想定のアスペクト。実寸比較はポイント換算で行う）
-        paper_w_pt, paper_h_pt = 595.0, 842.0
-        if self._paper_is_landscape(nat_w, nat_h):
-            paper_w_pt, paper_h_pt = paper_h_pt, paper_w_pt
+        # 用紙と印刷可能領域は、選んでいるプリンターの実際の値を使う
+        # （A4 決め打ちだと、B5 やはがきを選んだときに刷り上がりと食い違う）。
+        paper, printable = self._paper_rects(nat_w, nat_h)
+        paper_w_pt = max(1.0, paper.width())
+        paper_h_pt = max(1.0, paper.height())
         # プレビュー画布
         pw = self.PREVIEW_W
-        ph = int(pw * paper_h_pt / paper_w_pt)
+        ph = max(1, int(pw * paper_h_pt / paper_w_pt))
         canvas = QPixmap(pw, ph)
         canvas.fill(Qt.GlobalColor.white)
         p = QPainter(canvas)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         px_per_pt = pw / paper_w_pt
+        # 余白（ここから外は印刷されない）を点線で示す
+        margin_rect = QRectF(printable.x() * px_per_pt, printable.y() * px_per_pt,
+                             printable.width() * px_per_pt,
+                             printable.height() * px_per_pt)
         rotate = (self.rb_auto.isChecked()
                   and (nat_w > nat_h) != (paper_w_pt > paper_h_pt))
         eff_w, eff_h = (nat_h, nat_w) if rotate else (nat_w, nat_h)
-        fit = min(paper_w_pt / eff_w, paper_h_pt / eff_h)
+        # 拡大率は印刷可能領域に対して決める（実際の印刷と同じ計算にする）
+        avail_w = max(1.0, printable.width())
+        avail_h = max(1.0, printable.height())
+        fit = min(avail_w / eff_w, avail_h / eff_h)
         mode = self.size_combo.currentIndex()
         if mode == SIZE_ACTUAL:
             s = 1.0
@@ -294,13 +422,12 @@ class PrintDialog(QDialog):
             s = self.scale_spin.value() / 100.0
         tw = eff_w * s * px_per_pt
         th = eff_h * s * px_per_pt
-        x = (pw - tw) / 2
-        y = (ph - th) / 2
+        x = margin_rect.x() + (margin_rect.width() - tw) / 2
+        y = margin_rect.y() + (margin_rect.height() - th) / 2
         img = pix.toImage()
         if self.gray_check.isChecked():
             img = img.convertToFormat(img.Format.Format_Grayscale8)
         draw = QPixmap.fromImage(img)
-        from PySide6.QtCore import QRectF
         if rotate:
             p.save()
             p.translate(x + tw / 2, y + th / 2)
@@ -311,5 +438,10 @@ class PrintDialog(QDialog):
         else:
             p.drawPixmap(QRectF(x, y, tw, th), draw,
                          QRectF(0, 0, draw.width(), draw.height()))
+        pen = QPen(Qt.GlobalColor.gray)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(margin_rect.adjusted(0, 0, -1, -1))
         p.end()
         self.preview.setPixmap(canvas)

@@ -33,12 +33,7 @@ class PrintMixin:
         info = QPrinterInfo.printerInfo(opt["printer"])
         printer = (QPrinter(info, QPrinter.PrinterMode.HighResolution)
                    if not info.isNull() else QPrinter(QPrinter.PrinterMode.HighResolution))
-        printer.setCopyCount(opt["copies"])
-        if opt["grayscale"]:
-            printer.setColorMode(QPrinter.ColorMode.GrayScale)
-        if opt["orientation"] == "landscape":
-            from PySide6.QtGui import QPageLayout
-            printer.setPageOrientation(QPageLayout.Orientation.Landscape)
+        self._configure_printer(printer, opt)
 
         # 対象ページ
         total = self.doc.page_count
@@ -58,6 +53,30 @@ class PrintMixin:
 
         self._render_to_printer(printer, pages, opt)
 
+    def _configure_printer(self, printer, opt: dict) -> None:
+        """ダイアログの選択内容をプリンターに反映する（部数・両面・用紙・向き）。"""
+        from PySide6.QtGui import QPageLayout, QPageSize
+
+        printer.setCopyCount(opt.get("copies", 1))
+        # 2 部以上のとき、1 部ずつ揃えて出すか、同じページをまとめて出すか
+        printer.setCollateCopies(bool(opt.get("collate", True)))
+        printer.setDuplex({
+            "long": QPrinter.DuplexMode.DuplexLongSide,
+            "short": QPrinter.DuplexMode.DuplexShortSide,
+        }.get(opt.get("duplex", "none"), QPrinter.DuplexMode.DuplexNone))
+        if opt.get("grayscale"):
+            printer.setColorMode(QPrinter.ColorMode.GrayScale)
+        # 用紙。"auto"（PDF のページサイズに合わせる）はページごとに指定する。
+        paper = opt.get("paper")
+        if isinstance(paper, QPageSize):
+            printer.setPageSize(paper)
+        # 向きは必ず指定する。指定しないとプリンター側の既定（横のまま等）が
+        # 残り、「縦」を選んだのに横で出ることがある。
+        printer.setPageOrientation(
+            QPageLayout.Orientation.Landscape
+            if opt.get("orientation") == "landscape"
+            else QPageLayout.Orientation.Portrait)
+
     def _render_to_printer(self, printer, pages: list[int], opt: dict) -> None:
         """選んだページをプリンタへ描画する（ダイアログから切り離してある）。"""
         from PySide6.QtCore import QRectF
@@ -76,6 +95,9 @@ class PrintMixin:
         custom_scale = opt["custom_scale"]
         auto_rotate = opt["orientation"] == "auto"
 
+        auto_paper = opt.get("paper") == "auto"
+        if auto_paper and pages:
+            self._set_paper_from_page(printer, pages[0])
         painter = QPainter(printer)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)  # 印刷可能領域(px)
@@ -90,7 +112,11 @@ class PrintMixin:
                     self.statusBar().showMessage("印刷をキャンセルしました", 3000)
                     return
                 if n > 0:
+                    # 用紙をページごとに変える場合、newPage の前に指定する
+                    if auto_paper:
+                        self._set_paper_from_page(printer, i)
                     printer.newPage()
+                    page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
                 # ページの実寸(pt) → 紙面ピクセル数（1pt = 1/72inch）
                 w_pt, h_pt = self.doc.page_pixel_size(i, 1.0)
                 nat_w = w_pt / 72.0 * res
@@ -140,6 +166,21 @@ class PrintMixin:
             if painter.isActive():
                 painter.end()
         self.statusBar().showMessage("印刷ジョブを送信しました", 3000)
+
+    def _set_paper_from_page(self, printer, index: int) -> None:
+        """そのページの実寸を用紙サイズにする（B5 の届出書やはがき向け）。"""
+        from PySide6.QtCore import QSizeF
+        from PySide6.QtGui import QPageSize
+
+        w_pt, h_pt = self.doc.page_pixel_size(index, 1.0)
+        if w_pt <= 0 or h_pt <= 0:
+            return
+        try:
+            printer.setPageSize(QPageSize(
+                QSizeF(w_pt, h_pt), QPageSize.Unit.Point, "PDF",
+                QPageSize.SizeMatchPolicy.ExactMatch))
+        except Exception:  # noqa: BLE001  受け付けないプリンターは既定のまま
+            pass
 
     def _draw_page_vector(self, painter, index: int, x: float, y: float,
                           w: float, h: float, rotate: bool) -> bool:

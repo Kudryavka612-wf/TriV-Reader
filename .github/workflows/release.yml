@@ -52,6 +52,7 @@ jobs:
           python settings_test.py
           python zoom_test.py
           python print_test.py
+          python print_paper_test.py
           python text_select_test.py
           python gesture_test.py
           python compress_test.py
