@@ -34,7 +34,7 @@ python build_exe.py            # フォルダ形式（推奨・起動が速い�
 - 初回起動はウイルス対策/SmartScreen のスキャンで遅くなります。2回目以降は
   OS のファイルキャッシュで速くなります。
 
-## 1.2 軽量版（OCR・傾き補正なし）
+## 1.2 軽量版（OCR・傾き補正・圧縮なし）
 
 ```powershell
 python build_exe.py --lite             # 軽量版
@@ -42,11 +42,12 @@ python build_exe.py --lite             # 軽量版
 ```
 
 - 出力: `%USERPROFILE%\TriVReader_Lite_dist\dist\TriVReader_Lite\TriVReader_Lite.exe`
-- OCR（文字認識）と傾き補正(deskew)の機能を**非表示**にし、それらが使う
-  **numpy / Pillow を同梱しません**。
+- OCR（文字認識）・傾き補正(deskew)・圧縮（画像の再圧縮）の機能を**非表示**にし、
+  それらが使う **numpy / Pillow を同梱しません**。
+  無劣化の「最適化して保存」は Pillow 不要なので軽量版でも使えます。
 - サイズ: 約 **172MB**（通常版 約 211MB → 約 40MB 減）。タイトルは「TriV-Reader (Lite)」。
 - exe 隣の `lite.ini` で軽量モードを判定します（消すと通常UIに戻りますが、
-  numpy/Pillow が無いため OCR以外の傾き補正は動きません）。
+  numpy/Pillow が無いため傾き補正と圧縮は動きません）。
 
 > 補足: OCR エンジン（Tesseract）は PyMuPDF 内部に同梱されているため、
 > 「OCR を切る」だけではサイズはほぼ変わりません。軽量化の実体は

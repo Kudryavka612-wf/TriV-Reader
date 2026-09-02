@@ -310,7 +310,9 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         # メニュー専用アクション（ツールバーには出さない）
         self.act_add_bookmark = QAction("現在ページをしおりに追加", self)
         self.act_edit_toc = QAction("目次を編集…", self)
-        self.act_compress = QAction("最適化して保存…", self)
+        self.act_compress_img = QAction("圧縮（ファイルサイズを小さく）…", self)
+        self.act_compress_img.setIconText("圧縮")  # リボン用の短縮ラベル
+        self.act_compress = QAction("最適化して保存（無劣化）…", self)
         self.act_export_pdfa = QAction("PDF/A で書き出し…", self)
         self.act_protect = QAction("パスワードで保護して保存…", self)
         self.act_unlock = QAction("パスワードを解除して保存…", self)
@@ -566,6 +568,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         m_file.addAction(self.act_open_acrobat)
         m_file.addAction(self.act_set_default_pdf)
         m_file.addSeparator()
+        m_file.addAction(self.act_compress_img)
         m_file.addAction(self.act_compress)
         m_file.addAction(self.act_export_pdfa)
         m_file.addSeparator()
@@ -857,7 +860,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         p = r.add_page("保護")
         g = r.add_group(p, "セキュリティ")
         g.add_stack([self.act_protect, self.act_unlock])
-        g = r.add_group(p, "最適化")
+        g = r.add_group(p, "圧縮・最適化")
+        g.add_action(self.act_compress_img, big=True)
         g.add_stack([self.act_compress, self.act_export_pdfa])
         r.end_page(p)
 
@@ -914,11 +918,13 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         self.page_view.setFocus()
 
     def _apply_lite_mode(self) -> None:
-        """ライト版では OCR・傾き補正（numpy/Pillow 依存）の機能を隠す。"""
+        """ライト版では OCR・傾き補正・圧縮（numpy/Pillow 依存）の機能を隠す。"""
         self.is_lite = storage.is_lite()
         if self.is_lite:
             self.act_ocr.setVisible(False)
             self.act_deskew.setVisible(False)
+            # 画像の再圧縮は Pillow 必須。無劣化の「最適化」は残る。
+            self.act_compress_img.setVisible(False)
             self.setWindowTitle("TriV-Reader (Lite)")
 
     def _polish_actions(self) -> None:
@@ -950,6 +956,9 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             self.act_apply_redact: "登録した墨消しを適用して内容を完全削除",
             self.act_ocr: "画像/スキャンPDFを文字認識して検索可能にする",
             self.act_deskew: "スキャンの傾きを自動補正",
+            self.act_compress_img: "画像を縮小・再圧縮してファイルサイズを小さくする"
+                                   "（文字や図形はそのまま）",
+            self.act_compress: "画像はそのままに、不要な構造を削って軽くする（無劣化）",
         }
         for act, tip in tips.items():
             seq = act.shortcut()
@@ -1018,7 +1027,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             self.act_export_text: "📄", self.act_export_html: "🌐",
             self.act_metadata: "🏷", self.act_batch: "📚", self.act_diff: "🔀",
             self.act_protect: "🔒", self.act_unlock: "🔓",
-            self.act_compress: "🗜", self.act_export_pdfa: "🅰",
+            self.act_compress_img: "🗜", self.act_compress: "📦",
+            self.act_export_pdfa: "🅰",
             self.act_dark: "🌙", self.act_add_bookmark: "🔖",
             self.act_find: "🔍",
             self.act_edit_toc: "📇", self.act_check_update: "🔄",
@@ -1153,6 +1163,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         # しおり / 最適化 / PDF-A
         self.act_add_bookmark.triggered.connect(self._add_bookmark)
         self.act_edit_toc.triggered.connect(self._edit_toc)
+        self.act_compress_img.triggered.connect(self.compress_document)
         self.act_compress.triggered.connect(self.compress_save)
         self.act_export_pdfa.triggered.connect(self.export_pdfa)
         self.toc_dock.page_requested.connect(self._goto)
@@ -2759,6 +2770,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             self.act_clear_annots,
             self.act_add_bookmark,
             self.act_edit_toc,
+            self.act_compress_img,
             self.act_compress,
             self.act_export_pdfa,
             self.act_page_numbers,

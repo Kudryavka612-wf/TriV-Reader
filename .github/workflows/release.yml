@@ -54,6 +54,8 @@ jobs:
           python print_test.py
           python text_select_test.py
           python gesture_test.py
+          python compress_test.py
+          python compress_gui_test.py
 
       - name: ビルド（exe 化）
         run: python build_exe.py

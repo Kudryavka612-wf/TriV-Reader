@@ -1,6 +1,6 @@
 """変換・書き出しまわり（MainWindow から切り出した Mixin）。
 
-画像化 / 画像から PDF / OCR / 傾き補正 / テキスト書き出し / 最適化 /
+画像化 / 画像から PDF / OCR / 傾き補正 / テキスト書き出し / 圧縮 / 最適化 /
 PDF-A 化 / 一括処理 / 2 ファイルの比較。
 """
 from __future__ import annotations
@@ -93,10 +93,11 @@ class ConvertMixin:
         )
         if not paths:
             return
-        op, ok = QInputDialog.getItem(
-            self, "バッチ処理", "操作:",
-            ["最適化(圧縮)", "各ページ画像化(PNG 150dpi)", "OCR(日本語+英語)"], 0, False
-        )
+        ops = ["圧縮(画像を150dpiに縮小)", "最適化(無劣化)",
+               "各ページ画像化(PNG 150dpi)", "OCR(日本語+英語)"]
+        if getattr(self, "is_lite", False):
+            ops.pop(0)  # ライト版は Pillow 非同梱で画像を再圧縮できない
+        op, ok = QInputDialog.getItem(self, "バッチ処理", "操作:", ops, 0, False)
         if not ok:
             return
         out_dir = QFileDialog.getExistingDirectory(self, "出力先フォルダ")
@@ -128,7 +129,11 @@ class ConvertMixin:
                     d.close()
                     errors.append(f"{stem}: パスワード保護のためスキップ")
                     continue
-                if op.startswith("最適化"):
+                if op.startswith("圧縮"):
+                    d.compress_to_advanced(
+                        os.path.join(out_dir, f"{stem}_compressed.pdf"),
+                        max_dpi=150, jpeg_quality=72)
+                elif op.startswith("最適化"):
                     d.compress_to(os.path.join(out_dir, f"{stem}_optimized.pdf"))
                 elif op.startswith("各ページ"):
                     d.export_page_images(list(range(d.page_count)), out_dir,
@@ -189,7 +194,78 @@ class ConvertMixin:
         lay.addWidget(box)
         dlg.exec()
 
-    # --- 最適化 / PDF-A ------------------------------------------------
+    # --- 圧縮 / 最適化 / PDF-A ------------------------------------------
+    def compress_document(self) -> None:
+        """画像を再圧縮して軽くする（プリセット選択 → 保存先 → 実行）。
+
+        compress_save（無劣化の整理だけ）と違い、埋め込み画像を指定解像度まで
+        縮小して再エンコードするため、スキャン PDF が実際に小さくなる。
+        """
+        if not self.doc.is_open:
+            return
+        from PySide6.QtWidgets import QDialog
+
+        from .compress_dialog import CompressDialog, human_size
+
+        dlg = CompressDialog(self.doc, self.settings, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        dlg.save_settings()
+        opts = dlg.options()
+
+        src = self.doc.path if self.doc.path and os.path.exists(self.doc.path) else ""
+        before = os.path.getsize(src) if src else 0
+        base = os.path.splitext(self.doc.path or "document")[0]
+        out, _ = QFileDialog.getSaveFileName(
+            self, "圧縮して保存", base + "_compressed.pdf", "PDF ファイル (*.pdf)"
+        )
+        if not out:
+            return
+
+        prog = QProgressDialog("圧縮中…", "キャンセル", 0, 100, self)
+        prog.setWindowTitle("圧縮")
+        prog.setMinimumDuration(0)
+
+        def progress(done, total):
+            prog.setMaximum(max(1, total))
+            prog.setValue(done)
+            QApplication.processEvents()
+            return not prog.wasCanceled()
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            stats = self.doc.compress_to_advanced(out, progress=progress, **opts)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"圧縮できませんでした:\n{exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            prog.close()
+
+        if stats.get("canceled"):
+            self.statusBar().showMessage("圧縮をキャンセルしました", 3000)
+            return
+
+        # 開いているファイル自身に上書きした場合は中身が入れ替わっている
+        if src and os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(out)):
+            self._reload(self.page_view.index)
+            self.thumbnails.load(self.doc)
+            self._update_title()
+
+        after = os.path.getsize(out)
+        msg = (f"圧縮して保存しました:\n{out}\n\n"
+               f"{human_size(before) if before else '?'} → {human_size(after)}")
+        if before:
+            msg += f"（元の {round(100 * after / before)}%）"
+        if stats.get("recompressed"):
+            msg += f"\n画像 {stats['recompressed']} 点を再圧縮しました。"
+        elif stats.get("images"):
+            msg += "\n画像はすでに十分小さかったため、再圧縮していません。"
+        if before and after >= before:
+            msg += ("\n\nこの PDF は画像がほとんど無いか、すでに圧縮済みのようです。"
+                    "元のファイルをそのまま使うのがおすすめです。")
+        QMessageBox.information(self, "圧縮 完了", msg)
+
     def compress_save(self) -> None:
         if not self.doc.is_open:
             return

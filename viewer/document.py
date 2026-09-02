@@ -1931,8 +1931,11 @@ class PdfDocument:
         """
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        # use_objstms: オブジェクトを圧縮ストリームにまとめる（PDF 1.5 以降の
+        # 標準機能）。これを付けないと、元がオブジェクトストリーム形式だった
+        # PDF は書き直しでかえって太る。
         kwargs = dict(garbage=4, deflate=True, deflate_images=True,
-                      deflate_fonts=True, clean=True)
+                      deflate_fonts=True, clean=True, use_objstms=1)
         if self.path and _same_path(self.path, out_path):
             tmp = out_path + ".tmp_save"
             self._doc.save(tmp, **kwargs)
@@ -1946,6 +1949,194 @@ class PdfDocument:
             self.modified = False
         else:
             self._doc.save(out_path, **kwargs)
+
+    # --- 画像を再圧縮する「圧縮」 -------------------------------------
+    #: 圧縮プリセット（キー → (表示名, 画像の最大DPI, JPEG品質, 説明)）
+    COMPRESS_PRESETS = {
+        "high": ("高画質（印刷向け）", 200, 85,
+                 "印刷しても粗さが分かりにくい。縮小率は控えめ。"),
+        "standard": ("標準（画面表示向け）", 150, 72,
+                     "画面で見る/メールで送る用途の既定。バランス重視。"),
+        "small": ("最小サイズ（メール添付向け）", 96, 45,
+                  "とにかく軽く。拡大すると画像の粗さが目立つ。"),
+        "lossless": ("無劣化（構造の整理のみ）", 0, 0,
+                     "画像はそのまま。不要オブジェクトの削除と圧縮だけ行う。"),
+    }
+
+    @staticmethod
+    def _recompress_image_bytes(
+        data: bytes, ext: str, disp_pt: float,
+        max_dpi: int, quality: int, grayscale: bool, orig_bytes: int = 0,
+    ) -> bytes | None:
+        """埋め込み画像 1 枚を縮小＋再エンコードする。縮まないなら None。
+
+        disp_pt はページ上での表示幅（ポイント）。ピクセル幅と突き合わせて実効
+        解像度を求め、max_dpi を超える分だけダウンサンプルする（元から低解像度
+        の画像を無駄に作り直さない）。JPEG と PNG の両方を試して小さい方を採る
+        ため、線画やスクリーンショットが JPEG 化で逆に太ることがない。
+
+        orig_bytes は PDF に格納されている実際のストリーム長。data（取り出した
+        画像ファイル）とは容器が違って数 % ずれるので、得か損かの判定はこちらで
+        行う（そうしないと縮んだつもりでファイルが太る）。
+        """
+        import io
+
+        from PIL import Image
+
+        try:
+            im = Image.open(io.BytesIO(data))
+            im.load()
+        except Exception:  # noqa: BLE001  JPEG2000 等 Pillow が開けない形式
+            return None
+        # 透明度つきは JPEG で失われ、PNG 化しても得が少ないので触らない
+        if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info:
+            return None
+        if grayscale:
+            im = im.convert("L")
+        elif im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+
+        if max_dpi > 0 and disp_pt > 0:
+            eff_dpi = im.width / (disp_pt / 72.0)
+            if eff_dpi > max_dpi:
+                f = max_dpi / eff_dpi
+                im = im.resize(
+                    (max(1, round(im.width * f)), max(1, round(im.height * f))),
+                    Image.Resampling.LANCZOS,
+                )
+
+        cands: list[bytes] = []
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=max(1, quality), optimize=True)
+        cands.append(buf.getvalue())
+        # 元が可逆形式で色数が少ない画像（線画・図表・スクリーンショット）は
+        # PNG のままの方がずっと小さい。写真やスキャンは色数で弾いて JPEG だけ
+        # 試す（PNG 化は遅いうえ、そもそも数倍に膨らむ）。
+        if ext not in ("jpeg", "jpg", "jpx") and im.getcolors(maxcolors=4096):
+            buf = io.BytesIO()
+            im.save(buf, format="PNG", optimize=True)
+            cands.append(buf.getvalue())
+        best = min(cands, key=len)
+        # 5% も縮まないなら劣化させる意味がないので元を残す
+        return best if len(best) < (orig_bytes or len(data)) * 0.95 else None
+
+    @staticmethod
+    def _image_targets(doc: "fitz.Document") -> list[tuple[int, int, float]]:
+        """(xref, 代表ページ番号, ページ上の最大表示幅pt) の一覧を返す。
+
+        同じ画像が複数ページで使い回されている場合、xref は 1 つなので 1 回だけ
+        処理する（replace_image は全ページに反映される）。表示幅は最も大きく
+        置かれている箇所を採り、そこに合わせて解像度を決める。
+        """
+        found: dict[int, tuple[int, float]] = {}
+        for pno in range(doc.page_count):
+            page = doc.load_page(pno)
+            for info in page.get_images(full=True):
+                xref = info[0]
+                try:
+                    width = max((r.width for r in page.get_image_rects(xref)),
+                                default=0.0)
+                except Exception:  # noqa: BLE001  壊れた配置情報は無視
+                    width = 0.0
+                prev = found.get(xref)
+                if prev is None or width > prev[1]:
+                    found[xref] = (pno, width)
+        return [(x, p, w) for x, (p, w) in found.items()]
+
+    def compress_to_advanced(
+        self,
+        out_path: str,
+        *,
+        max_dpi: int = 150,
+        jpeg_quality: int = 72,
+        grayscale: bool = False,
+        min_bytes: int = 8 * 1024,
+        progress=None,
+    ) -> dict:
+        """埋め込み画像を縮小・再圧縮して out_path に保存する。
+
+        テキストやベクター図形はそのまま残す（ページを画像化しない）ので、
+        文字の検索・コピーや注釈は保たれる。max_dpi=0 なら画像には触らず
+        compress_to と同じ無劣化の整理だけを行う。
+
+        progress(done, total) が False を返したら中断し、何も保存せずに
+        {"canceled": True} を含む結果を返す。
+        戻り値: images/recompressed/skipped/canceled を持つ dict。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+
+        stats = {"images": 0, "recompressed": 0, "skipped": 0, "canceled": False}
+        # 開いている文書自体は劣化させたくないので作業用コピーで処理する
+        work = fitz.open("pdf", self._doc.tobytes(garbage=3, deflate=True))
+        try:
+            if max_dpi > 0 or grayscale:
+                try:
+                    from PIL import Image  # noqa: F401  同梱確認だけ
+                except ImportError as exc:  # ライト版は Pillow を含まない
+                    raise RuntimeError(
+                        "この構成では画像の再圧縮を行えません（軽量版）。"
+                        "「最適化して保存（無劣化）」をお使いください。") from exc
+                targets = self._image_targets(work)
+                stats["images"] = len(targets)
+                for n, (xref, pno, disp_pt) in enumerate(targets):
+                    if progress and not progress(n, len(targets)):
+                        stats["canceled"] = True
+                        return stats
+                    try:
+                        info = work.extract_image(xref)
+                    except Exception:  # noqa: BLE001
+                        stats["skipped"] += 1
+                        continue
+                    data = info.get("image") or b""
+                    try:  # PDF に入っている実際のストリーム長（圧縮後）
+                        orig_bytes = len(work.xref_stream_raw(xref))
+                    except Exception:  # noqa: BLE001
+                        orig_bytes = len(data)
+                    # 小さすぎる画像・白黒2値（CCITT/JBIG2）・透明マスク付きは対象外。
+                    # 2値はもともと極小で、JPEG 化するとむしろ太る。
+                    if (orig_bytes < min_bytes or info.get("bpc") == 1
+                            or info.get("smask")):
+                        stats["skipped"] += 1
+                        continue
+                    new = self._recompress_image_bytes(
+                        data, (info.get("ext") or "").lower(), disp_pt,
+                        max_dpi, jpeg_quality, grayscale, orig_bytes,
+                    )
+                    if not new:
+                        stats["skipped"] += 1
+                        continue
+                    try:
+                        work.load_page(pno).replace_image(xref, stream=new)
+                    except Exception:  # noqa: BLE001  差し替え不可な画像は諦める
+                        stats["skipped"] += 1
+                        continue
+                    stats["recompressed"] += 1
+                if progress:
+                    progress(len(targets), len(targets))
+
+            kwargs = dict(garbage=4, deflate=True, deflate_images=True,
+                          deflate_fonts=True, clean=True, use_objstms=1)
+            if self.path and _same_path(self.path, out_path):
+                # 自分自身への上書き。保存後もファイルをロックしないよう、
+                # compress_to と同じく stream で開き直す。
+                tmp = out_path + ".tmp_save"
+                work.save(tmp, **kwargs)
+                work.close()
+                work = None
+                self._doc.close()
+                os.replace(tmp, out_path)
+                with open(out_path, "rb") as f:
+                    data = f.read()
+                self._doc = fitz.open(stream=data, filetype="pdf")
+                self.path = out_path
+                self.modified = False
+            else:
+                work.save(out_path, **kwargs)
+        finally:
+            if work is not None:
+                work.close()
+        return stats
 
     # --- PDF/A-2b 化（pikepdf で OutputIntent + XMP 付与） -------------
     SRGB_ICC = r"C:\Windows\System32\spool\drivers\color\sRGB Color Space Profile.icm"
