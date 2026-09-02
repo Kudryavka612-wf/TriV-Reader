@@ -58,6 +58,7 @@ jobs:
           python compress_gui_test.py
           python render_cache_test.py
           python theme_test.py
+          python robust_test.py
 
       - name: ビルド（exe 化）
         run: python build_exe.py

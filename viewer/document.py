@@ -19,6 +19,33 @@ def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
+def friendly_error(exc: Exception, saving: bool = False) -> str:
+    """PyMuPDF/OS の英語の例外を、利用者に伝わる日本語にする。
+
+    そのまま出すと "Failed to open stream" や "code=2: cannot open file" と
+    いった、原因も対処も読み取れない文字列が画面に出てしまう。
+    """
+    name = type(exc).__name__
+    text = str(exc)
+    if isinstance(exc, FileNotFoundError) or "No such file" in text:
+        return ("保存先のフォルダが見つかりません。" if saving
+                else "ファイルが見つかりません。移動または削除された可能性があります。")
+    if isinstance(exc, PermissionError) or "denied" in text or "Access is denied" in text:
+        return ("保存できませんでした。ほかのアプリ（Acrobat など）でこのファイルを"
+                "開いていないか、書き込み権限があるかを確認してください。")
+    if getattr(exc, "errno", None) == 28 or "No space" in text:
+        return "保存先の空き容量が足りません。"
+    if name == "EmptyFileError" or "empty" in text.lower():
+        return "ファイルの中身が空です（0 バイト）。"
+    if name in ("FileDataError", "FzErrorFormat") or "Failed to open stream" in text:
+        return ("PDF として読み込めませんでした。ファイルが壊れているか、"
+                "PDF ではない可能性があります。")
+    if name == "FzErrorSystem":
+        return ("保存できませんでした。保存先のフォルダが無いか、書き込みできません。"
+                if saving else "ファイルを開けませんでした。")
+    return text
+
+
 # 直線・矢印の線端スタイル（キー名 → PyMuPDF の PDF_ANNOT_LE_* 定数）。
 # UI側（main_window.py）はこのキー名でコンボボックスの選択肢を組み立てる。
 LINE_END_STYLES = {
@@ -138,6 +165,32 @@ class PdfDocument:
             self._render_bytes -= (old.width() * old.height()
                                    * max(1, old.depth()) // 8)
 
+    def _save_over_self(self, out_path: str, **kwargs) -> None:
+        """開いているファイル自身へ上書きする（安全な順序で置き換える）。
+
+        先に自分を閉じてから os.replace すると、他アプリがファイルを掴んで
+        いた場合（Acrobat で開いている・OneDrive が同期中・ウイルス対策が
+        走っている、いずれも Windows では珍しくない）に置き換えが失敗し、
+        閉じたきりの文書だけが残って未保存の編集ごと巻き添えになる。
+        置き換えが成功してから開き直す。
+        """
+        tmp = out_path + ".tmp_save"
+        self._doc.save(tmp, **kwargs)
+        try:
+            os.replace(tmp, out_path)
+        except OSError:
+            try:
+                os.remove(tmp)      # 中途半端な一時ファイルを残さない
+            except OSError:
+                pass
+            raise
+        # 置き換え後もファイルをロックしないよう、stream で開き直す
+        with open(out_path, "rb") as f:
+            data = f.read()
+        self._doc.close()
+        self._doc = fitz.open(stream=data, filetype="pdf")
+        self._invalidate_view_caches()
+
     def _finish_annot(self, annot) -> None:
         """注釈の仕上げ。作成者名を入れてから外観を確定する。
 
@@ -156,9 +209,12 @@ class PdfDocument:
         self.close()
         # ファイルをメモリに読み込んでから開く（ディスク上のファイルをロックしない）。
         # これにより、開いたままでもエクスプローラでのリネーム/移動が可能になる。
-        with open(path, "rb") as f:
-            data = f.read()
-        self._doc = fitz.open(stream=data, filetype="pdf")
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            self._doc = fitz.open(stream=data, filetype="pdf")
+        except Exception as exc:  # noqa: BLE001  英語の内部エラーを出さない
+            raise RuntimeError(friendly_error(exc)) from exc
         self._invalidate_view_caches()  # 別の中身に差し替えた
         self.path = path
         self.modified = False
@@ -1637,19 +1693,13 @@ class PdfDocument:
         """
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
-        opening_self = self.path and _same_path(self.path, out_path)
-        if opening_self:
-            tmp = out_path + ".tmp_save"
-            self._doc.save(tmp, garbage=4, deflate=True)
-            self._doc.close()
-            os.replace(tmp, out_path)
-            # 置き換え後もロックしないよう stream で開き直す
-            with open(out_path, "rb") as f:
-                data = f.read()
-            self._doc = fitz.open(stream=data, filetype="pdf")
-            self._invalidate_view_caches()  # 別の中身に差し替えた
-        else:
-            self._doc.save(out_path, garbage=4, deflate=True)
+        try:
+            if self.path and _same_path(self.path, out_path):
+                self._save_over_self(out_path, garbage=4, deflate=True)
+            else:
+                self._doc.save(out_path, garbage=4, deflate=True)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(friendly_error(exc, saving=True)) from exc
         self.path = out_path
         self.modified = False
 
@@ -2007,20 +2057,15 @@ class PdfDocument:
         # PDF は書き直しでかえって太る。
         kwargs = dict(garbage=4, deflate=True, deflate_images=True,
                       deflate_fonts=True, clean=True, use_objstms=1)
-        if self.path and _same_path(self.path, out_path):
-            tmp = out_path + ".tmp_save"
-            self._doc.save(tmp, **kwargs)
-            self._doc.close()
-            os.replace(tmp, out_path)
-            # 置き換え後もロックしないよう stream で開き直す（save_as と同じ）
-            with open(out_path, "rb") as f:
-                data = f.read()
-            self._doc = fitz.open(stream=data, filetype="pdf")
-            self._invalidate_view_caches()  # 別の中身に差し替えた
-            self.path = out_path
-            self.modified = False
-        else:
-            self._doc.save(out_path, **kwargs)
+        try:
+            if self.path and _same_path(self.path, out_path):
+                self._save_over_self(out_path, **kwargs)
+                self.path = out_path
+                self.modified = False
+            else:
+                self._doc.save(out_path, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(friendly_error(exc, saving=True)) from exc
 
     # --- 画像を再圧縮する「圧縮」 -------------------------------------
     #: 圧縮プリセット（キー → (表示名, 画像の最大DPI, JPEG品質, 説明)）
@@ -2189,23 +2234,33 @@ class PdfDocument:
 
             kwargs = dict(garbage=4, deflate=True, deflate_images=True,
                           deflate_fonts=True, clean=True, use_objstms=1)
-            if self.path and _same_path(self.path, out_path):
-                # 自分自身への上書き。保存後もファイルをロックしないよう、
-                # compress_to と同じく stream で開き直す。
-                tmp = out_path + ".tmp_save"
-                work.save(tmp, **kwargs)
-                work.close()
-                work = None
-                self._doc.close()
-                os.replace(tmp, out_path)
-                with open(out_path, "rb") as f:
-                    data = f.read()
-                self._doc = fitz.open(stream=data, filetype="pdf")
-                self._invalidate_view_caches()  # 別の中身に差し替えた
-                self.path = out_path
-                self.modified = False
-            else:
-                work.save(out_path, **kwargs)
+            try:
+                if self.path and _same_path(self.path, out_path):
+                    # 自分自身への上書き。置き換えが成功してから開き直す
+                    # （失敗しても、開いている文書は無事なままにする）。
+                    tmp = out_path + ".tmp_save"
+                    work.save(tmp, **kwargs)
+                    work.close()
+                    work = None
+                    try:
+                        os.replace(tmp, out_path)
+                    except OSError:
+                        try:
+                            os.remove(tmp)
+                        except OSError:
+                            pass
+                        raise
+                    with open(out_path, "rb") as f:
+                        data = f.read()
+                    self._doc.close()
+                    self._doc = fitz.open(stream=data, filetype="pdf")
+                    self._invalidate_view_caches()  # 別の中身に差し替えた
+                    self.path = out_path
+                    self.modified = False
+                else:
+                    work.save(out_path, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(friendly_error(exc, saving=True)) from exc
         finally:
             if work is not None:
                 work.close()

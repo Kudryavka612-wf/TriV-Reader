@@ -2392,11 +2392,14 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:  # noqa: N802
-        for u in event.mimeData().urls():
-            p = u.toLocalFile()
-            if p.lower().endswith(".pdf"):
-                self.open_path(p)
-                break
+        # 複数まとめて落とされたら全部タブで開く（1 つ目だけ開いて残りを
+        # 黙って捨てると、落とし直しになって手間が増える）。
+        paths = [u.toLocalFile() for u in event.mimeData().urls()]
+        pdfs = [p for p in paths if p.lower().endswith(".pdf")]
+        for p in pdfs:
+            self.open_path(p)
+        if paths and not pdfs:
+            self.statusBar().showMessage("PDF ファイルだけ開けます", 4000)
 
 
 
