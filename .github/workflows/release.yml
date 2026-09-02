@@ -66,11 +66,31 @@ jobs:
       - name: ビルド（exe 化）
         run: python build_exe.py
 
+      - name: リリースノートを用意（注釈付きタグの本文を使う）
+        # 日本語が化けないよう、git の出力を PowerShell に通さず bash で
+        # そのままファイルへ書く（Windows ランナーのコンソールは UTF-8 では
+        # ないので、パイプを通すと壊れる）。
+        shell: bash
+        run: |
+          tag="$GITHUB_REF_NAME"
+          # checkout が浅い取得のときでもタグ本体を読めるようにする
+          git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}" || true
+          if [ "$(git cat-file -t "$tag" 2>/dev/null)" = "tag" ]; then
+            # 注釈付きタグ: メッセージ全文をそのままリリースノートにする
+            git tag -l --format='%(contents)' "$tag" > release_notes.txt
+          else
+            # 軽量タグ: %(contents) はコミットメッセージに化けるので使わない
+            echo "$tag" > release_notes.txt
+          fi
+          [ -s release_notes.txt ] || echo "$tag" > release_notes.txt
+          echo "--- release notes ---"
+          cat release_notes.txt
+
       - name: zip / update.json 生成
         run: >
           python make_release.py
           --base-url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
-          --notes "${{ github.ref_name }}"
+          --notes-file release_notes.txt
 
       - name: Inno Setup 導入（インストーラ生成用）
         run: choco install innosetup -y --no-progress
@@ -90,4 +110,4 @@ jobs:
           gh release create "${{ github.ref_name }}" "$zip" "$setup" "$json" `
             --repo "${{ github.repository }}" `
             --title "${{ github.ref_name }}" `
-            --notes "Release ${{ github.ref_name }}"
+            --notes-file release_notes.txt

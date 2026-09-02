@@ -5,7 +5,8 @@
 update.json の "url" に、update.json の公開URLをアプリの「更新元URL」に設定する。
 
 使い方:
-    python make_release.py [onedirフォルダ] [--base-url https://.../download] [--notes "説明"]
+    python make_release.py [onedirフォルダ] [--base-url https://.../download]
+                          [--notes "説明" | --notes-file notes.txt]
     省略時は %USERPROFILE%\\TriVReader_dist\\dist\\TriVReader を対象にする。
 """
 from __future__ import annotations
@@ -41,6 +42,12 @@ def main() -> int:
             base_url = args[i + 1].rstrip("/"); i += 2
         elif args[i] == "--notes" and i + 1 < len(args):
             notes = args[i + 1]; i += 2
+        elif args[i] == "--notes-file" and i + 1 < len(args):
+            # 複数行のリリースノートはファイル渡しにする。コマンドラインに
+            # 改行入りの文字列を通すと、シェルの引用でいくらでも壊れるため。
+            with open(args[i + 1], encoding="utf-8") as f:
+                notes = f.read().strip()
+            i += 2
         else:
             folder = args[i]; i += 1
 

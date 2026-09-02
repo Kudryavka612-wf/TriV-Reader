@@ -78,3 +78,17 @@ python main.py
 ## 自動リリース（GitHub Actions）
 `viewer/version.py` の `APP_VERSION` を上げてコミットし、`vX.Y.Z` タグを push すると
 クラウドで自動ビルドされ、GitHub Releases に公開されます（`.github/workflows/release.yml`）。
+
+タグは**注釈付き**（`-m` 付き）にしてください。そのメッセージがそのまま
+リリースノートになり、`update.json` にも入ります＝アプリの「更新を確認」で
+利用者に見える文面になります。
+
+```powershell
+git tag -a v1.6.0 -m "v1.6.0
+・○○を追加
+・△△の不具合を修正"
+git push origin v1.6.0
+```
+
+`-m` の無い軽量タグで push した場合はタグ名だけが出ます（コミットメッセージが
+そのまま出ることはありません）。

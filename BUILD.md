@@ -129,6 +129,12 @@ python release.py --notes "更新内容"
 → ビルド → zip/update.json生成 → タグ作成 → GitHubへアップロードまで自動。
 Webでのドラッグ＆ドロップは不要です。
 
+### リリースノート
+GitHub Actions で公開する場合、**注釈付きタグのメッセージがそのまま
+リリースノートになり、`update.json` の `notes` にも入ります**。ここは
+アプリの「更新を確認」で利用者に見える文面なので、変更点を書いてください。
+`-m` の無い軽量タグではタグ名だけになります。
+
 ### 手動で出すとき（GitHub Releases）
 1. `viewer/version.py` の `APP_VERSION` を上げる（例 1.0.0 → 1.1.0）。
 2. ビルド: `python build_exe.py`（必要なら `--portable` 等）。

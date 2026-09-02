@@ -9,6 +9,7 @@ dist/
 *.spec
 
 # 一時/生成物
+release_notes.txt   # CI がタグのメッセージから作る（手元で試したとき用）
 *.bak
 _sample.pdf
 _*.pdf
