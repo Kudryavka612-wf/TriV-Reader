@@ -331,6 +331,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         self.act_deskew = QAction("傾き補正（スキャン）", self)
         self.act_check_update = QAction("更新を確認…", self)
         self.act_about = QAction("バージョン情報", self)
+        self.act_open_log = QAction("エラーログを開く…", self)
+        self.act_open_log.setIconText("ログ")
         self.act_set_update_url = QAction("更新元URLを設定…", self)
         self.act_report_govform = QAction("未対応フォーム機能を報告用に保存…", self)
         self.act_report_govform.setEnabled(False)
@@ -505,13 +507,13 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         # 注釈の元に戻す / やり直し
         self.act_undo = QAction("元に戻す", self)
         self.act_undo.setShortcut(QKeySequence.StandardKey.Undo)   # Ctrl+Z
-        self.act_undo.setToolTip("注釈操作を元に戻す (Ctrl+Z)")
+        self.act_undo.setToolTip("元に戻す（Ctrl+Z）")
         tb.addAction(self.act_undo)
         self.act_redo = QAction("やり直し", self)
         # Ctrl+Y と Ctrl+Shift+Z の両方で効くようにする
         self.act_redo.setShortcuts([QKeySequence.StandardKey.Redo,
                                     QKeySequence("Ctrl+Y")])
-        self.act_redo.setToolTip("注釈操作をやり直す (Ctrl+Y)")
+        self.act_redo.setToolTip("やり直し（Ctrl+Y）")
         tb.addAction(self.act_redo)
 
     def _build_search_toolbar(self) -> None:
@@ -668,6 +670,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         m_help.addSeparator()
         m_help.addAction(self.act_report_govform)
         m_help.addAction(self.act_telemetry_toggle)
+        m_help.addAction(self.act_open_log)
         m_help.addSeparator()
         m_help.addAction(self.act_about)
 
@@ -884,7 +887,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         g = r.add_group(p, "ヘルプ")
         g.add_stack([self.act_settings, self.act_check_update,
                      self.act_set_update_url, self.act_report_govform,
-                     self.act_about])
+                     self.act_open_log, self.act_about])
         r.end_page(p)
 
         # リボンを最上部に据え、従来のメニューバー/ツールバーは隠す
@@ -1035,6 +1038,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             self.act_edit_toc: "📇", self.act_check_update: "🔄",
             self.act_settings: "⚙",
             self.act_set_update_url: "⚙", self.act_about: "ℹ",
+            self.act_open_log: "🧾",
             self.act_report_govform: "📮",
             self.act_toggle_pagedock: "▤",
             self.act_fill_enabled: "🪣", self.act_fill_color: "🎨",
@@ -1164,6 +1168,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         # しおり / 最適化 / PDF-A
         self.act_add_bookmark.triggered.connect(self._add_bookmark)
         self.act_edit_toc.triggered.connect(self._edit_toc)
+        self.act_open_log.triggered.connect(self._open_error_log)
         self.act_compress_img.triggered.connect(self.compress_document)
         self.act_compress.triggered.connect(self.compress_save)
         self.act_export_pdfa.triggered.connect(self.export_pdfa)
@@ -1365,6 +1370,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         # 初回表示直後はビューポートの幅がまだ確定していないことがあるので、
         # レイアウトが落ち着いた次のループでもう一度当て直す。
         QTimer.singleShot(0, lambda z=remembered_zoom: self._apply_default_zoom(z))
+        resume = self._remembered_page(path)
+        if resume:
+            # 倍率が決まってレイアウトが落ち着いてから移動する
+            QTimer.singleShot(0, lambda t=tab, n=resume: self._resume_to(t, n))
         self._add_recent(path)
         # 入力欄付き（フォーム）PDF は Adobe と同様、開いた時点で入力可能にする
         if doc.is_form():
@@ -1382,6 +1391,18 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
                     t.page_view.set_form_mode(True)
                     self._check_unsupported_govform(d)
             QTimer.singleShot(0, _finish_form_setup)
+
+    def _resume_to(self, tab, page: int) -> None:
+        """前回見ていたページへ移動する（閉じられていたら何もしない）。"""
+        if self.tabs.indexOf(tab) < 0 or not tab.doc.is_open:
+            return
+        target = min(page, tab.doc.page_count - 1)
+        if target > 0:
+            tab.page_view.set_page(target)
+            if tab is self._active_tab():
+                self.thumbnails.select_page(target)
+                self.statusBar().showMessage(
+                    f"前回見ていた {target + 1} ページ目から表示しています", 4000)
 
     def activate_and_open(self, path: str) -> None:
         """別インスタンスから渡されたパスを開き、ウィンドウを前面化する。"""
@@ -1462,6 +1483,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         if isinstance(prev, DocTab):
             try:
                 prev._saved_scroll = prev.page_view.scroll_value()
+                self._remember_page(prev)  # 落ちても続きから開けるよう都度記録
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1500,6 +1522,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         tab = self.tabs.widget(index)
         if not isinstance(tab, DocTab):
             return
+        self._remember_page(tab)   # 次に開いたとき同じページから出せるように
         if tab.doc.is_open and tab.doc.modified:
             self.tabs.setCurrentIndex(index)
             ret = QMessageBox.question(
@@ -1694,19 +1717,33 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             f"スタンプ「{text}」：ページ上のクリックした位置に配置します", 0)
 
     def _undo_annot(self) -> None:
-        if self.doc.is_open:
-            self.page_view.undo_annot()
-            self._update_undo_actions()
+        self._apply_undo(self.page_view.undo(), "元に戻しました")
 
     def _redo_annot(self) -> None:
-        if self.doc.is_open:
-            self.page_view.redo_annot()
-            self._update_undo_actions()
+        self._apply_undo(self.page_view.redo(), "やり直しました")
+
+    def _apply_undo(self, result, verb: str) -> None:
+        """Undo/Redo の後始末。ページ構成が変わった場合は全体を作り直す。"""
+        if result is None:
+            return
+        kind, index, label = result
+        if kind == "doc":
+            target = min(max(0, index or self.page_view.index),
+                         max(0, self.doc.page_count - 1))
+            self._reload(target)
+        self._refresh_annot_list()
+        self._update_undo_actions()
+        self._update_title()
+        self.statusBar().showMessage(f"{label}を{verb}", 3000)
 
     def _update_undo_actions(self) -> None:
         pv = self.page_view
-        self.act_undo.setEnabled(pv.can_undo_annot())
-        self.act_redo.setEnabled(pv.can_redo_annot())
+        # 次に何が戻るのかをボタンに出す（「元に戻す: ページの削除」）。
+        self.act_undo.setEnabled(pv.can_undo())
+        self.act_redo.setEnabled(pv.can_redo())
+        u, r = pv.undo_label(), pv.redo_label()
+        self.act_undo.setToolTip(f"元に戻す: {u}（Ctrl+Z）" if u else "元に戻す（Ctrl+Z）")
+        self.act_redo.setToolTip(f"やり直し: {r}（Ctrl+Y）" if r else "やり直し（Ctrl+Y）")
 
     def _on_annotation_changed(self, index: int) -> None:
         self._update_undo_actions()
@@ -1770,11 +1807,12 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         if not self.doc.is_open:
             return
         n = 0
-        for i in range(self.doc.page_count):
-            rect = self.doc.auto_crop_rect(i)
-            if rect:
-                self.doc.set_crop(i, rect)
-                n += 1
+        with self.doc.undo_group("余白のトリミング"):
+            for i in range(self.doc.page_count):
+                rect = self.doc.auto_crop_rect(i)
+                if rect:
+                    self.doc.set_crop(i, rect)
+                    n += 1
         self._reload(self.page_view.index)
         self.statusBar().showMessage(f"{n} ページの余白をトリミングしました", 3000)
 
@@ -2272,6 +2310,40 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         paths = [t.doc.path for i in range(self.tabs.count())
                  if isinstance(t := self.tabs.widget(i), DocTab) and t.doc.path]
         self.settings.setValue("session/open_files", paths)
+        for i in range(self.tabs.count()):
+            t = self.tabs.widget(i)
+            if isinstance(t, DocTab):
+                self._remember_page(t)
+
+    # --- 前回見ていたページ ---------------------------------------------
+    # ファイルごとに「最後に見ていたページ」を憶えて、次に開いたときそこから
+    # 出す。長い規程や申請書の束を毎日開き直す使い方だと、毎回1ページ目から
+    # 探し直すのは地味に手間なので。設定（前回見ていたページから開く）で切れる。
+    RESUME_MAX = 200   # 憶えておくファイル数
+
+    def _remember_page(self, tab) -> None:
+        path = tab.doc.path if tab.doc.is_open else None
+        if not path:
+            return
+        page = tab.page_view.index
+        key = os.path.normcase(os.path.abspath(path))
+        rows = [r for r in (self.settings.value("resume/pages", [], list) or [])
+                if isinstance(r, str) and not r.endswith("\t" + key)]
+        if page > 0:  # 1 ページ目は憶えなくてよい（既定と同じ）
+            rows.insert(0, f"{page}\t{key}")
+        self.settings.setValue("resume/pages", rows[:self.RESUME_MAX])
+
+    def _remembered_page(self, path: str) -> int:
+        if not prefs.value(self.settings, "startup/resume_page"):
+            return 0
+        key = os.path.normcase(os.path.abspath(path))
+        for row in (self.settings.value("resume/pages", [], list) or []):
+            if isinstance(row, str) and row.endswith("\t" + key):
+                try:
+                    return max(0, int(row.split("\t", 1)[0]))
+                except ValueError:
+                    return 0
+        return 0
 
     def restore_session(self) -> None:
         """設定が有効なら、前回開いていたファイルを開き直す。"""
@@ -2404,6 +2476,15 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
 
 
 
+    def _open_error_log(self) -> None:
+        """エラーログを既定のアプリで開く（不具合を報告してもらう用）。"""
+        from . import errorlog
+
+        if not errorlog.open_log():
+            self.statusBar().showMessage(
+                "エラーログはまだありません（記録されると "
+                f"{errorlog.log_path()} に作られます）", 6000)
+
     # --- テーマ --------------------------------------------------------
     def _apply_title_bar_theme(self, dark: bool) -> None:
         """Windows のタイトルバーもテーマに合わせる。
@@ -2521,6 +2602,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         self.thumbnails.select_page(self.page_view.index)
         self._update_status()
         self._update_title()
+        self._update_undo_actions()   # ページ操作も Ctrl+Z で戻せる
 
     def _delete_page(self, index: int) -> None:
         if not self.doc.is_open:
@@ -2545,8 +2627,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
     def _rotate_pages(self, indices: list, delta: int) -> None:
         if not self.doc.is_open or not indices:
             return
-        for i in indices:
-            self.doc.rotate_page(int(i), delta)
+        # まとめて回したときも Ctrl+Z 一回で元に戻せるようにする
+        with self.doc.undo_group("ページの回転"):
+            for i in indices:
+                self.doc.rotate_page(int(i), delta)
         self._reload(self.page_view.index)
 
     def _reorder(self, new_order: list) -> None:
@@ -2844,6 +2928,9 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             self.act_form.blockSignals(True)
             self.act_form.setChecked(False)
             self.act_form.blockSignals(False)
+        # 戻せるものが無いときは Ctrl+Z を灰色にする（押しても何も起きない
+        # ボタンを押せる状態にしておかない）
+        self._update_undo_actions()
 
     # --- 終了確認 -------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)

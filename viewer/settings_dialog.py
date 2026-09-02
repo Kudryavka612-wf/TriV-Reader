@@ -39,6 +39,7 @@ from . import ocr, storage
 DEFAULTS: dict[str, object] = {
     # --- 全般 ---
     "startup/restore_session": False,  # 前回開いていたファイルを開き直す
+    "startup/resume_page": True,       # 前回見ていたページから開く
     "tray/resident": True,             # 閉じてもトレイに常駐
     "confirm_close": True,             # ウィンドウを閉じるときに尋ねる
     "recent/limit": 8,                 # 最近使ったファイルの記憶件数
@@ -179,6 +180,9 @@ class SettingsDialog(QDialog):
         w = QWidget()
         form = QFormLayout(w)
         self.cb_restore = QCheckBox("前回開いていたファイルを開き直す")
+        self.cb_resume_page = QCheckBox("前回見ていたページから開く")
+        self.cb_resume_page.setToolTip(
+            "ファイルごとに最後に見ていたページを憶えて、次に開いたときそこから表示します")
         self.cb_tray = QCheckBox("ウィンドウを閉じてもトレイに常駐する（次回の起動が速い）")
         self.cb_confirm_close = QCheckBox("ウィンドウを閉じるときに確認する")
         self.cb_gesture = QCheckBox("マウスジェスチャーを使う")
@@ -192,6 +196,7 @@ class SettingsDialog(QDialog):
         self.sp_recent.setMaximumWidth(120)
 
         form.addRow("起動時", self.cb_restore)
+        form.addRow("", self.cb_resume_page)
         form.addRow("", self.cb_tray)
         form.addRow("", self.cb_confirm_close)
         form.addRow("マウス操作", self.cb_gesture)
@@ -337,6 +342,7 @@ class SettingsDialog(QDialog):
     def _load(self) -> None:
         s = self.settings
         self.cb_restore.setChecked(value(s, "startup/restore_session"))
+        self.cb_resume_page.setChecked(value(s, "startup/resume_page"))
         self.cb_tray.setChecked(value(s, "tray/resident"))
         self.cb_confirm_close.setChecked(value(s, "confirm_close"))
         self.cb_gesture.setChecked(value(s, "gesture/enabled"))
@@ -380,6 +386,7 @@ class SettingsDialog(QDialog):
     def _store(self) -> None:
         s = self.settings
         s.setValue("startup/restore_session", self.cb_restore.isChecked())
+        s.setValue("startup/resume_page", self.cb_resume_page.isChecked())
         s.setValue("tray/resident", self.cb_tray.isChecked())
         s.setValue("confirm_close", self.cb_confirm_close.isChecked())
         s.setValue("gesture/enabled", self.cb_gesture.isChecked())

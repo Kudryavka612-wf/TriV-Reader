@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import re
 from collections import OrderedDict
+from contextlib import contextmanager
 
 import fitz  # PyMuPDF
 from PySide6.QtGui import QImage, QPixmap
@@ -102,6 +103,9 @@ class PdfDocument:
     """PyMuPDF の Document を薄くラップしたクラス。"""
 
     _UNDO_MAX = 60
+    # ページ操作の Undo は文書まるごと控えるので、深さとメモリの両方で抑える。
+    _UNDO_DOC_MAX = 5
+    _UNDO_DOC_BYTES = 192 * 1024 * 1024
     _LAYOUT_CACHE_MAX = 8   # 文字レイアウトを憶えておくページ数
     # 注釈に記録する作成者名。設定ダイアログから
     # PdfDocument.annot_author = "..." で全ドキュメントに効かせる。
@@ -129,9 +133,17 @@ class PdfDocument:
         # ので、毎回 rawdict を解析すると重い。ページをまたぐ選択でも効くよう
         # 数ページ分を憶えておく。
         self._layout_cache: dict[int, tuple] = {}
-        # 注釈の Undo/Redo（ページ単位のスナップショット）
-        self._undo: list = []   # [(page_index, [desc,...]), ...] 変更前の状態
+        # Undo/Redo。注釈（ページ単位のスナップショット）とページ操作
+        # （文書まるごとのスナップショット）を 1 本の履歴にまとめて持つ。
+        # 種類を混ぜても、時系列に戻すぶんには前後の状態が食い違わない。
+        # 要素: (kind, index, payload, label)
+        #   kind "annot" → payload は注釈の記述リスト
+        #   kind "doc"   → payload は PDF のバイト列
+        self._undo: list = []
         self._redo: list = []
+        self._undo_bytes = 0    # doc スナップショットの合計サイズ
+        self._undo_group = 0    # >0 の間は 1 操作としてまとめる
+        self._group_pushed = False
 
     # --- 変更フラグと表示キャッシュ -------------------------------------
     # 「中身が変わった＝描いてあるものも変わった」ので、modified を立てる箇所
@@ -152,6 +164,7 @@ class PdfDocument:
         self._render_cache.clear()
         self._render_bytes = 0
         self._fields_cache.clear()
+        self._layout_cache.clear()
 
     def _cache_render(self, key: tuple, pixmap: "QPixmap") -> None:
         """描画結果を LRU に入れ、上限を超えた分を古い順に捨てる。"""
@@ -371,6 +384,7 @@ class PdfDocument:
         """
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        self._push_doc_undo("ページの回転", index)
         page = self._doc.load_page(index)
         new_angle = (page.rotation + delta) % 360
         page.set_rotation(new_angle)
@@ -580,6 +594,7 @@ class PdfDocument:
         """登録済みの墨消しを全ページに適用し、対象の文字/画像を完全削除する。"""
         if not self._doc:
             return 0
+        self._push_doc_undo("墨消しの適用", None)
         n = 0
         for i in range(self.page_count):
             page = self._doc.load_page(i)
@@ -605,6 +620,7 @@ class PdfDocument:
         """全ページの中央に半透明の透かし文字を斜めに重ねる。"""
         if not self._doc:
             return 0
+        self._push_doc_undo("透かしの追加", None)
         font = self._font_for(text)
         for i in range(self.page_count):
             page = self._doc.load_page(i)
@@ -627,6 +643,7 @@ class PdfDocument:
         """
         if not self._doc:
             return 0
+        self._push_doc_undo("ヘッダー/フッターの追加", None)
         import datetime
         today = datetime.date.today().isoformat()
         fname = os.path.basename(self.path) if self.path else ""
@@ -659,6 +676,7 @@ class PdfDocument:
         """at の位置に白紙ページを挿入。サイズ未指定は隣ページ or A4。"""
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        self._push_doc_undo("白紙ページの挿入", at)
         if width is None or height is None:
             ref = min(max(at - 1, 0), self.page_count - 1) if self.page_count else 0
             if self.page_count:
@@ -673,11 +691,13 @@ class PdfDocument:
         """index ページを複製して直後に挿入する（独立コピー）。"""
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        self._push_doc_undo("ページの複製", index)
         self._doc.fullcopy_page(index, index + 1)
         self.modified = True
 
     def set_crop(self, index: int, rect) -> None:
         """表示/出力範囲(CropBox)を設定する。rect は PDF 座標。"""
+        self._push_doc_undo("余白のトリミング", index)
         page = self._doc.load_page(index)
         page.set_cropbox(rect)
         self.modified = True
@@ -1393,54 +1413,163 @@ class PdfDocument:
         return [self._describe(a) for a in page.annots()]
 
     def _push_undo(self, index: int) -> None:
-        """注釈を変更する直前に、そのページの現状を Undo スタックへ積む。"""
+        """注釈を変更する直前に、そのページの現状を履歴へ積む。"""
         if not self._doc:
             return
         try:
-            self._undo.append((index, self._annot_snapshot(index)))
+            snap = self._annot_snapshot(index)
         except Exception:  # noqa: BLE001
             return
-        if len(self._undo) > self._UNDO_MAX:
-            self._undo.pop(0)
-        self._redo.clear()  # 新しい変更が入ったら Redo は無効化
+        self._append_history(("annot", index, snap, "注釈"))
 
     def _restore_snapshot(self, index: int, snap: list) -> None:
+        """そのページの注釈を snap の状態に戻す。"""
         page = self._doc.load_page(index)
         for a in list(page.annots()):
             page.delete_annot(a)
         for desc in snap:
             self._recreate(page, desc)
-        self.modified = True
+        self._modified = True   # setter だと履歴を巻き込むので直接立てる
+        self._invalidate_view_caches()
 
-    def undo_annot(self):
-        """直前の注釈変更を取り消す。対象ページ番号を返す（無ければ None）。"""
+    def _push_doc_undo(self, label: str, index: int | None = None) -> None:
+        """ページ構成を変える直前に、文書まるごとを履歴へ積む。
+
+        削除・並べ替え・回転などは注釈のような部分スナップショットでは戻せない
+        ので、その時点の PDF をバイト列で控える。大きな文書では効かないことが
+        あるが（下の上限）、黙って戻せない方がマシなので履歴自体を空にする。
+        undo_group で囲まれている間は、最初の 1 回だけ積む。
+        """
+        if not self._doc:
+            return
+        if self._undo_group > 0 and self._group_pushed:
+            return  # 同じ操作の 2 回目以降（1 回分にまとめる）
+        try:
+            data = self._doc.tobytes()
+        except Exception:  # noqa: BLE001
+            return
+        if len(data) > self._UNDO_DOC_BYTES:
+            # 1 手も入らない大きさ。中途半端に古い履歴だけ残さない。
+            self._clear_history()
+            return
+        if self._undo_group > 0:
+            self._group_pushed = True
+        self._append_history(("doc", index, data, label))
+
+    @contextmanager
+    def undo_group(self, label: str):
+        """複数ページにまたがる 1 操作を、Undo 1 回分にまとめる。"""
+        self._undo_group += 1
+        if self._undo_group == 1:
+            self._group_pushed = False
+        try:
+            yield
+        finally:
+            self._undo_group -= 1
+
+    def _append_history(self, entry: tuple) -> None:
+        self._undo.append(entry)
+        if entry[0] == "doc":
+            self._undo_bytes += len(entry[2])
+        self._redo.clear()      # 新しい変更が入ったら Redo は無効化
+        self._trim_history()
+
+    def _trim_history(self) -> None:
+        """古いものから捨てて、件数とメモリを上限内に収める。"""
+        while len(self._undo) > self._UNDO_MAX:
+            self._drop_oldest()
+        docs = [e for e in self._undo if e[0] == "doc"]
+        while (len(docs) > self._UNDO_DOC_MAX
+               or self._undo_bytes > self._UNDO_DOC_BYTES):
+            if not self._drop_oldest():
+                break
+            docs = [e for e in self._undo if e[0] == "doc"]
+
+    def _drop_oldest(self) -> bool:
+        if not self._undo:
+            return False
+        kind, _idx, payload, _label = self._undo.pop(0)
+        if kind == "doc":
+            self._undo_bytes -= len(payload)
+        return True
+
+    def _clear_history(self) -> None:
+        self._undo.clear()
+        self._redo.clear()
+        self._undo_bytes = 0
+
+    def _restore_doc_bytes(self, data: bytes) -> None:
+        self._doc.close()
+        self._doc = fitz.open(stream=data, filetype="pdf")
+        self._invalidate_view_caches()
+        self._modified = True   # setter を通すと履歴まで巻き込むので直接立てる
+
+    def _apply_entry(self, entry: tuple, opposite: list) -> tuple:
+        """entry の状態へ戻し、戻す前の状態を opposite に積む。"""
+        kind, index, payload, label = entry
+        if kind == "doc":
+            current = self._doc.tobytes()
+            self._restore_doc_bytes(payload)
+            opposite.append(("doc", index, current, label))
+        else:
+            current = self._annot_snapshot(index)
+            self._restore_snapshot(index, payload)
+            opposite.append(("annot", index, current, label))
+        return (kind, index, label)
+
+    def undo(self):
+        """直前の操作を取り消す。(kind, page_index, label) を返す（無ければ None）。"""
         if not self._undo or not self._doc:
             return None
-        index, snap = self._undo.pop()
+        entry = self._undo.pop()
+        if entry[0] == "doc":
+            self._undo_bytes -= len(entry[2])
         try:
-            self._redo.append((index, self._annot_snapshot(index)))
-            self._restore_snapshot(index, snap)
-        except Exception:  # noqa: BLE001
+            return self._apply_entry(entry, self._redo)
+        except Exception:  # noqa: BLE001  戻せないものは履歴ごと諦める
+            self._clear_history()
             return None
-        return index
 
-    def redo_annot(self):
-        """取り消した注釈変更をやり直す。対象ページ番号を返す（無ければ None）。"""
+    def redo(self):
+        """取り消した操作をやり直す。(kind, page_index, label) を返す。"""
         if not self._redo or not self._doc:
             return None
-        index, snap = self._redo.pop()
+        entry = self._redo.pop()
         try:
-            self._undo.append((index, self._annot_snapshot(index)))
-            self._restore_snapshot(index, snap)
+            result = self._apply_entry(entry, self._undo)
         except Exception:  # noqa: BLE001
+            self._clear_history()
             return None
-        return index
+        if entry[0] == "doc":
+            self._undo_bytes += len(self._undo[-1][2])
+        return result
 
-    def can_undo_annot(self) -> bool:
+    def can_undo(self) -> bool:
         return bool(self._undo)
 
-    def can_redo_annot(self) -> bool:
+    def can_redo(self) -> bool:
         return bool(self._redo)
+
+    def undo_label(self) -> str:
+        return self._undo[-1][3] if self._undo else ""
+
+    def redo_label(self) -> str:
+        return self._redo[-1][3] if self._redo else ""
+
+    # 旧名（注釈だけだった頃の呼び名）。呼び出し側が残っているので残す。
+    def undo_annot(self):
+        result = self.undo()
+        return None if result is None else result[1]
+
+    def redo_annot(self):
+        result = self.redo()
+        return None if result is None else result[1]
+
+    def can_undo_annot(self) -> bool:
+        return self.can_undo()
+
+    def can_redo_annot(self) -> bool:
+        return self.can_redo()
 
     # --- ページ編集（並べ替え・削除・統合） ---------------------------
     def move_page(self, src: int, dst: int) -> None:
@@ -1449,6 +1578,7 @@ class PdfDocument:
             raise RuntimeError("ドキュメントが開かれていません")
         if src == dst:
             return
+        self._push_doc_undo("ページの移動", dst)
         # move_page は dst の「前」に挿入する。末尾へ送る場合に対応する。
         self._doc.move_page(src, dst if dst < self.page_count else -1)
         self.modified = True
@@ -1463,6 +1593,7 @@ class PdfDocument:
             raise RuntimeError("ドキュメントが開かれていません")
         if sorted(new_order) != list(range(self.page_count)):
             raise ValueError("並べ替え指定が不正です")
+        self._push_doc_undo("ページの並べ替え", None)
         self._doc.select(new_order)
         self.modified = True
 
@@ -1471,6 +1602,7 @@ class PdfDocument:
             raise RuntimeError("ドキュメントが開かれていません")
         if self.page_count <= 1:
             raise ValueError("最後の1ページは削除できません")
+        self._push_doc_undo("ページの削除", index)
         self._doc.delete_page(index)
         self.modified = True
 
@@ -1478,6 +1610,7 @@ class PdfDocument:
         """複数ページをまとめて削除する（順序は維持）。"""
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        self._push_doc_undo("ページの削除", None)
         drop = set(indices)
         keep = [i for i in range(self.page_count) if i not in drop]
         if not keep:
@@ -1489,6 +1622,7 @@ class PdfDocument:
         """別の PDF を取り込む。at=None なら末尾に追加。挿入したページ数を返す。"""
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        self._push_doc_undo("PDF の結合", None)
         with fitz.open(other_path) as other:
             n = other.page_count
             start_at = self.page_count if at is None else at
@@ -1502,6 +1636,7 @@ class PdfDocument:
         """画像ファイルをページとして取り込む。挿入したページ数を返す。"""
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        self._push_doc_undo("画像の取り込み", None)
         start = self.page_count if at is None else at
         added = 0
         for p in image_paths:
@@ -1585,6 +1720,7 @@ class PdfDocument:
             new.close()
             raise
         # 元ドキュメントを差し替える
+        self._push_doc_undo("傾き補正")
         self._doc.close()
         self._doc = new
         self._invalidate_view_caches()  # 別の中身に差し替えた
@@ -2005,6 +2141,7 @@ class PdfDocument:
         """
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        self._push_doc_undo("ページ番号の追加", None)
         total = self.page_count
         for i in range(total):
             page = self._doc.load_page(i)

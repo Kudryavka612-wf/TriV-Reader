@@ -1582,31 +1582,60 @@ class PageView(QScrollArea):
         self.set_selection(index, new_xref)
         return True
 
-    def undo_annot(self) -> None:
-        """直前の注釈操作を取り消す。"""
+    def undo(self):
+        """直前の操作（注釈でもページ操作でも）を取り消す。
+
+        戻り値は (kind, page_index, label)。kind が "doc" のときは文書の構成
+        そのものが変わっているので、呼び出し側が全体を作り直すこと。
+        """
         if not self._doc:
-            return
+            return None
         if self._text_editor is not None:
             self._text_editor._finish()  # 入力中なら確定してから取り消す
-        idx = self._doc.undo_annot()
-        if idx is not None:
-            self.clear_selection()
-            self._after_annot(idx)
+        return self._apply_history(self._doc.undo())
+
+    def redo(self):
+        """取り消した操作をやり直す。戻り値は undo と同じ。"""
+        if not self._doc:
+            return None
+        return self._apply_history(self._doc.redo())
+
+    def _apply_history(self, result):
+        if result is None:
+            return None
+        kind, index, _label = result
+        self.clear_selection()
+        self.clear_text_selection()
+        if kind == "annot" and index is not None:
+            self._after_annot(index)
+        # kind == "doc" の作り直しは呼び出し側（MainWindow._reload）に任せる。
+        # ここで reload するとサムネイルや整理画面と食い違うため。
+        return result
+
+    def can_undo(self) -> bool:
+        return bool(self._doc and self._doc.can_undo())
+
+    def can_redo(self) -> bool:
+        return bool(self._doc and self._doc.can_redo())
+
+    def undo_label(self) -> str:
+        return self._doc.undo_label() if self._doc else ""
+
+    def redo_label(self) -> str:
+        return self._doc.redo_label() if self._doc else ""
+
+    # 旧名（注釈だけだった頃の呼び名）。テストや外部からの呼び出し用に残す。
+    def undo_annot(self) -> None:
+        self.undo()
 
     def redo_annot(self) -> None:
-        """取り消した注釈操作をやり直す。"""
-        if not self._doc:
-            return
-        idx = self._doc.redo_annot()
-        if idx is not None:
-            self.clear_selection()
-            self._after_annot(idx)
+        self.redo()
 
     def can_undo_annot(self) -> bool:
-        return bool(self._doc and self._doc.can_undo_annot())
+        return self.can_undo()
 
     def can_redo_annot(self) -> bool:
-        return bool(self._doc and self._doc.can_redo_annot())
+        return self.can_redo()
 
     def edit_selection_text(self) -> None:
         if self._sel_xref is None or not self._doc:

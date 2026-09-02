@@ -13,7 +13,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
-from viewer import storage, theme
+from viewer import errorlog, storage, theme
 from viewer.main_window import MainWindow
 
 # ユーザー毎に一意なサーバー名（同一PCの複数ユーザーでも衝突しない）
@@ -106,6 +106,9 @@ def _start_server(window: MainWindow) -> QLocalServer:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    # 何より先に。ここから後の例外は必ずログに残る（--windowed の exe は
+    # 標準出力の行き先が無く、入れておかないと落ちても何も残らない）。
+    errorlog.install()
 
     # 引数の相対パスは CWD を移す前に解決しておく。
     file_arg = sys.argv[1] if len(sys.argv) > 1 else ""
