@@ -15,8 +15,10 @@ from __future__ import annotations
 import os
 import subprocess
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QUrl
+from PySide6.QtGui import (
+    QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -26,10 +28,142 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMessageBox,
+    QTabBar,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
 )
+
+
+class DocTabBar(QTabBar):
+    """文書タブのタブバー。タブ幅を [TAB_MIN, TAB_MAX] に収める。
+
+    QSS の max-width は最初のレイアウトでは効かず（後の再スタイルで急に
+    縮む）、min-width が無いとタブが増えたとき全部が「…」まで潰れる。
+    sizeHint 側で決めておけば、収まらない分は素直にスクロール矢印になる。
+    """
+
+    TAB_MIN = 110
+    TAB_MAX = 260
+
+    def tabSizeHint(self, index: int) -> QSize:  # noqa: N802 (Qt 命名)
+        s = super().tabSizeHint(index)
+        s.setWidth(max(self.TAB_MIN, min(s.width(), self.TAB_MAX)))
+        return s
+
+    def minimumTabSizeHint(self, index: int) -> QSize:  # noqa: N802
+        s = super().minimumTabSizeHint(index)
+        s.setWidth(self.TAB_MIN)
+        return s
+
+    # タブが収まらないときに出る左右のスクロールボタン。Fusion + QSS では
+    # 矢印の記号が描かれず（枠だけになる）、特にダークで存在が分からない。
+    # Qt はレイアウトのたびに arrowType を設定し直すのでアイコン差し替えは
+    # 効かず、描画イベントを横取りしてテーマの文字色でシェブロンを描く。
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._arrow_painters: list[_ScrollArrowPainter] = []
+        for btn in self.findChildren(QToolButton):
+            side = {"ScrollLeftButton": "left",
+                    "ScrollRightButton": "right"}.get(btn.objectName())
+            if side:
+                self._arrow_painters.append(_ScrollArrowPainter(btn, side))
+
+    def apply_theme(self, dark: bool) -> None:
+        from . import theme
+
+        c = theme._tokens(dark)
+        for ap in self._arrow_painters:
+            ap.set_colors(QColor(c["text"]), QColor(c["border_strong"]))
+
+
+class _ScrollArrowPainter(QObject):
+    """タブバーのスクロールボタンに ‹ › を描く（Paint イベントを置き換える）。"""
+
+    def __init__(self, btn: QToolButton, side: str) -> None:
+        super().__init__(btn)
+        self._btn = btn
+        self._side = side
+        self._color = QColor("#161a21")
+        self._disabled = QColor("#c9cfd8")
+        btn.installEventFilter(self)
+
+    def set_colors(self, color: QColor, disabled: QColor) -> None:
+        self._color = color
+        self._disabled = disabled
+        self._btn.update()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt 命名)
+        if obj is self._btn and event.type() == QEvent.Type.Paint:
+            from PySide6.QtCore import QPointF
+            from PySide6.QtWidgets import QStyle, QStyleOptionToolButton
+
+            btn = self._btn
+            opt = QStyleOptionToolButton()
+            btn.initStyleOption(opt)
+            # 矢印は自前で描くので、スタイル側の矢印描画は外して面と枠だけ描かせる
+            opt.features = QStyleOptionToolButton.ToolButtonFeature.None_
+            opt.arrowType = Qt.ArrowType.NoArrow
+            opt.text = ""
+            p = QPainter(btn)
+            btn.style().drawComplexControl(
+                QStyle.ComplexControl.CC_ToolButton, opt, p, btn)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            color = self._color if btn.isEnabled() else self._disabled
+            p.setPen(QPen(color, 1.8, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            r = btn.rect()
+            cx, cy = r.center().x() + 0.5, r.center().y() + 0.5
+            if self._side == "left":
+                pts = [(cx + 2.5, cy - 4.5), (cx - 2.5, cy), (cx + 2.5, cy + 4.5)]
+            else:
+                pts = [(cx - 2.5, cy - 4.5), (cx + 2.5, cy), (cx - 2.5, cy + 4.5)]
+            p.drawPolyline([QPointF(x, y) for x, y in pts])
+            p.end()
+            return True
+        return super().eventFilter(obj, event)
+
+
+class _TabCloseButton(QToolButton):
+    """文書タブの × 。Fusion 標準の close-button アイコンはダークテーマで
+    背景に溶けて見えないので、文字の ✕ を theme.py の #tabClose で塗る。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("tabClose")
+        self.setText("×")
+        self.setAutoRaise(True)
+        self.setFixedSize(QSize(16, 16))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("タブを閉じる（中ボタンクリックでも閉じます）")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+
+class _TabBarMiddleClick(QObject):
+    """タブバーの中ボタンクリックでそのタブを閉じる（ブラウザーと同じ）。"""
+
+    def __init__(self, bar: QTabBar, close_cb) -> None:
+        super().__init__(bar)
+        self._bar = bar
+        self._close = close_cb
+        self._pressed = -1
+        bar.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt 命名)
+        if obj is self._bar:
+            if (event.type() == QEvent.Type.MouseButtonPress
+                    and event.button() == Qt.MouseButton.MiddleButton):
+                self._pressed = self._bar.tabAt(event.position().toPoint())
+                return True
+            if (event.type() == QEvent.Type.MouseButtonRelease
+                    and event.button() == Qt.MouseButton.MiddleButton):
+                idx = self._bar.tabAt(event.position().toPoint())
+                pressed, self._pressed = self._pressed, -1
+                if idx >= 0 and idx == pressed:
+                    self._close(idx)
+                return True
+        return super().eventFilter(obj, event)
 
 # QShortcut や PageView.keyPressEvent が直接さばくキー（QAction ではないので
 # findChildren では拾えない）。main_window._setup_shortcuts と揃えておく。
@@ -119,6 +253,22 @@ class ToolsMixin:
 
         self.tabs.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tabs.tabBar().customContextMenuRequested.connect(self._tab_context_menu)
+        self._tab_middle_click = _TabBarMiddleClick(self.tabs.tabBar(), self._close_tab)
+
+    def _install_tab_close(self, index: int) -> None:
+        """index のタブに自前の × を付ける（open_path から呼ぶ）。"""
+        bar = self.tabs.tabBar()
+        btn = _TabCloseButton(bar)
+        # タブは並べ替えられるので、押された時点でボタンの位置から番号を引く
+        btn.clicked.connect(lambda _c=False, b=btn: self._close_tab_of_button(b))
+        bar.setTabButton(index, QTabBar.ButtonPosition.RightSide, btn)
+
+    def _close_tab_of_button(self, btn) -> None:
+        bar = self.tabs.tabBar()
+        for i in range(bar.count()):
+            if bar.tabButton(i, QTabBar.ButtonPosition.RightSide) is btn:
+                self._close_tab(i)
+                return
 
     # --- 新しいタブへの接続（_new_tab から呼ぶ）----------------------------
     def _connect_tools_signals(self, pv) -> None:

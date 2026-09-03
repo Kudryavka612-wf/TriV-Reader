@@ -110,7 +110,7 @@ def _qss(c: dict) -> str:
     #ribbonGroupTitle {{ color: {c['muted']}; font-size: 11px; }}
     #ribbonSep {{ color: {c['border']}; margin: 6px 3px; }}
     #ribbon QToolButton {{
-        padding: 3px 7px; border-radius: 6px; border: 1px solid transparent; }}
+        padding: 3px 5px; border-radius: 6px; border: 1px solid transparent; }}
     #ribbon QToolButton:hover {{
         background: {c['accent_soft']}; border-color: {c['accent_soft2']}; }}
     #ribbon QToolButton:pressed {{ background: {c['accent_soft2']}; }}
@@ -131,13 +131,26 @@ def _qss(c: dict) -> str:
         background: {c['surface_alt']}; color: {c['muted']};
         border: 1px solid transparent; border-bottom: 0;
         border-top-left-radius: 8px; border-top-right-radius: 8px;
-        padding: 6px 10px 6px 12px; margin: 3px 2px 0 0; max-width: 260px; }}
+        padding: 6px 10px 6px 12px; margin: 3px 2px 0 0; }}
     #docTabs > QTabBar::tab:hover {{ background: {c['accent_soft']}; color: {c['text']}; }}
     #docTabs > QTabBar::tab:selected {{
         background: {c['surface']}; color: {c['text']};
         border-color: {c['border']}; }}
-    #docTabs > QTabBar::close-button {{ border-radius: 5px; margin-left: 2px; }}
-    #docTabs > QTabBar::close-button:hover {{ background: {c['accent_soft2']}; }}
+    /* × は Fusion 標準アイコンだとダークで見えないため、自前の QToolButton
+       （objectName=tabClose、mw_tools._TabCloseButton）を各タブに置いている */
+    #tabClose {{ color: {c['muted']}; background: transparent; border: 0;
+        border-radius: 7px; padding: 0; margin: 0; font-size: 11px; }}
+    #tabClose:hover {{ background: {c['accent_soft2']}; color: {c['text']}; }}
+    #tabClose:pressed {{ background: {c['accent']}; color: {c['accent_text']}; }}
+    /* タブが収まらないときの左右スクロール矢印。既定の描画は背景と同化して
+       ダークで消えるので、面と枠を与えて矢印の色も明示する */
+    #docTabs > QTabBar::scroller {{ width: 44px; }}
+    #docTabs > QTabBar QToolButton {{
+        background: {c['surface_alt']}; color: {c['text']};
+        border: 1px solid {c['border']}; border-radius: 6px;
+        margin: 4px 1px 1px 1px; }}
+    #docTabs > QTabBar QToolButton:hover {{ background: {c['accent_soft']}; }}
+    #docTabs > QTabBar QToolButton:disabled {{ color: {c['border_strong']}; }}
 
     /* ── メニュー ─────────────────────────────────────── */
     QMenuBar {{ background: {c['bg']}; color: {c['text']}; border: 0; }}

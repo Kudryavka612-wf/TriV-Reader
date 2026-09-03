@@ -45,7 +45,7 @@ from .page_view import PageView
 from .thumbnail_list import ThumbnailList
 from .mw_convert import ConvertMixin
 from .mw_print import PrintMixin
-from .mw_tools import ToolsMixin
+from .mw_tools import DocTabBar, ToolsMixin
 from .mw_update import UpdateMixin
 from .util import parse_ranges
 from .welcome import WelcomeWidget
@@ -121,10 +121,16 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.welcome.open_requested.connect(self.open_file)
         self.welcome.file_requested.connect(self.open_path)
         self.tabs = QTabWidget()
+        self.tabs.setTabBar(DocTabBar())     # タブ幅の上限・下限（mw_tools）
         self.tabs.setObjectName("docTabs")  # テーマ側のスタイル対象
         self.tabs.setDocumentMode(True)
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
+        # 長いファイル名は中央を「…」で詰める（両端が切れて拡張子や × が
+        # 消えないように）。日本語の届出書名は末尾に日付や社名が付くことが
+        # 多いので、先頭と末尾を残す。
+        self.tabs.setElideMode(Qt.TextElideMode.ElideMiddle)
+        self.tabs.tabBar().setUsesScrollButtons(True)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         # ウェルカム ⇔ タブ群 を切り替える中央スタック
@@ -184,6 +190,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self._tray_notified = False
         self._setup_tray()
         self._build_ribbon()  # Foxit 風リボンを最上部に（従来のバーは隠す）
+        self.tabs.tabBar().apply_theme(self.act_dark.isChecked())
 
     # --- アクティブタブへのアクセス（プロパティ） ---------------------
     def _active_tab(self) -> "DocTab | None":
@@ -239,7 +246,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self.zoom_slider.setRange(25, 400)   # 25%〜400%
         self.zoom_slider.setValue(100)
-        self.zoom_slider.setFixedWidth(120)
+        self.zoom_slider.setFixedWidth(96)
         tb.addWidget(self.zoom_slider)
         self.zoom_combo = QComboBox()
         self.zoom_combo.addItems(["50%", "75%", "100%", "125%", "150%", "200%",
@@ -767,6 +774,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             self.act_flatten: "固定して保存",
             self.act_copy_page_image: "ページを画像に",
             self.act_show_in_explorer: "フォルダを開く",
+            self.act_report_govform: "フォーム報告",
+            self.act_set_update_url: "更新元URL",
+            self.act_add_bookmark: "しおりに追加",
+            self.act_check_update: "更新を確認",
         }
         for act, text in short.items():
             act.setIconText(text)
@@ -778,9 +789,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         p = r.add_page("ホーム")
         g = r.add_group(p, "ファイル")
         g.add_action(self.act_open, big=True)
+        # 「設定」「既定に設定」は 表示 > ヘルプ にもあるので、ホームからは外して
+        # 幅を節約する（既定ウィンドウ幅 1180px にホームが収まるように）。
         g.add_stack([self.act_save, self.act_save_as, self.act_print,
-                     self.act_open_acrobat, self.act_set_default_pdf,
-                     self.act_settings])
+                     self.act_open_acrobat])
         recent_btn = QToolButton()
         recent_btn.setText("最近 ▾")
         recent_btn.setAutoRaise(True)
@@ -909,7 +921,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         g = r.add_group(p, "しおり")
         g.add_stack([self.act_add_bookmark, self.act_edit_toc])
         g = r.add_group(p, "ヘルプ")
-        g.add_stack([self.act_shortcuts, self.act_settings, self.act_check_update,
+        g.add_stack([self.act_shortcuts, self.act_settings,
+                     self.act_set_default_pdf, self.act_check_update,
                      self.act_set_update_url, self.act_report_govform,
                      self.act_open_log, self.act_about])
         r.end_page(p)
@@ -934,6 +947,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         # 折りたたみ状態を復元
         if self.settings.value("ribbon_collapsed", False, bool):
             r.set_collapsed(True)
+        r.refresh_min_widths()   # QSS 適用後の実寸でラベルが省略されない幅に
 
     def _jump_to_page_edit(self) -> None:
         """リボンのページ番号欄からジャンプ（入力 + Enter）。"""
@@ -1403,6 +1417,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         tab.page_view.set_document(doc)
         idx = self.tabs.addTab(tab, os.path.basename(path))
         self.tabs.setTabToolTip(idx, path)
+        self._install_tab_close(idx)   # テーマ連動の × ボタン
         self.center.setCurrentWidget(self.tabs)
         self.tabs.setCurrentIndex(idx)  # _on_tab_changed が読み込み・更新を行う
         QApplication.processEvents()
@@ -2565,6 +2580,9 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.welcome.apply_theme(on)
         self._apply_title_bar_theme(on)  # Windows のタイトルバーも合わせる
         self._assign_icons()  # 記号アイコンの色をテーマに追従させる
+        if hasattr(self, "ribbon"):
+            self.ribbon.refresh_min_widths()  # 再スタイル後もラベルを省略させない
+        self.tabs.tabBar().apply_theme(on)   # タブのスクロール矢印をテーマ色で
 
     # --- ページ番号 ----------------------------------------------------
     def add_page_numbers_dialog(self) -> None:

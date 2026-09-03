@@ -46,7 +46,7 @@ class RibbonGroup(QWidget):
     def __init__(self, title: str) -> None:
         super().__init__()
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 3, 8, 2)
+        outer.setContentsMargins(6, 3, 6, 2)
         outer.setSpacing(1)
         self._row = QHBoxLayout()
         self._row.setContentsMargins(0, 0, 0, 0)
@@ -60,6 +60,7 @@ class RibbonGroup(QWidget):
 
     def add_action(self, action, big: bool = False) -> QToolButton:
         btn = QToolButton()
+        self._register(btn)
         btn.setDefaultAction(action)
         _apply_ribbon_text(btn, action)
         btn.setAutoRaise(True)
@@ -89,6 +90,7 @@ class RibbonGroup(QWidget):
                 col.setAlignment(Qt.AlignmentFlag.AlignTop)
                 self._row.addLayout(col)
             btn = QToolButton()
+            self._register(btn)
             btn.setDefaultAction(act)
             _apply_ribbon_text(btn, act)
             btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -105,6 +107,14 @@ class RibbonGroup(QWidget):
             btn.setMinimumWidth(fm.horizontalAdvance(btn.text()) + 34)
             btn.setMinimumHeight(24)
             col.addWidget(btn)
+
+    def _register(self, btn: QToolButton) -> None:
+        """リボン本体（Ribbon）に登録して、後で最小幅を決め直せるようにする。"""
+        p = self.parentWidget()
+        while p is not None and not isinstance(p, Ribbon):
+            p = p.parentWidget()
+        if p is not None:
+            p._buttons.append(btn)
 
     def add_widget(self, w: QWidget) -> None:
         self._row.addWidget(w)
@@ -142,6 +152,7 @@ class Ribbon(QTabWidget):
         btn.clicked.connect(self.toggle_collapsed)
         btn.raise_()
         self._collapse_btn = btn
+        self._buttons: list[QToolButton] = []   # 最小幅を後で決め直す対象
 
         # タブのダブルクリックで折りたたみ切替、折りたたみ中のクリックで展開
         self.tabBarDoubleClicked.connect(lambda _i: self.toggle_collapsed())
@@ -204,6 +215,20 @@ class Ribbon(QTabWidget):
                 self._end_temp_open()
                 self._apply_height(self._collapsed_height())
         return super().eventFilter(obj, event)
+
+    # --- ボタンの最小幅 ---------------------------------------------------
+    def refresh_min_widths(self) -> None:
+        """各ボタンの最小幅を、スタイル適用後の sizeHint に合わせ直す。
+
+        生成時の fontMetrics ベースの見積もりは、QSS の padding / 枠や
+        Fusion の余白を含まないので実際の sizeHint より 10px ほど小さい。
+        ページの内容がウィンドウ幅を超えて各ボタンが最小幅まで縮むと、
+        Qt はラベルを「…」に省略してしまう（テーマ切替後に目立つ）。
+        表示直後とテーマ切替後に呼んで、ラベルが必ず収まる幅を保証する。
+        """
+        for btn in self._buttons:
+            btn.ensurePolished()
+            btn.setMinimumWidth(max(btn.minimumWidth(), btn.sizeHint().width()))
 
     # --- ページ / グループ ----------------------------------------------
     def add_page(self, name: str) -> QWidget:
