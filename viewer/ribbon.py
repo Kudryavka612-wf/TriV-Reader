@@ -30,7 +30,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-STACK_ROWS = 2  # 小ボタンの段数（2段=横に効率配置）
+STACK_ROWS = 2  # 小ボタンの段数（既定。注釈タブのように項目が多い所は 3 段）
+ROW_H = 24      # 小ボタン・入力欄 1 段の高さ
 
 
 def _apply_ribbon_text(btn: QToolButton, action) -> None:
@@ -50,13 +51,53 @@ class RibbonGroup(QWidget):
         outer.setSpacing(1)
         self._row = QHBoxLayout()
         self._row.setContentsMargins(0, 0, 0, 0)
-        self._row.setSpacing(3)
+        self._row.setSpacing(2)
         self._row.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         outer.addLayout(self._row, 1)
         cap = QLabel(title)
         cap.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         cap.setObjectName("ribbonGroupTitle")
         outer.addWidget(cap)
+
+    def small_button(self, action) -> QToolButton:
+        """スタック用と同じ見た目の小ボタンを作るだけ（配置は呼び出し側）。"""
+        btn = QToolButton()
+        self._register(btn)
+        btn.setDefaultAction(action)
+        _apply_ribbon_text(btn, action)
+        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        btn.setIconSize(QSize(16, 16))
+        btn.setAutoRaise(True)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        fm = btn.fontMetrics()
+        btn.setMinimumWidth(fm.horizontalAdvance(btn.text()) + 34)
+        btn.setFixedHeight(ROW_H)
+        return btn
+
+    def add_column(self, widgets: list) -> None:
+        """任意のウィジェット（入力欄・コンボ・ボタン）を縦に積む列。
+
+        1 段の高さを小ボタンに揃えるので、add_stack の列と横に並べても
+        段が合う。要素が list/tuple なら、その段だけ横に並べる。
+        """
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(1)
+        col.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        for item in widgets:
+            if isinstance(item, (list, tuple)):
+                row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(2)
+                for w in item:
+                    w.setFixedHeight(ROW_H)
+                    row.addWidget(w)
+                col.addLayout(row)
+            else:
+                item.setFixedHeight(ROW_H)
+                col.addWidget(item)
+        self._row.addLayout(col)
 
     def add_action(self, action, big: bool = False) -> QToolButton:
         btn = QToolButton()
@@ -87,7 +128,8 @@ class RibbonGroup(QWidget):
                 col = QVBoxLayout()
                 col.setContentsMargins(0, 0, 0, 0)
                 col.setSpacing(1)
-                col.setAlignment(Qt.AlignmentFlag.AlignTop)
+                # リボンの高さは 3 段ぶんあるので、2 段のスタックは縦中央に寄せる
+                col.setAlignment(Qt.AlignmentFlag.AlignVCenter)
                 self._row.addLayout(col)
             btn = QToolButton()
             self._register(btn)
@@ -126,9 +168,9 @@ class RibbonGroup(QWidget):
 class Ribbon(QTabWidget):
     """タブごとにグループを並べるリボン本体。折りたたみ対応。"""
 
-    # 2段スタック＋グループ名が収まる高さ。幅不足時に出る横スクロールバー
-    # （8px）分の余裕も含める（96 だと2段目が押し出されて隠れるため）。
-    EXPANDED_HEIGHT = 104
+    # 3段スタック＋グループ名が収まる高さ（注釈タブが 3 段）。幅不足時に出る
+    # 横スクロールバー（8px）分の余裕も含める。2 段のタブは縦中央に寄せる。
+    EXPANDED_HEIGHT = 104 + ROW_H + 1
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)

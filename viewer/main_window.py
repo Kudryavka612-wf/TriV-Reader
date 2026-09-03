@@ -483,11 +483,26 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.text_font_combo.setToolTip(
             "テキスト注釈のフォント（英数字に適用。日本語は標準フォントで描画）")
 
-        # 入力コントロールが押しやすいよう最小幅を確保（リボン上で潰れない）
-        self.opacity_spin.setMinimumWidth(58)
-        self.text_size_spin.setMinimumWidth(56)
-        self.width_spin.setMinimumWidth(46)
-        self.text_font_combo.setMinimumWidth(104)
+        # リボンでは「太さ」「不透明度」などのラベルを別に置かず、値の前に
+        # 入れて幅を節約する（ツールチップに説明がある）。
+        self.width_spin.setPrefix("太さ ")
+        self.text_size_spin.setPrefix("文字 ")
+        self.opacity_spin.setPrefix("不透明 ")
+        # 幅は「接頭辞＋最大値＋接尾辞」が収まる分だけにする（QSpinBox の
+        # sizeHint は余裕を多めに取り、3 つで 370px になる）。実フォントで
+        # 計測するので、環境のフォントが違っても右端が切れない。
+        for sp in (self.width_spin, self.text_size_spin, self.opacity_spin):
+            longest = f"{sp.prefix()}{sp.maximum()}{sp.suffix()}"
+            # 内訳: 文字幅 + 上下ボタン 18 + 枠/余白 16 + 余裕 4
+            sp.setFixedWidth(sp.fontMetrics().horizontalAdvance(longest) + 38)
+        self.text_font_combo.setFixedWidth(128)   # 「ゴシック(標準)」が切れない幅
+        # 始点/終点は選択肢の文字が長い（「矢印(塗り・逆)」）ので、閉じた状態の
+        # 幅は選択肢に引きずられないようにする（開けば全文が読める）
+        for cb in (self.line_start_combo, self.line_end_combo):
+            cb.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            cb.setMinimumContentsLength(4)
+            cb.setFixedWidth(92)
 
         # スタンプ（承認・済・日付など。選ぶとクリックした位置に置く）
         from PySide6.QtWidgets import QMenu, QToolButton
@@ -774,6 +789,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             self.act_flatten: "固定して保存",
             self.act_copy_page_image: "ページを画像に",
             self.act_show_in_explorer: "フォルダを開く",
+            self.act_paste: "貼り付け",
             self.act_report_govform: "フォーム報告",
             self.act_set_update_url: "更新元URL",
             self.act_add_bookmark: "しおりに追加",
@@ -837,37 +853,25 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         r.end_page(p)
 
         # ── 注釈 ────────────────────────────────────────────────
+        # 項目が多いので 3 段に積む（2 段だと 2500px を超えて横スクロールに
+        # なる）。書式の入力欄も 1 行に並べず 3 段の格子にして、既定の
+        # ウィンドウ幅（1180px）に収める。
         p = r.add_page("注釈")
         g = r.add_group(p, "ツール")
-        g.add_stack(list(self.tool_group.actions()))
+        g.add_stack(list(self.tool_group.actions()), rows=3)
         g = r.add_group(p, "書式")
         g.add_action(self.act_color, big=True)
-        g.add_label(" 太さ ")
-        g.add_widget(self.width_spin)
-        g.add_label(" 線種 ")
-        g.add_widget(self.line_style_combo)
-        g = r.add_group(p, "矢印")
-        g.add_label(" 始点 ")
-        g.add_widget(self.line_start_combo)
-        g.add_label(" 終点 ")
-        g.add_widget(self.line_end_combo)
-        g = r.add_group(p, "塗り・不透明度")
-        g.add_action(self.act_fill_enabled, big=True)
-        g.add_action(self.act_fill_color, big=True)
-        g.add_label(" 不透明度 ")
-        g.add_widget(self.opacity_spin)
-        g = r.add_group(p, "テキスト")
-        g.add_label(" サイズ ")
-        g.add_widget(self.text_size_spin)
-        g.add_label(" フォント ")
-        g.add_widget(self.text_font_combo)
-        g = r.add_group(p, "スタンプ")
-        g.add_widget(self.stamp_btn)
+        g.add_column([self.width_spin, self.text_size_spin, self.opacity_spin])
+        g.add_column([self.line_style_combo, self.text_font_combo, self.stamp_btn])
+        lbl_s, lbl_e = QLabel("始点"), QLabel("終点")
+        g.add_column([[lbl_s, self.line_start_combo],
+                      [lbl_e, self.line_end_combo],
+                      [g.small_button(self.act_fill_enabled),
+                       g.small_button(self.act_fill_color)]])
         g = r.add_group(p, "編集")
-        g.add_stack([self.act_undo, self.act_redo])
-        g.add_stack([self.act_copy, self.act_paste])
-        g.add_stack([self.act_apply_redact, self.act_clear_annots])
-        g.add_stack([self.act_copy_page_image])
+        g.add_stack([self.act_undo, self.act_redo, self.act_copy,
+                     self.act_paste, self.act_apply_redact,
+                     self.act_clear_annots], rows=3)
         r.end_page(p)
 
         # ── ページ ──────────────────────────────────────────────
@@ -886,7 +890,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         # ── 変換 ────────────────────────────────────────────────
         p = r.add_page("変換")
         g = r.add_group(p, "画像")
-        g.add_stack([self.act_to_images, self.act_from_images, self.act_add_images])
+        g.add_stack([self.act_to_images, self.act_from_images, self.act_add_images,
+                     self.act_copy_page_image])
         g = r.add_group(p, "文字認識")
         g.add_stack([self.act_ocr, self.act_deskew])
         g = r.add_group(p, "出力")

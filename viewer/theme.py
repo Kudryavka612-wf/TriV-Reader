@@ -12,7 +12,10 @@
 """
 from __future__ import annotations
 
-from PySide6.QtGui import QColor, QFont, QPalette
+import os
+
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import QApplication
 
 # UI フォント。Latin/数字は Windows 11 の標準（Segoe UI Variable）、かなは
@@ -89,8 +92,72 @@ def _palette(c: dict) -> QPalette:
     return p
 
 
-def _qss(c: dict) -> str:
+# --- コンボ/スピンの矢印 -------------------------------------------------
+# QSS で ::drop-down / ::up-button に手を入れると、Qt は矢印の描画も QSS に
+# 任せる（image が無ければ何も描かない）。Fusion に戻す手が無いので、テーマの
+# 文字色で描いた小さな PNG を用意して image: url() で当てる。
+_ARROW_PX = 16   # 画像の一辺。QSS 側の width/height で表示サイズを決める
+
+
+def _draw_arrow(path: str, kind: str, color: QColor) -> None:
+    pm = QPixmap(_ARROW_PX, _ARROW_PX)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(QPen(color, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                  Qt.PenJoinStyle.RoundJoin))
+    c = _ARROW_PX / 2
+    if kind == "down":
+        pts = [(c - 4, c - 2), (c, c + 2), (c + 4, c - 2)]
+    else:
+        pts = [(c - 4, c + 2), (c, c - 2), (c + 4, c + 2)]
+    p.drawPolyline([QPointF(x, y) for x, y in pts])
+    p.end()
+    pm.save(path, "PNG")
+
+
+def _arrow_images(c: dict, dark: bool) -> dict[str, str]:
+    """矢印 PNG を用意して {名前: QSS 用パス} を返す。書けなければ空。"""
+    try:
+        from . import storage
+
+        d = os.path.join(storage.data_dir(), "ui")
+        os.makedirs(d, exist_ok=True)
+        out: dict[str, str] = {}
+        theme_tag = "dark" if dark else "light"
+        for kind in ("down", "up"):
+            for state, col in (("", c["text"]), ("_dis", c["border_strong"])):
+                name = f"arrow_{kind}{state}_{theme_tag}.png"
+                path = os.path.join(d, name)
+                if not os.path.exists(path):
+                    _draw_arrow(path, kind, QColor(col))
+                out[f"{kind}{state}"] = path.replace("\\", "/")
+        return out
+    except Exception:  # noqa: BLE001  矢印が出ないだけで動作に支障はない
+        return {}
+
+
+def _arrow_qss(a: dict[str, str]) -> str:
+    if not a:
+        return ""
     return f"""
+    QComboBox::down-arrow {{ image: url("{a['down']}"); width: 12px; height: 12px; }}
+    QComboBox::down-arrow:disabled {{ image: url("{a['down_dis']}"); }}
+    QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+        image: url("{a['up']}"); width: 9px; height: 9px; }}
+    QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+        image: url("{a['down']}"); width: 9px; height: 9px; }}
+    QSpinBox::up-arrow:disabled, QSpinBox::up-arrow:off,
+    QDoubleSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:off {{
+        image: url("{a['up_dis']}"); }}
+    QSpinBox::down-arrow:disabled, QSpinBox::down-arrow:off,
+    QDoubleSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:off {{
+        image: url("{a['down_dis']}"); }}
+    """
+
+
+def _qss(c: dict, arrows: dict[str, str] | None = None) -> str:
+    return _arrow_qss(arrows or {}) + f"""
     /* ── 土台 ─────────────────────────────────────────── */
     QMainWindow, QDialog {{ background: {c['bg']}; }}
     QWidget {{ color: {c['text']}; }}
@@ -110,12 +177,20 @@ def _qss(c: dict) -> str:
     #ribbonGroupTitle {{ color: {c['muted']}; font-size: 11px; }}
     #ribbonSep {{ color: {c['border']}; margin: 6px 3px; }}
     #ribbon QToolButton {{
-        padding: 3px 5px; border-radius: 6px; border: 1px solid transparent; }}
+        padding: 3px 4px; border-radius: 6px; border: 1px solid transparent; }}
     #ribbon QToolButton:hover {{
         background: {c['accent_soft']}; border-color: {c['accent_soft2']}; }}
     #ribbon QToolButton:pressed {{ background: {c['accent_soft2']}; }}
     #ribbon QToolButton:checked {{
         background: {c['accent']}; color: {c['accent_text']}; border-color: {c['accent']}; }}
+    /* リボン内の入力欄は 1 段 24px に収めるので、通常の 5px/8px の余白では
+       文字と上下ボタンの場所が無くなる。余白を詰めて中身を優先する。 */
+    #ribbon QSpinBox, #ribbon QComboBox, #ribbon QLineEdit {{
+        padding: 1px 4px; border-radius: 6px; }}
+    #ribbon QSpinBox:focus, #ribbon QComboBox:focus, #ribbon QLineEdit:focus {{
+        padding: 0px 3px; }}
+    #ribbon QSpinBox::up-button, #ribbon QSpinBox::down-button {{
+        width: 15px; margin: 1px 2px; }}
     #ribbon QScrollArea {{ background: transparent; border: 0; }}
     #ribbon QScrollArea > QWidget > QWidget {{ background: transparent; }}
     #ribbon QScrollBar:horizontal {{ height: 8px; background: transparent; }}
@@ -346,5 +421,5 @@ def apply_theme(app: QApplication, dark: bool, force: bool = False) -> None:
     app.setStyle("Fusion")
     apply_font(app)
     app.setPalette(_palette(c))
-    app.setStyleSheet(_qss(c))
+    app.setStyleSheet(_qss(c, _arrow_images(c, dark)))
     app._trv_theme_dark = dark
