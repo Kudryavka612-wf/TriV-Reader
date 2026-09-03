@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, QSizeF, Qt
+from PySide6.QtCore import QRectF, QSizeF, Qt, QTimer
 from PySide6.QtGui import QPageLayout, QPageSize, QPainter, QPen, QPixmap
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
@@ -23,9 +23,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QRadioButton,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
 )
+
+from .util import parse_ranges
 
 # サイズ処理モード
 SIZE_FIT, SIZE_ACTUAL, SIZE_SHRINK, SIZE_CUSTOM = range(4)
@@ -65,7 +68,7 @@ def nup_slots(rect: QRectF, count: int, page_w: float, page_h: float) -> list[QR
 class PrintDialog(QDialog):
     """印刷設定＋プレビュー。"""
 
-    PREVIEW_W = 300
+    PREVIEW_W = 300   # プレビューの最小幅。ダイアログを広げれば追従して大きくなる
 
     def __init__(self, doc, current_index: int, settings, parent=None) -> None:
         super().__init__(parent)
@@ -120,11 +123,14 @@ class PrintDialog(QDialog):
         gb_pages = QGroupBox("印刷するページ")
         v = QVBoxLayout(gb_pages)
         self.rb_all = QRadioButton("すべて")
-        self.rb_current = QRadioButton("現在のページ")
+        # プレビューを ◀▶ で送っても「現在のページ」は開いている画面のページ。
+        # どのページが刷られるのか迷わないよう、番号を添える。
+        self.rb_current = QRadioButton(f"現在のページ（{self._current_index + 1}）")
         row = QHBoxLayout()
         self.rb_range = QRadioButton("ページ指定:")
         self.range_edit = QLineEdit()
         self.range_edit.setPlaceholderText("例: 1-3, 5, 8")
+        self.range_edit.setToolTip("ページ番号をカンマ区切りで。範囲は 1-3 のように書きます")
         row.addWidget(self.rb_range)
         row.addWidget(self.range_edit)
         self.rb_all.setChecked(True)
@@ -134,6 +140,24 @@ class PrintDialog(QDialog):
         self._page_group = QButtonGroup(self)
         for rb in (self.rb_all, self.rb_current, self.rb_range):
             self._page_group.addButton(rb)
+        # 奇数/偶数だけ・逆順。両面に対応していないプリンターで手差し両面を
+        # するときの定番（奇数を刷る → 裏返す → 偶数を逆順で刷る）。
+        row = QHBoxLayout()
+        self.subset_combo = QComboBox()
+        self.subset_combo.addItem("すべてのページ", "all")
+        self.subset_combo.addItem("奇数ページのみ", "odd")
+        self.subset_combo.addItem("偶数ページのみ", "even")
+        self.subset_combo.setToolTip(
+            "両面に対応していないプリンターで手差し両面をするときに。\n"
+            "奇数ページを刷ってから紙を裏返し、偶数ページを刷ります。")
+        self.reverse_check = QCheckBox("逆順に印刷")
+        self.reverse_check.setToolTip(
+            "最後のページから刷ります。排紙が裏向きになるプリンターで、"
+            "刷り上がりをページ順に揃えたいときに。")
+        row.addWidget(self.subset_combo)
+        row.addWidget(self.reverse_check)
+        row.addStretch(1)
+        v.addLayout(row)
         left.addWidget(gb_pages)
 
         # ページサイズ処理
@@ -223,19 +247,29 @@ class PrintDialog(QDialog):
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                               | QDialogButtonBox.StandardButton.Cancel)
-        bb.button(QDialogButtonBox.StandardButton.Ok).setText("印刷")
+        self.print_button = bb.button(QDialogButtonBox.StandardButton.Ok)
+        self.print_button.setText("印刷")
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("キャンセル")
         bb.accepted.connect(self._on_accept)
         bb.rejected.connect(self.reject)
         left.addWidget(bb)
-        root.addLayout(left, 1)
+        root.addLayout(left, 0)
 
         # ── 右: プレビュー ──────────────────────────────────────
+        # ダイアログを広げたぶんプレビューも大きくなる（300px 固定だと、
+        # 大きくしても灰色の余白が増えるだけで細部が見えない）。
         right = QVBoxLayout()
         self.preview = QLabel()
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setMinimumSize(self.PREVIEW_W, int(self.PREVIEW_W * 1.4142))
+        self.preview.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                   QSizePolicy.Policy.Expanding)
         self.preview.setStyleSheet("background: #888; border: 1px solid #666;")
         right.addWidget(self.preview, 1)
+        self._preview_timer = QTimer(self)      # リサイズ中の描き直しをまとめる
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(60)
+        self._preview_timer.timeout.connect(self._refresh)
         nav = QHBoxLayout()
         btn_prev = QPushButton("◀")
         btn_next = QPushButton("▶")
@@ -248,6 +282,7 @@ class PrintDialog(QDialog):
         nav.addStretch(1)
         right.addLayout(nav)
         root.addLayout(right, 1)
+        self.resize(900, 700)
 
         # 配線: 設定変更でプレビュー更新
         btn_prev.clicked.connect(lambda: self._step_preview(-1))
@@ -264,6 +299,13 @@ class PrintDialog(QDialog):
         self.paper_combo.currentIndexChanged.connect(self._refresh)
         self.nup_combo.currentIndexChanged.connect(self._refresh)
         self.annots_check.toggled.connect(self._on_annots_toggled)
+        # ページ指定欄に打ち始めたら、そのラジオを選ぶ（打ったのに「すべて」の
+        # まま刷ってしまうのを防ぐ）。中身は打つたびに検査して、誤りなら
+        # 印刷ボタンを押せなくする。
+        self.range_edit.textEdited.connect(lambda _t: self.rb_range.setChecked(True))
+        self.range_edit.textChanged.connect(self._validate_range)
+        for rb in (self.rb_all, self.rb_current, self.rb_range):
+            rb.toggled.connect(self._validate_range)
 
         self._printer_name = None
         self._sync_printer_caps()
@@ -281,6 +323,31 @@ class PrintDialog(QDialog):
     def _on_printer_changed(self, _name: str) -> None:
         self._sync_printer_caps()
         self._refresh()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        super().resizeEvent(event)
+        self._preview_timer.start()
+
+    def range_error(self) -> str:
+        """ページ指定の誤り（空文字なら問題なし）。"""
+        if not self.rb_range.isChecked():
+            return ""
+        text = self.range_edit.text().strip()
+        if not text:
+            return "ページ番号を入力してください"
+        try:
+            pages = parse_ranges(text, self._doc.page_count)
+        except ValueError as exc:
+            return str(exc)
+        return "" if pages else "該当するページがありません"
+
+    def _validate_range(self, *_args) -> None:
+        err = self.range_error()
+        self.print_button.setEnabled(not err)
+        self.print_button.setToolTip(err)
+        self.range_edit.setStyleSheet(
+            "border: 2px solid #d64545;" if err and self.range_edit.text().strip()
+            else "")
 
     def _on_annots_toggled(self, _on: bool) -> None:
         self._release_stripped()
@@ -416,6 +483,8 @@ class PrintDialog(QDialog):
             "annots": self.annots_check.isChecked(),
             "duplex": self.duplex_combo.currentData() if self.duplex_combo.isEnabled() else "none",
             "collate": self.collate_check.isChecked(),
+            "subset": self.subset_combo.currentData(),
+            "reverse": self.reverse_check.isChecked(),
         }
 
     def _on_accept(self) -> None:
@@ -508,8 +577,10 @@ class PrintDialog(QDialog):
         paper, printable = self._paper_rects(nat_w, nat_h)
         paper_w_pt = max(1.0, paper.width())
         paper_h_pt = max(1.0, paper.height())
-        # プレビュー画布
-        pw = self.PREVIEW_W
+        # プレビュー画布：ラベルの中に収まる最大の大きさ（縦横比は用紙どおり）
+        avail_w = max(self.PREVIEW_W, self.preview.width() - 16)
+        avail_h = max(int(self.PREVIEW_W * 1.4142), self.preview.height() - 16)
+        pw = int(min(avail_w, avail_h * paper_w_pt / paper_h_pt))
         ph = max(1, int(pw * paper_h_pt / paper_w_pt))
         canvas = QPixmap(pw, ph)
         canvas.fill(Qt.GlobalColor.white)

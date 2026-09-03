@@ -13,6 +13,30 @@ from PySide6.QtWidgets import QMessageBox, QProgressDialog
 from .util import parse_ranges
 
 
+def select_pages(opt: dict, total: int, current: int) -> list[int]:
+    """ダイアログの選択内容から、刷るページ（0 始まり）を順に返す。
+
+    「すべて / 現在 / 指定」で母集団を決め、奇数・偶数で絞り、逆順にする。
+    奇数・偶数は文書のページ番号（1 始まり）で数える。ページ指定が誤って
+    いれば ValueError（メッセージは parse_ranges のもの）。
+    """
+    if opt.get("page_mode") == "current":
+        pages = [current]
+    elif opt.get("page_mode") == "range":
+        pages = parse_ranges(opt.get("range_text", ""), total)
+    else:
+        pages = list(range(total))
+    pages = [i for i in pages if 0 <= i < total]
+    subset = opt.get("subset", "all")
+    if subset == "odd":
+        pages = [i for i in pages if (i + 1) % 2 == 1]
+    elif subset == "even":
+        pages = [i for i in pages if (i + 1) % 2 == 0]
+    if opt.get("reverse"):
+        pages.reverse()
+    return pages
+
+
 class PrintMixin:
     """印刷ダイアログとプリンタへの描画。MainWindow に混ぜて使う。"""
 
@@ -36,19 +60,14 @@ class PrintMixin:
         self._configure_printer(printer, opt)
 
         # 対象ページ
-        total = self.doc.page_count
-        if opt["page_mode"] == "current":
-            pages = [self.page_view.index]
-        elif opt["page_mode"] == "range":
-            try:
-                pages = parse_ranges(opt["range_text"], total)
-            except ValueError as exc:
-                QMessageBox.information(self, "入力エラー", str(exc))
-                return
-        else:
-            pages = list(range(total))
-        pages = [i for i in pages if 0 <= i < total]
+        try:
+            pages = select_pages(opt, self.doc.page_count, self.page_view.index)
+        except ValueError as exc:
+            QMessageBox.information(self, "入力エラー", str(exc))
+            return
         if not pages:
+            QMessageBox.information(
+                self, "印刷", "該当するページがありません（奇数/偶数の指定を確認してください）")
             return
 
         self._render_to_printer(printer, pages, opt)

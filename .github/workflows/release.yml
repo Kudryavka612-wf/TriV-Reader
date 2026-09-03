@@ -64,6 +64,7 @@ jobs:
           python session_test.py
           python links_test.py
           python tabs_test.py
+          python print_pages_test.py
 
       - name: ビルド（exe 化）
         run: python build_exe.py
