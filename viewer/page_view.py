@@ -327,9 +327,11 @@ TOOL_CIRCLE = "circle"
 TOOL_REDACT = "redact"
 TOOL_CROP = "crop"
 TOOL_STAMP = "stamp"    # クリックで枠付きテキストスタンプを置く
+TOOL_SNAPSHOT = "snapshot"  # 範囲をドラッグして画像としてコピー（注釈は作らない）
 
 # ドラッグ矩形系（始点・終点で矩形を作る）
-_RECT_TOOLS = {TOOL_HIGHLIGHT, TOOL_RECT, TOOL_TEXT, TOOL_CIRCLE, TOOL_REDACT, TOOL_CROP}
+_RECT_TOOLS = {TOOL_HIGHLIGHT, TOOL_RECT, TOOL_TEXT, TOOL_CIRCLE, TOOL_REDACT, TOOL_CROP,
+               TOOL_SNAPSHOT}
 # 始点→終点の線/テキストマーク系
 _LINE_TOOLS = {TOOL_LINE, TOOL_ARROW, TOOL_UNDERLINE, TOOL_STRIKEOUT}
 
@@ -395,6 +397,11 @@ class _PageLabel(QLabel):
         # マウスジェスチャー（右ボタンを押しながら動かす）
         self._gesture_from: QPoint | None = None
         self._skip_context_menu = False
+        # リンク（目次ジャンプ・URL）。押した位置のリンクを控え、動かさずに
+        # 離したときだけ辿る（ドラッグはテキスト選択として扱う）。
+        self.setMouseTracking(True)   # ボタンを押していなくても move が来る
+        self._press_link = None
+        self._hover_link = None
 
     def apply_theme(self, dark: bool) -> None:
         """紙（未描画時のプレースホルダ）の色をテーマに合わせる。"""
@@ -432,6 +439,13 @@ class _PageLabel(QLabel):
                     self._cur_box = box
                     self._press = pos
                     return
+            # リンクの上なら、まずリンクとして扱う（離したときに辿る）
+            link = self._view.link_at(self._index, pos)
+            if link is not None:
+                self._view.clear_selection()
+                self._press_link = (link, pos)
+                self._press = pos
+                return
             # 注釈に当たれば選択して移動、外れたらテキスト選択を開始
             xref = self._view.hit_annot(self._index, pos)
             if xref is not None:
@@ -460,6 +474,21 @@ class _PageLabel(QLabel):
         self._stroke = [pos]
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        pos = event.position().toPoint()
+        if self._press_link is not None:
+            # リンクの上で押したまま動かした → リンクではなくテキスト選択
+            if (pos - self._press).manhattanLength() > 4:
+                self._press_link = None
+                self._text_selecting = True
+                self._start = self._press
+                self._view.clear_text_selection()
+                self._view.begin_text_selection()
+            else:
+                return
+        if (self._view.tool == TOOL_NONE and not self._text_selecting
+                and not self._resizing and not self._sel_moving
+                and not self._drawing):
+            self._update_link_hover(pos)
         if self._text_selecting:
             self._view.update_text_selection_to(
                 self._index, self._start, event.globalPosition().toPoint()
@@ -486,6 +515,13 @@ class _PageLabel(QLabel):
             if self._finish_gesture(event.position().toPoint()):
                 event.accept()
                 return
+        if self._press_link is not None:
+            link, at = self._press_link
+            self._press_link = None
+            if (event.button() == Qt.MouseButton.LeftButton
+                    and (event.position().toPoint() - at).manhattanLength() <= 4):
+                self._view.link_activated.emit(dict(link))
+            return
         if self._text_selecting:
             self._text_selecting = False
             return
@@ -517,6 +553,29 @@ class _PageLabel(QLabel):
             self._view.commit_drag(self._index, self._start, self._cur, tool)
         self._stroke = []
         self.update()
+
+    def _update_link_hover(self, pos: QPoint) -> None:
+        """リンクの上ならカーソルを手にして、行き先をステータスバーへ出す。"""
+        link = self._view.link_at(self._index, pos)
+        if link is self._hover_link or (
+                link is not None and self._hover_link is not None
+                and link["rect"] == self._hover_link["rect"]):
+            return
+        self._hover_link = link
+        if link is not None:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._view.link_hovered.emit(link["label"])
+        else:
+            self.setCursor(Qt.CursorShape.IBeamCursor)
+            self._view.link_hovered.emit("")
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        if self._hover_link is not None:
+            self._hover_link = None
+            if self._view.tool == TOOL_NONE:
+                self.setCursor(Qt.CursorShape.IBeamCursor)
+            self._view.link_hovered.emit("")
+        super().leaveEvent(event)
 
     def _finish_gesture(self, pos: QPoint) -> bool:
         """右ドラッグの向きからジェスチャーを決める。動かした量が少なければ
@@ -564,7 +623,19 @@ class _PageLabel(QLabel):
                     lambda: view.search_requested.emit(view.selection_text()))
                 menu.addSeparator()
 
+        link = view.link_at(self._index, event.pos())
+        if link is not None:
+            if link["kind"] == "uri":
+                add("リンクを開く", lambda: view.link_activated.emit(dict(link)))
+                add("リンク先アドレスをコピー",
+                    lambda: view.copy_text_to_clipboard(link["uri"]))
+            elif link["kind"] == "goto":
+                add(link["label"], lambda: view.link_activated.emit(dict(link)))
+            menu.addSeparator()
+
         add("すべて選択", view.select_all_text)
+        add("このページを画像としてコピー",
+            lambda: view.copy_page_image(self._index))
         menu.addSeparator()
         add("幅に合わせる", view.fit_width)
         add("縦に合わせる", view.fit_height)
@@ -704,6 +775,11 @@ class _PageLabel(QLabel):
             painter.drawEllipse(rect)
         elif tool == TOOL_REDACT:
             painter.fillRect(rect, QColor(0, 0, 0, 160))
+        elif tool == TOOL_SNAPSHOT:
+            # 切り取り範囲：青の破線＋薄い塗り（注釈の色に左右されない）
+            painter.setPen(QPen(QColor(26, 115, 232), 1, Qt.PenStyle.DashLine))
+            painter.fillRect(rect, QColor(26, 115, 232, 28))
+            painter.drawRect(rect)
         elif tool == TOOL_RECT:
             painter.setOpacity(self._view.opacity)
             painter.setPen(QPen(QColor(color), max(1, self._view.pen_width), qt_dash))
@@ -813,6 +889,9 @@ class PageView(QScrollArea):
     gesture = Signal(str)   # マウスジェスチャー left/right/up/down
     search_requested = Signal(str)   # 右クリックメニューから検索
     rotate_requested = Signal(int)   # 右クリックメニューからページ回転(±90)
+    link_activated = Signal(dict)    # ページ内リンクをクリック（document.links の要素）
+    link_hovered = Signal(str)       # リンクの上にいる（行き先の説明。空文字=離れた）
+    snapshot_copied = Signal(int, int)  # 範囲を画像としてコピーした (幅px, 高さpx)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1088,6 +1167,14 @@ class PageView(QScrollArea):
         if tool == TOOL_STRIKEOUT:
             self._doc.add_strikeout(index, a, b, color=self._rgb())
             self._after_annot(index)
+            return
+
+        if tool == TOOL_SNAPSHOT:
+            r = QRect(p0, p1).normalized()
+            if r.width() < 4 or r.height() < 4:
+                return
+            self.copy_region_image(index, r.left(), r.top(), r.right() + 1,
+                                   r.bottom() + 1)
             return
 
         rect = self._doc.label_to_pdf_rect(
@@ -1465,6 +1552,47 @@ class PageView(QScrollArea):
         return sorted(self._text_sel)
 
     # --- 注釈の選択・移動・編集 ---------------------------------------
+    # --- リンク / スナップショット --------------------------------------
+    SNAPSHOT_DPI = 200   # クリップボードへ入れる画像の解像度（印刷しても粗くない）
+
+    def link_at(self, index: int, pos: QPoint):
+        """表示座標 pos にあるリンク（document.links の要素）。無ければ None。"""
+        if not self._doc or not self._doc.is_open:
+            return None
+        return self._doc.link_at(index, pos.x(), pos.y(), self._zoom)
+
+    def copy_region_image(self, index: int, x0: int, y0: int, x1: int, y1: int) -> bool:
+        """表示座標の矩形を画像にしてクリップボードへ入れる。"""
+        from PySide6.QtWidgets import QApplication
+
+        if not self._doc or not self._doc.is_open:
+            return False
+        try:
+            img = self._doc.snapshot_image(index, x0, y0, x1, y1, self._zoom,
+                                           dpi=self.SNAPSHOT_DPI)
+        except ValueError:
+            return False
+        QApplication.clipboard().setImage(img)
+        self.snapshot_copied.emit(img.width(), img.height())
+        return True
+
+    def copy_page_image(self, index: int) -> bool:
+        """ページ全体を画像にしてクリップボードへ入れる。"""
+        from PySide6.QtWidgets import QApplication
+
+        if not self._doc or not self._doc.is_open:
+            return False
+        img = self._doc.page_image(index, dpi=self.SNAPSHOT_DPI)
+        QApplication.clipboard().setImage(img)
+        self.snapshot_copied.emit(img.width(), img.height())
+        return True
+
+    @staticmethod
+    def copy_text_to_clipboard(text: str) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.clipboard().setText(text or "")
+
     def hit_annot(self, index: int, pos: QPoint):
         if not self._doc:
             return None

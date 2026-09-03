@@ -62,6 +62,7 @@ jobs:
           python robust_test.py
           python undo_test.py
           python session_test.py
+          python links_test.py
 
       - name: ビルド（exe 化）
         run: python build_exe.py

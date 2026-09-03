@@ -133,6 +133,9 @@ class PdfDocument:
         # ので、毎回 rawdict を解析すると重い。ページをまたぐ選択でも効くよう
         # 数ページ分を憶えておく。
         self._layout_cache: dict[int, tuple] = {}
+        # ページ内リンク（目次のジャンプ・URL）。ホバーのたびに get_links() を
+        # 呼ぶと重いので、ページごとに憶えておく。中身が変われば捨てる。
+        self._links_cache: dict[int, list] = {}
         # Undo/Redo。注釈（ページ単位のスナップショット）とページ操作
         # （文書まるごとのスナップショット）を 1 本の履歴にまとめて持つ。
         # 種類を混ぜても、時系列に戻すぶんには前後の状態が食い違わない。
@@ -165,6 +168,7 @@ class PdfDocument:
         self._render_bytes = 0
         self._fields_cache.clear()
         self._layout_cache.clear()
+        self._links_cache.clear()
 
     def _cache_render(self, key: tuple, pixmap: "QPixmap") -> None:
         """描画結果を LRU に入れ、上限を超えた分を古い順に捨てる。"""
@@ -798,6 +802,106 @@ class PdfDocument:
         xs = sorted([p0.x * zoom, p1.x * zoom])
         ys = sorted([p0.y * zoom, p1.y * zoom])
         return (xs[0], ys[0], xs[1], ys[1])
+
+    # --- リンク（目次ジャンプ・URL）-------------------------------------
+    # PyMuPDF の get_links() が返す "from" 矩形は「回転後のページ座標」なので、
+    # 表示座標 ÷ 倍率でそのまま当たり判定できる（注釈の unrotated 座標とは違う）。
+    def links(self, index: int) -> list:
+        """ページ内のリンク一覧。要素は dict:
+        {"rect": fitz.Rect, "kind": "goto"|"uri"|"named"|"file"|"other",
+         "page": int|None, "uri": str|None, "label": str}
+        """
+        if not self._doc:
+            return []
+        cached = self._links_cache.get(index)
+        if cached is not None:
+            return cached
+        out: list = []
+        try:
+            raw = self._doc.load_page(index).get_links()
+        except Exception:  # noqa: BLE001  壊れたリンク辞書は無視して続ける
+            raw = []
+        for lk in raw:
+            kind = lk.get("kind")
+            rect = lk.get("from")
+            if rect is None or rect.is_empty:
+                continue
+            item = {"rect": fitz.Rect(rect), "kind": "other", "page": None,
+                    "uri": None, "label": ""}
+            if kind == fitz.LINK_GOTO:
+                pno = lk.get("page", -1)
+                if pno is None or pno < 0:
+                    continue
+                item.update(kind="goto", page=int(pno),
+                            label=f"{int(pno) + 1} ページへ")
+            elif kind == fitz.LINK_URI:
+                uri = (lk.get("uri") or "").strip()
+                if not uri:
+                    continue
+                item.update(kind="uri", uri=uri, label=uri)
+            elif kind == fitz.LINK_NAMED:
+                name = lk.get("name") or lk.get("nameddest") or ""
+                pno = lk.get("page")
+                if pno is not None and pno >= 0:
+                    item.update(kind="goto", page=int(pno),
+                                label=f"{int(pno) + 1} ページへ")
+                else:
+                    item.update(kind="named", uri=str(name), label=str(name))
+            elif kind in (fitz.LINK_GOTOR, fitz.LINK_LAUNCH):
+                f = lk.get("file") or ""
+                item.update(kind="file", uri=str(f), label=f"別のファイル: {f}")
+            else:
+                continue
+            out.append(item)
+        self._links_cache[index] = out
+        return out
+
+    def link_at(self, index: int, x: float, y: float, zoom: float):
+        """表示(ラベル)座標にあるリンクを返す。無ければ None。"""
+        if not self._doc:
+            return None
+        pt = fitz.Point(x / zoom, y / zoom)
+        for lk in self.links(index):
+            if lk["rect"].contains(pt):
+                return lk
+        return None
+
+    def link_boxes_label(self, index: int, zoom: float) -> list:
+        """ページ内リンクの表示座標 (x0,y0,x1,y1) 一覧（ホバー表示用）。"""
+        return [(r.x0 * zoom, r.y0 * zoom, r.x1 * zoom, r.y1 * zoom)
+                for r in (lk["rect"] for lk in self.links(index))]
+
+    # --- スナップショット（範囲を画像に）--------------------------------
+    def snapshot_image(self, index: int, x0: float, y0: float, x1: float, y1: float,
+                       zoom: float, dpi: int = 200) -> "QImage":
+        """表示座標の矩形を dpi 相当の解像度で描いて QImage で返す。
+
+        矩形を渡さなければページ全体。画面の倍率に関係なく、貼り付け先で
+        粗くならない解像度で描く（get_pixmap の clip は回転後の座標）。
+        """
+        from PySide6.QtGui import QImage
+
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        page = self._doc.load_page(index)
+        clip = fitz.Rect(x0 / zoom, y0 / zoom, x1 / zoom, y1 / zoom)
+        clip.normalize()
+        clip &= page.rect
+        if clip.is_empty:
+            raise ValueError("範囲がページの外です")
+        scale = max(dpi, 72) / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip,
+                              alpha=False, colorspace=fitz.csRGB)
+        img = QImage(pix.samples, pix.width, pix.height, pix.stride,
+                     QImage.Format.Format_RGB888)
+        return img.copy()
+
+    def page_image(self, index: int, dpi: int = 200) -> "QImage":
+        """ページ全体を dpi 相当で描いた QImage（「ページを画像としてコピー」用）。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        r = self._doc.load_page(index).rect
+        return self.snapshot_image(index, r.x0, r.y0, r.x1, r.y1, 1.0, dpi)
 
     # --- フォーム（AcroForm 入力欄）------------------------------------
     def is_form(self) -> bool:
@@ -1871,6 +1975,26 @@ class PdfDocument:
         self._doc.save(
             out_path, encryption=fitz.PDF_ENCRYPT_NONE, garbage=3, deflate=True
         )
+
+    # --- 固定化（注釈・入力値を本文に焼き込む）---------------------------
+    def flatten_to(self, out_path: str, annots: bool = True,
+                   widgets: bool = True) -> None:
+        """注釈やフォームの入力値をページの絵の一部にして別名保存する。
+
+        相手に渡したあとで注釈を動かされたり入力欄を書き換えられたりしない
+        ようにする用途（届出書の控え・確定版）。開いている文書はそのまま
+        （編集可能なまま）で、複製に対して行う。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        if self.path and _same_path(self.path, out_path):
+            raise ValueError("開いているファイルとは別名で保存してください")
+        work = fitz.open("pdf", self._doc.tobytes())
+        try:
+            work.bake(annots=annots, widgets=widgets)
+            work.save(out_path, garbage=4, deflate=True)
+        finally:
+            work.close()
 
     # --- 検索 -----------------------------------------------------------
     def search(self, query: str, max_hits: int = 2000) -> list:

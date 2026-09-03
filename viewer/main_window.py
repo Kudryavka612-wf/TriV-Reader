@@ -45,6 +45,7 @@ from .page_view import PageView
 from .thumbnail_list import ThumbnailList
 from .mw_convert import ConvertMixin
 from .mw_print import PrintMixin
+from .mw_tools import ToolsMixin
 from .mw_update import UpdateMixin
 from .util import parse_ranges
 from .welcome import WelcomeWidget
@@ -103,7 +104,7 @@ class DocTab(QStackedWidget):
         self.addWidget(self.organizer)   # index 1
 
 
-class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
+class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("TriV-Reader")
@@ -171,6 +172,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         self._build_toolbar()
         self._build_annotation_toolbar()
         self._build_search_toolbar()
+        self._build_extra_actions()   # リンク履歴・全画面・ショートカット一覧など
         self._build_menubar()
         self._tighten_chrome()  # ツールバー/メニューの余白を詰める
         self._connect()
@@ -372,6 +374,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             return act
 
         self.act_tool_none = add_tool("選択", page_view.TOOL_NONE, checked=True)
+        self.act_tool_snapshot = add_tool("スナップショット", page_view.TOOL_SNAPSHOT)
         self.act_tool_highlight = add_tool("ハイライト", page_view.TOOL_HIGHLIGHT)
         self.act_tool_pen = add_tool("ペン", page_view.TOOL_PEN)
         self.act_tool_rect = add_tool("四角", page_view.TOOL_RECT)
@@ -572,18 +575,25 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         m_file.addAction(self.act_open_acrobat)
         m_file.addAction(self.act_set_default_pdf)
         m_file.addSeparator()
+        m_file.addAction(self.act_show_in_explorer)
+        m_file.addAction(self.act_copy_path)
+        m_file.addAction(self.act_close_others)
+        m_file.addAction(self.act_close_all)
+        m_file.addSeparator()
         m_file.addAction(self.act_compress_img)
         m_file.addAction(self.act_compress)
         m_file.addAction(self.act_export_pdfa)
         m_file.addSeparator()
         m_file.addAction(self.act_protect)
         m_file.addAction(self.act_unlock)
+        m_file.addAction(self.act_flatten)
         m_file.addSeparator()
         m_file.addAction(self.act_settings)
 
         m_view = mb.addMenu("表示(&V)")
         m_view.addAction(self.act_dark)
         m_view.addAction(self.act_compact)
+        m_view.addAction(self.act_fullscreen)
         m_view.addSeparator()
         # 左のページ一覧ドックの表示/非表示（消しても再表示できるように）
         self.act_toggle_pagedock = self.page_dock.toggleViewAction()
@@ -604,6 +614,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         m_view.addAction(self.act_toggle_annotbar)
         m_view.addSeparator()
         m_view.addAction(self.act_copy)
+        m_view.addAction(self.act_copy_page_image)
+        m_view.addSeparator()
+        m_view.addAction(self.act_nav_back)
+        m_view.addAction(self.act_nav_forward)
         m_view.addSeparator()
         m_view.addAction(self.act_prev)
         m_view.addAction(self.act_next)
@@ -665,6 +679,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         m_conv.addAction(self.act_diff)
 
         m_help = mb.addMenu("ヘルプ(&H)")
+        m_help.addAction(self.act_shortcuts)
         m_help.addAction(self.act_check_update)
         m_help.addAction(self.act_set_update_url)
         m_help.addSeparator()
@@ -747,6 +762,11 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             self.act_zoom_in: "拡大", self.act_zoom_out: "縮小",
             self.act_rotate_left: "左回転", self.act_rotate_right: "右回転",
             self.act_search_prev: "前", self.act_search_next: "次",
+            self.act_nav_back: "戻る", self.act_nav_forward: "進む",
+            self.act_shortcuts: "ショートカット",
+            self.act_flatten: "固定して保存",
+            self.act_copy_page_image: "ページを画像に",
+            self.act_show_in_explorer: "フォルダを開く",
         }
         for act, text in short.items():
             act.setIconText(text)
@@ -768,7 +788,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         recent_btn.setMenu(self.recent_menu)
         g.add_widget(recent_btn)
         g = r.add_group(p, "ページ移動")
-        g.add_stack([self.act_prev, self.act_next])
+        g.add_stack([self.act_prev, self.act_next,
+                     self.act_nav_back, self.act_nav_forward])
         # 現在ページの直接入力（例: 8 + Enter で 8 ページへ）
         self.page_edit = QLineEdit()
         self.page_edit.setFixedWidth(46)
@@ -834,6 +855,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         g.add_stack([self.act_undo, self.act_redo])
         g.add_stack([self.act_copy, self.act_paste])
         g.add_stack([self.act_apply_redact, self.act_clear_annots])
+        g.add_stack([self.act_copy_page_image])
         r.end_page(p)
 
         # ── ページ ──────────────────────────────────────────────
@@ -868,12 +890,14 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         g = r.add_group(p, "圧縮・最適化")
         g.add_action(self.act_compress_img, big=True)
         g.add_stack([self.act_compress, self.act_export_pdfa])
+        g = r.add_group(p, "配布用")
+        g.add_action(self.act_flatten, big=True)
         r.end_page(p)
 
         # ── 表示 ────────────────────────────────────────────────
         p = r.add_page("表示")
         g = r.add_group(p, "テーマ")
-        g.add_stack([self.act_dark, self.act_facing])
+        g.add_stack([self.act_dark, self.act_facing, self.act_fullscreen])
         g = r.add_group(p, "パネル")
         toc_toggle = self.toc_dock.toggleViewAction()
         toc_toggle.setIconText("しおり一覧")
@@ -885,7 +909,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         g = r.add_group(p, "しおり")
         g.add_stack([self.act_add_bookmark, self.act_edit_toc])
         g = r.add_group(p, "ヘルプ")
-        g.add_stack([self.act_settings, self.act_check_update,
+        g.add_stack([self.act_shortcuts, self.act_settings, self.act_check_update,
                      self.act_set_update_url, self.act_report_govform,
                      self.act_open_log, self.act_about])
         r.end_page(p)
@@ -963,6 +987,14 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             self.act_compress_img: "画像を縮小・再圧縮してファイルサイズを小さくする"
                                    "（文字や図形はそのまま）",
             self.act_compress: "画像はそのままに、不要な構造を削って軽くする（無劣化）",
+            self.act_nav_back: "リンクや目次で移動する前の位置へ戻る",
+            self.act_nav_forward: "戻る前の位置へ進む",
+            self.act_fullscreen: "リボンやパネルを隠して全画面で表示（Esc で戻る）",
+            self.act_shortcuts: "使えるキーボードショートカットの一覧",
+            self.act_flatten: "注釈やフォームの入力値をページに焼き込み、動かせない状態で別名保存",
+            self.act_copy_page_image: "現在のページを画像としてクリップボードへ（Word などに貼り付け）",
+            self.act_show_in_explorer: "このファイルのあるフォルダをエクスプローラーで開く",
+            self.act_copy_path: "このファイルのフルパスをコピー",
         }
         for act, tip in tips.items():
             seq = act.shortcut()
@@ -971,7 +1003,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             act.setStatusTip(tip)
         # ツール群のヒント
         tool_tips = {
-            page_view.TOOL_NONE: "選択：テキスト選択・注釈の選択/移動",
+            page_view.TOOL_NONE: "選択：テキスト選択・注釈の選択/移動・リンクのクリック",
+            page_view.TOOL_SNAPSHOT: "スナップショット：範囲をドラッグして画像としてコピー",
             page_view.TOOL_HIGHLIGHT: "文字をなぞってハイライト",
             page_view.TOOL_PEN: "フリーハンドで描画",
             page_view.TOOL_RECT: "四角を描く",
@@ -1043,11 +1076,17 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             self.act_toggle_pagedock: "▤",
             self.act_fill_enabled: "🪣", self.act_fill_color: "🎨",
             self.act_open_acrobat: "🅐", self.act_set_default_pdf: "⭐",
+            self.act_nav_back: "⬅", self.act_nav_forward: "➡",
+            self.act_fullscreen: "⛶", self.act_shortcuts: "⌨",
+            self.act_flatten: "📌", self.act_copy_page_image: "📷",
+            self.act_show_in_explorer: "📁", self.act_copy_path: "📋",
+            self.act_close_others: "✖", self.act_close_all: "✖",
         }
         for act, g in glyphs.items():
             act.setIcon(self._glyph_icon(g))
         tool_glyphs = {
-            page_view.TOOL_NONE: "🖱", page_view.TOOL_HIGHLIGHT: "🖍",
+            page_view.TOOL_NONE: "🖱", page_view.TOOL_SNAPSHOT: "📷",
+            page_view.TOOL_HIGHLIGHT: "🖍",
             page_view.TOOL_PEN: "✏", page_view.TOOL_RECT: "▭",
             page_view.TOOL_UNDERLINE: "U", page_view.TOOL_STRIKEOUT: "S",
             page_view.TOOL_LINE: "／", page_view.TOOL_ARROW: "↗",
@@ -1172,7 +1211,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         self.act_compress_img.triggered.connect(self.compress_document)
         self.act_compress.triggered.connect(self.compress_save)
         self.act_export_pdfa.triggered.connect(self.export_pdfa)
-        self.toc_dock.page_requested.connect(self._goto)
+        self.toc_dock.page_requested.connect(self.goto_with_history)
         self.annot_dock.annot_selected.connect(self._on_annot_list_selected)
         self.annot_dock.annot_delete_requested.connect(self._on_annot_list_delete)
         # 検索 / ページ番号
@@ -1291,6 +1330,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         pv.gesture.connect(self._on_gesture)
         pv.search_requested.connect(self._search_selection)
         pv.rotate_requested.connect(self._rotate)
+        self._connect_tools_signals(pv)   # リンク / スナップショット
         pv.set_gesture_enabled(prefs.value(self.settings, "gesture/enabled"))
         org.reordered.connect(self._reorder_from_organizer)
         org.delete_requested.connect(self._delete_pages)
@@ -1540,6 +1580,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
         tab.doc.close()
         if getattr(self, "_active_doctab", None) is tab:
             self._active_doctab = None
+        self._forget_tab_history(tab)
         self.tabs.removeTab(index)
         tab.deleteLater()
         if self.tabs.count() == 0:
@@ -1590,6 +1631,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             self._set_combo_data(self.line_end_combo, "none")
         if tool == page_view.TOOL_NONE:
             self.statusBar().clearMessage()
+        elif tool == page_view.TOOL_SNAPSHOT:
+            self.statusBar().showMessage(
+                "スナップショット: 画像にしたい範囲をドラッグすると"
+                "クリップボードへコピーします", 0)
         else:
             self.statusBar().showMessage(
                 f"注釈ツール: {action.text()}（ページ上でドラッグ/クリック）", 0
@@ -2914,9 +2959,16 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, QMainWindow):
             self.act_open_acrobat,
             self.act_facing,
             self.act_deskew,
+            self.act_flatten,
+            self.act_copy_page_image,
+            self.act_close_all,
             *self.tool_group.actions(),
         ):
             act.setEnabled(has)
+        has_path = bool(has and self.doc.path)
+        self.act_show_in_explorer.setEnabled(has_path)
+        self.act_copy_path.setEnabled(has_path)
+        self.act_close_others.setEnabled(self.tabs.count() > 1)
         self.width_spin.setEnabled(has)
         self.search_edit.setEnabled(has)
         # 画像→PDF は PDF を開いていなくても使える
