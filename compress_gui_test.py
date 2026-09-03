@@ -170,6 +170,7 @@ def main() -> int:  # noqa: C901
     orig_exec = CompressDialog.exec
     orig_save = mw_convert.QFileDialog.getSaveFileName
     orig_info = mw_convert.QMessageBox.information
+    orig_question = mw_convert.QMessageBox.question
 
     def fake_exec(self):
         self._radios["standard"].setChecked(True)
@@ -182,6 +183,10 @@ def main() -> int:  # noqa: C901
     mw_convert.QMessageBox.information = staticmethod(
         lambda parent, title, msg, *a, **k: shown.setdefault("msg", msg)
         or QMessageBox.StandardButton.Ok)
+    # 別名保存のあとは「開きますか？」と聞く（question）。ここでは開かない。
+    mw_convert.QMessageBox.question = staticmethod(
+        lambda parent, title, msg, *a, **k: shown.setdefault("msg", msg)
+        or QMessageBox.StandardButton.No)
     try:
         btn.click()  # 実際のリボンボタンから起動する
         app.processEvents()
@@ -189,6 +194,7 @@ def main() -> int:  # noqa: C901
         CompressDialog.exec = orig_exec
         mw_convert.QFileDialog.getSaveFileName = orig_save
         mw_convert.QMessageBox.information = orig_info
+        mw_convert.QMessageBox.question = orig_question
 
     assert os.path.exists(out), "圧縮ファイルが作られていない"
     after = os.path.getsize(out)

@@ -232,9 +232,21 @@ class ConvertMixin:
             QApplication.processEvents()
             return not prog.wasCanceled()
 
+        same_file = bool(src) and os.path.normcase(os.path.abspath(src)) == \
+            os.path.normcase(os.path.abspath(out))
+        # 「試算」と同じ設定なら、その成果物を保存先へ動かすだけで済ませる。
+        # 開いているファイル自身への上書きは、compress_to_advanced が
+        # 差し替えと開き直しを面倒みるので、そちらに任せる。
+        cached = None if same_file else dlg.take_cached(opts)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            stats = self.doc.compress_to_advanced(out, progress=progress, **opts)
+            if cached:
+                import shutil
+
+                shutil.move(cached[0], out)
+                stats = cached[1]
+            else:
+                stats = self.doc.compress_to_advanced(out, progress=progress, **opts)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "エラー", f"圧縮できませんでした:\n{exc}")
             return
@@ -264,7 +276,16 @@ class ConvertMixin:
         if before and after >= before:
             msg += ("\n\nこの PDF は画像がほとんど無いか、すでに圧縮済みのようです。"
                     "元のファイルをそのまま使うのがおすすめです。")
-        QMessageBox.information(self, "圧縮 完了", msg)
+        if same_file:
+            QMessageBox.information(self, "圧縮 完了", msg)
+            return
+        # 別名で保存したときは、その場で開いて仕上がりを確かめられるようにする
+        ret = QMessageBox.question(
+            self, "圧縮 完了", msg + "\n\n圧縮したファイルを開きますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret == QMessageBox.StandardButton.Yes:
+            self.open_path(out)
 
     def compress_save(self) -> None:
         if not self.doc.is_open:

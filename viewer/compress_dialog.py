@@ -129,9 +129,15 @@ class CompressDialog(QDialog):
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                                | QDialogButtonBox.StandardButton.Cancel)
         box.button(QDialogButtonBox.StandardButton.Ok).setText("圧縮して保存…")
+        box.button(QDialogButtonBox.StandardButton.Cancel).setText("キャンセル")
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
         root.addWidget(box)
+
+        # 試算の成果物。同じ設定で「圧縮して保存」を押したら、もう一度圧縮
+        # せずにこのファイルを保存先へ動かす（数百ページのスキャンで二度
+        # 待たされない）。{"key": 設定, "path": 一時ファイル, "stats": ...}
+        self._cache: dict | None = None
 
         self._group.buttonToggled.connect(lambda *_: self._sync())
         self._load()
@@ -189,9 +195,41 @@ class CompressDialog(QDialog):
         return {"max_dpi": dpi, "jpeg_quality": quality or 72,
                 "grayscale": self.gray.isChecked() and bool(dpi)}
 
+    # --- 試算の成果物（保存に使い回す） ------------------------------------
+    @staticmethod
+    def _cache_key(opts: dict) -> tuple:
+        return tuple(sorted(opts.items()))
+
+    def _drop_cache(self) -> None:
+        c, self._cache = self._cache, None
+        if c and os.path.exists(c["path"]):
+            try:
+                os.remove(c["path"])
+            except OSError:
+                pass
+
+    def take_cached(self, opts: dict):
+        """opts が試算と同じなら (一時ファイルのパス, stats) を渡して手放す。
+
+        呼び出し側がそのファイルを保存先へ移動する。違う設定なら None。
+        """
+        c = self._cache
+        if not c or c["key"] != self._cache_key(opts) or not os.path.exists(c["path"]):
+            return None
+        self._cache = None
+        return c["path"], c["stats"]
+
+    def done(self, result: int) -> None:
+        # 使われなかった試算ファイルを残さない（accept/reject/× のどれでも）
+        if result != QDialog.DialogCode.Accepted:
+            self._drop_cache()
+        super().done(result)
+
     # --- 試算 -----------------------------------------------------------
     def _estimate(self) -> None:
-        tmp = os.path.join(tempfile.gettempdir(), "_trivreader_estimate.pdf")
+        self._drop_cache()
+        fd, tmp = tempfile.mkstemp(prefix="_trivreader_estimate_", suffix=".pdf")
+        os.close(fd)
         dlg = QProgressDialog("試算中…", "キャンセル", 0, 100, self)
         dlg.setWindowTitle("試算")
         dlg.setMinimumDuration(0)
@@ -203,9 +241,9 @@ class CompressDialog(QDialog):
             return not dlg.wasCanceled()
 
         self.btn_estimate.setEnabled(False)
+        opts = self.options()
         try:
-            stats = self._doc.compress_to_advanced(
-                tmp, progress=progress, **self.options())
+            stats = self._doc.compress_to_advanced(tmp, progress=progress, **opts)
         except Exception as exc:  # noqa: BLE001
             self.result.setText(f"試算できませんでした: {exc}")
             return
@@ -216,11 +254,10 @@ class CompressDialog(QDialog):
             self.result.setText("試算を中止しました")
             return
         after = os.path.getsize(tmp) if os.path.exists(tmp) else 0
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        self.result.setText(self.describe(self._before, after, stats))
+        if after:
+            self._cache = {"key": self._cache_key(opts), "path": tmp, "stats": stats}
+        self.result.setText(self.describe(self._before, after, stats)
+                            + "　（この設定で保存すれば、試算の結果をそのまま使います）")
 
     @staticmethod
     def describe(before: int, after: int, stats: dict) -> str:
