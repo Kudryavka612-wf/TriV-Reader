@@ -103,8 +103,15 @@ def test_freetext(root: str) -> None:
     page = doc._doc.load_page(0)
     old = page.add_freetext_annot(fitz.Rect(20, 240, 380, 280), "旧版の注釈", fontsize=14)
     old.update()
-    check("(an old-style annotation really uses /Song)",
-          any(f[0] == "/Song" for f in ap_fonts(doc._doc, old.xref)))
+    old_fonts = ap_fonts(doc._doc, old.xref)
+    if any(f[0] == "/Song" for f in old_fonts):
+        check("(an old-style annotation really uses /Song)", True)
+    else:
+        # 和文フォントの無い PC（GitHub のビルド機）では MuPDF が /Song を書かない。
+        # 直す対象ができないだけなので、下の「保存すると中国語フォントが残らない」
+        # だけを確かめる
+        print(f"[SKIP] this machine does not write /Song for an old-style annotation "
+              f"{old_fonts}")
     out = os.path.join(root, "ft_out.pdf")
     doc.save_as(out)
     s2 = fitz.open(out)

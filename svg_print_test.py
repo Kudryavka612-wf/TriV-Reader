@@ -183,8 +183,10 @@ def main() -> int:
         shutil.rmtree(root, ignore_errors=True)
     ok = sum(results)
     print(f"\n==== {ok}/{len(results)} checks passed ====", flush=True)
-    os._exit(0 if ok == len(results) else 1)
+    # os._exit で抜けると、プリンターのドライバーを読み込んだまま終わるため
+    # ときどき終了時に落ちる（アプリの通常の終了では起きない）。普通に終える
+    return 0 if ok == len(results) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
