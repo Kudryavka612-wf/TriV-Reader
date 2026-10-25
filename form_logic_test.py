@@ -317,6 +317,19 @@ def test_history(app, w) -> None:
 
 def test_checks(app, w) -> None:
     from PySide6.QtGui import QInputMethodEvent
+
+    from viewer import form_history
+    # 入力候補の一覧は別に確かめる（PySide6 6.12 の画面なしの表示では、一覧が
+    # 閉じてもキーボードがウィンドウに戻らない。実際の Windows の画面では戻る）
+    form_history.set_enabled(False)
+    try:
+        _test_checks(app, w)
+    finally:
+        form_history.set_enabled(True)
+
+
+def _test_checks(app, w) -> None:
+    from PySide6.QtGui import QInputMethodEvent
     pv = w.page_view
     w.activateWindow()
     pv.set_page(0)
