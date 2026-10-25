@@ -39,7 +39,7 @@ from . import ocr, storage
 DEFAULTS: dict[str, object] = {
     # --- 全般 ---
     "startup/restore_session": False,  # 前回開いていたファイルを開き直す
-    "startup/resume_page": True,       # 前回見ていたページから開く
+    "startup/resume_mode": "ask",      # 前回見ていたページ（RESUME_CHOICES）
     "tray/resident": True,             # 閉じてもトレイに常駐
     "confirm_close": True,             # ウィンドウを閉じるときに尋ねる
     "recent/limit": 8,                 # 最近使ったファイルの記憶件数
@@ -58,7 +58,10 @@ DEFAULTS: dict[str, object] = {
     "annot_dock_visible": True,
     # --- 注釈 ---
     "annot/author": "",                # 注釈の作成者名（空なら書き込まない）
-    "annot/color": "#ffdb2e",   # 既存の初期色（黄色のハイライト）に合わせる
+    # 色はハイライトとそれ以外で分ける。以前は 1 色（黄）を共有していたため
+    # テキストや図形まで黄色で入った。旧キー annot/color は読まない。
+    "annot/ink_color": "#000000",       # 文字・図形・ペン・線
+    "annot/highlight_color": "#ffdb2e",  # ハイライト
     "annot/width": 2,
     "annot/opacity": 100,
     "annot/text_size": 14,
@@ -109,6 +112,26 @@ ZOOM_CHOICES = [
 ]
 
 
+# 「前回見ていたページ」の扱い。以前は自動で飛ぶだけ（オン/オフ）だったが、
+# 毎回勝手に戻られると困る、という声で「尋ねる」を既定にした。
+RESUME_CHOICES = [
+    ("ask", "開くたびにたずねる"),
+    ("always", "自動で続きから表示する"),
+    ("never", "常に先頭から表示する"),
+]
+
+
+def resume_mode(settings) -> str:
+    """前回見ていたページの扱い（ask/always/never）。旧設定のオフは never。"""
+    if settings.contains("startup/resume_mode"):
+        mode = value(settings, "startup/resume_mode")
+        return mode if mode in dict(RESUME_CHOICES) else "ask"
+    legacy = settings.value("startup/resume_page", None)
+    if legacy is not None and str(legacy).lower() in ("false", "0"):
+        return "never"
+    return "ask"
+
+
 def value(settings, key: str):
     """既定値の型で設定を読む（INI 保存でも bool/int が壊れないように）。"""
     default = DEFAULTS[key]
@@ -118,9 +141,13 @@ def value(settings, key: str):
         return default
 
 
+#: もう使っていない設定キー（初期値に戻すときに一緒に消す）
+LEGACY_KEYS = ("annot/color", "startup/resume_page")
+
+
 def reset_to_defaults(settings) -> None:
     """DEFAULTS にあるキーだけ消す（ウィンドウ位置や履歴は残す）。"""
-    for key in DEFAULTS:
+    for key in (*DEFAULTS, *LEGACY_KEYS):
         settings.remove(key)
 
 
@@ -180,9 +207,13 @@ class SettingsDialog(QDialog):
         w = QWidget()
         form = QFormLayout(w)
         self.cb_restore = QCheckBox("前回開いていたファイルを開き直す")
-        self.cb_resume_page = QCheckBox("前回見ていたページから開く")
-        self.cb_resume_page.setToolTip(
-            "ファイルごとに最後に見ていたページを憶えて、次に開いたときそこから表示します")
+        self.cmb_resume = QComboBox()
+        for key, label in RESUME_CHOICES:
+            self.cmb_resume.addItem(label, key)
+        self.cmb_resume.setToolTip(
+            "ファイルごとに最後に見ていたページを憶えています。\n"
+            "「たずねる」では先頭のまま開き、ページの上に［続きから表示］を出します")
+        self.cmb_resume.setMaximumWidth(240)
         self.cb_tray = QCheckBox("ウィンドウを閉じてもトレイに常駐する（次回の起動が速い）")
         self.cb_confirm_close = QCheckBox("ウィンドウを閉じるときに確認する")
         self.cb_gesture = QCheckBox("マウスジェスチャーを使う")
@@ -196,9 +227,9 @@ class SettingsDialog(QDialog):
         self.sp_recent.setMaximumWidth(120)
 
         form.addRow("起動時", self.cb_restore)
-        form.addRow("", self.cb_resume_page)
         form.addRow("", self.cb_tray)
         form.addRow("", self.cb_confirm_close)
+        form.addRow("前回見ていたページ", self.cmb_resume)
         form.addRow("マウス操作", self.cb_gesture)
 
         self.gesture_box = QGroupBox("ジェスチャーの割り当て")
@@ -258,8 +289,16 @@ class SettingsDialog(QDialog):
             "付箋やハイライトなどの注釈に記録される名前です（PDF の作成者欄）")
         self.btn_color = QPushButton()
         self.btn_color.setFixedWidth(120)
-        self.btn_color.clicked.connect(self._pick_color)
-        self._color = QColor(str(DEFAULTS["annot/color"]))
+        self.btn_color.clicked.connect(
+            lambda: self._pick_color(self.btn_color, "文字・図形の既定色"))
+        self.btn_hl_color = QPushButton()
+        self.btn_hl_color.setFixedWidth(120)
+        self.btn_hl_color.clicked.connect(
+            lambda: self._pick_color(self.btn_hl_color, "ハイライトの既定色"))
+        self._colors = {
+            self.btn_color: QColor(str(DEFAULTS["annot/ink_color"])),
+            self.btn_hl_color: QColor(str(DEFAULTS["annot/highlight_color"])),
+        }
         self.sp_width = QSpinBox()
         self.sp_width.setRange(1, 20)
         self.sp_width.setMaximumWidth(120)
@@ -274,7 +313,8 @@ class SettingsDialog(QDialog):
         self.sp_text.setSuffix(" pt")
 
         form.addRow("作成者名", self.ed_author)
-        form.addRow("既定の色", self._left(self.btn_color))
+        form.addRow("文字・図形の色", self._left(self.btn_color))
+        form.addRow("ハイライトの色", self._left(self.btn_hl_color))
         form.addRow("線の太さ", self.sp_width)
         form.addRow("不透明度", self.sp_opacity)
         form.addRow("文字サイズ", self.sp_text)
@@ -342,7 +382,8 @@ class SettingsDialog(QDialog):
     def _load(self) -> None:
         s = self.settings
         self.cb_restore.setChecked(value(s, "startup/restore_session"))
-        self.cb_resume_page.setChecked(value(s, "startup/resume_page"))
+        idx = self.cmb_resume.findData(resume_mode(s))
+        self.cmb_resume.setCurrentIndex(max(0, idx))
         self.cb_tray.setChecked(value(s, "tray/resident"))
         self.cb_confirm_close.setChecked(value(s, "confirm_close"))
         self.cb_gesture.setChecked(value(s, "gesture/enabled"))
@@ -363,7 +404,8 @@ class SettingsDialog(QDialog):
         self.cb_annot_dock.setChecked(value(s, "annot_dock_visible"))
 
         self.ed_author.setText(value(s, "annot/author"))
-        self._set_color(QColor(value(s, "annot/color")))
+        self._set_color(self.btn_color, QColor(value(s, "annot/ink_color")))
+        self._set_color(self.btn_hl_color, QColor(value(s, "annot/highlight_color")))
         self.sp_width.setValue(value(s, "annot/width"))
         self.sp_opacity.setValue(value(s, "annot/opacity"))
         self.sp_text.setValue(value(s, "annot/text_size"))
@@ -386,7 +428,7 @@ class SettingsDialog(QDialog):
     def _store(self) -> None:
         s = self.settings
         s.setValue("startup/restore_session", self.cb_restore.isChecked())
-        s.setValue("startup/resume_page", self.cb_resume_page.isChecked())
+        s.setValue("startup/resume_mode", self.cmb_resume.currentData())
         s.setValue("tray/resident", self.cb_tray.isChecked())
         s.setValue("confirm_close", self.cb_confirm_close.isChecked())
         s.setValue("gesture/enabled", self.cb_gesture.isChecked())
@@ -403,7 +445,8 @@ class SettingsDialog(QDialog):
         s.setValue("annot_dock_visible", self.cb_annot_dock.isChecked())
 
         s.setValue("annot/author", self.ed_author.text().strip())
-        s.setValue("annot/color", self._color.name())
+        s.setValue("annot/ink_color", self._colors[self.btn_color].name())
+        s.setValue("annot/highlight_color", self._colors[self.btn_hl_color].name())
         s.setValue("annot/width", self.sp_width.value())
         s.setValue("annot/opacity", self.sp_opacity.value())
         s.setValue("annot/text_size", self.sp_text.value())
@@ -444,17 +487,20 @@ class SettingsDialog(QDialog):
         self.gesture_box.setEnabled(bool(on))
 
     # --- 小物 -----------------------------------------------------------
-    def _set_color(self, col: QColor) -> None:
+    def _set_color(self, btn: QPushButton, col: QColor) -> None:
         if not col.isValid():
             return
-        self._color = col
-        self.btn_color.setStyleSheet(
-            f"background:{col.name()}; border:1px solid #888; min-height:22px;")
-        self.btn_color.setText(col.name())
+        self._colors[btn] = col
+        # 黒など暗い色でも色名が読めるよう、文字色を地の明るさで切り替える
+        fg = "#ffffff" if col.lightness() < 128 else "#000000"
+        btn.setStyleSheet(
+            f"background:{col.name()}; color:{fg}; border:1px solid #888;"
+            " min-height:22px;")
+        btn.setText(col.name())
 
-    def _pick_color(self) -> None:
-        col = QColorDialog.getColor(self._color, self, "注釈の既定色")
-        self._set_color(col)
+    def _pick_color(self, btn: QPushButton, title: str) -> None:
+        col = QColorDialog.getColor(self._colors[btn], self, title)
+        self._set_color(btn, col)
 
     def _clear_recent(self) -> None:
         self.settings.setValue("recent", [])

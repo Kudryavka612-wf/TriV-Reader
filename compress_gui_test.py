@@ -12,6 +12,8 @@ import sys
 import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 利用者本人の設定（レジストリ）を書き換えないよう、使い捨ての INI で動かす
+os.environ.setdefault("TRIVREADER_SETTINGS_INI", "throwaway")
 
 import fitz
 import numpy as np

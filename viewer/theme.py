@@ -371,6 +371,13 @@ def _qss(c: dict, arrows: dict[str, str] | None = None) -> str:
     #recentTile:hover {{ background: {c['accent_soft']}; border-color: {c['accent']}; }}
     #recentName {{ font-weight: 600; color: {c['text']}; }}
     #recentDir {{ color: {c['muted']}; font-size: 11px; }}
+
+    /* ── 前回の続きの案内（ページの上に浮かぶ）───────────── */
+    #resumeBar {{ background: {c['surface']}; border: 1px solid {c['border_strong']};
+        border-radius: 10px; }}
+    #resumeText {{ color: {c['text']}; background: transparent; }}
+    #resumeBar QPushButton {{ padding: 5px 14px; }}
+    #resumeBar QPushButton#primary {{ padding: 6px 16px; }}
     """
 
 

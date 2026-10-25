@@ -42,6 +42,9 @@ jobs:
 
       - name: テスト実行（失敗したらリリースしない）
         run: |
+          # 1 本でも落ちたらここで止める。pwsh は既定だと途中の python の失敗を
+          # 無視し、最後のコマンドの終了コードしか見ない。
+          $PSNativeCommandUseErrorActionPreference = $true
           python smoke_test.py
           python updater_test.py
           python govform_interact_test.py
@@ -66,6 +69,7 @@ jobs:
           python tabs_test.py
           python print_pages_test.py
           python compress_cache_test.py
+          python text_edit_test.py
 
       - name: ビルド（exe 化）
         run: python build_exe.py

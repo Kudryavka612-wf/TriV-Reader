@@ -44,6 +44,7 @@ class PrintMixin:
         """Adobe 風の印刷ダイアログ（プレビュー付き）で印刷する。"""
         if not self.doc.is_open:
             return
+        self.page_view.finish_text_edit()   # 打ちかけの文字も刷る
         from PySide6.QtPrintSupport import QPrinterInfo
 
         from .print_dialog import PrintDialog

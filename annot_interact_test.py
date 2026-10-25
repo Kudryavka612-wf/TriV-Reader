@@ -157,11 +157,13 @@ def main() -> int:
     drag(QPoint(40, 460), QPoint(300, 500))
     ed = pv._text_editor
     check("text tool opens an in-place editor", isinstance(ed, _TextAnnotEditor))
-    check("editor font follows text size", ed is not None and ed.font().pixelSize() == 24)
+    def _px(e):   # 入力欄の文字の大きさ（画面 px）。端数まで合わせて pt で持つ
+        return round(e.font().pointSizeF() * e.logicalDpiY() / 72.0, 1)
+    check("editor font follows text size", ed is not None and _px(ed) == 24)
     ed.setPlainText("メモ テスト")
     pv.set_text_size(30)   # live change while editing must not commit
     check("size change mid-edit keeps editing", pv._text_editor is ed
-          and ed.font().pixelSize() == 30)
+          and _px(ed) == 30)
     ed._finish()
     app.processEvents()
     ft = None

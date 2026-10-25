@@ -11,17 +11,22 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor,
     QCursor,
+    QFont,
     QFontMetrics,
     QKeySequence,
     QPainter,
     QPen,
     QPixmap,
     QPolygon,
+    QTextBlockFormat,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFrame,
     QGridLayout,
+    QHBoxLayout,
     QLabel,
     QLayout,
     QLineEdit,
@@ -29,11 +34,12 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QTextEdit,
     QWidget,
 )
 
 from . import theme
-from .document import _UNSET, PdfDocument
+from .document import _UNSET, FT_LINE, PdfDocument, ft_needed_size
 from .govform_js import SIMPLE_CALL_RE
 
 PAGE_SPACING = 16  # ページ間の余白(px)。落ち影が乗るので少し広めに取る
@@ -134,27 +140,171 @@ class _FormComboBox(QComboBox):
         p.end()
 
 
-class _TextAnnotEditor(QPlainTextEdit):
+class _TextAnnotEditor(QTextEdit):
     """テキスト注釈を「その場で」入力する編集ボックス。
 
-    入力した文字をそのまま見ながら打てる（モーダルのポップアップではない）。
-    確定＝ページ上をクリックして離れる / Ctrl+Enter。取消＝Esc または空のまま離脱。
-    ツールバー（サイズ・色）を触ったときは確定させず編集を続けられるようにする。
+    見たまま入ること（確定しても文字が跳ねない・切れない）を優先している。
+    - 余白 0・行送り 1.2 倍で、MuPDF が描く FreeText と同じ位置に文字が並ぶ
+      （以前は余白と枠で 1 文字近くずれ、確定した瞬間に左上へ跳ねていた）
+    - 打った分だけ広がる。クリックで置いた欄は横へ（ページの右端で折り返し）、
+      ドラッグで幅を決めた欄は下へ。枠の外に隠れて見えない文字が出ない
+    - 見えている折り返し位置を、そのまま確定後の改行にする（wrapped_lines）
+    - 背景は透明（新規）か、注釈を除いた紙面（既存の編集）。下の罫線や記入欄に
+      合わせて打てる
+    確定＝ページの別の場所をクリック / Esc / Ctrl+Enter。空のまま離れたら取消。
+    ツールバー（サイズ・色）を触ったときは確定させず編集を続けられる。
     """
 
     committed = Signal()
     cancelled = Signal()
 
-    def __init__(self, parent=None) -> None:
+    #: 1 行目のベースラインの位置（枠の上端から、文字サイズの何倍下か）。
+    #: MuPDF は経路によって 0.8 と 0.9 を使い分けるので、その間に置く。
+    BASELINE = 0.85
+    CARET_ROOM = 3   # 行末にカーソルが見える分の余白(px)
+
+    def __init__(self, parent, auto_width: bool) -> None:
         super().__init__(parent)
+        self.auto_width = auto_width   # True=クリックで置いた欄（横に伸びる）
+        self.setAcceptRichText(False)
+        self.setFrameShape(QFrame.Shape.NoFrame)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.FixedPixelWidth)
+        self.document().setDocumentMargin(0)
         self._done = False
+        self._px = 14.0
+        self._origin = (0.0, 0.0)   # 1 行目の枠の左上（ラベル座標）
+        self._wrap_w = 200
+        self._min_w = 0
+        self._min_h = 0
+        self._shift = 0.0           # 1 行目のベースラインを合わせるための上下補正
+        self._backdrop: QPixmap | None = None
+        self.document().contentsChanged.connect(self._schedule_fit)
 
+    # --- 見た目と大きさ ---------------------------------------------------
+    def configure(self, font, color: QColor, px: float, origin: tuple,
+                  wrap_w: float, min_w: float = 0, min_h: float = 0) -> None:
+        """文字・色・位置・折り返し幅を決める。IME の変換中には呼ばないこと
+        （setFont が変換を取り消す。[[project-trivreader-ime-defer]] と同じ罠）。"""
+        self._px = px
+        self._origin = origin
+        self._wrap_w = max(8, int(round(wrap_w)))
+        self._min_w = int(round(min_w))
+        self._min_h = int(round(min_h))
+        self.setFont(font)
+        self.document().setDefaultFont(font)
+        # アプリ全体の QSS が入力欄に余白と角丸を付けているので、ここで 0 に
+        # 戻す（残すと文字が枠の内側へ 9px ほどずれ、確定で跳ねる）
+        self.setStyleSheet(
+            "QTextEdit { background: transparent; border: 1px dashed #1a73e8;"
+            " border-radius: 0px; padding: 0px; margin: 0px;"
+            " color: rgb(%d,%d,%d); selection-background-color: rgba(26,115,232,90);"
+            " selection-color: rgb(%d,%d,%d); }"
+            % (color.red(), color.green(), color.blue(),
+               color.red(), color.green(), color.blue()))
+        self.setLineWrapColumnOrWidth(self._wrap_w)
+        self._apply_line_height()
+        self._shift = self.BASELINE * px - self._first_baseline()
+        self._fit()
+
+    def set_backdrop(self, pixmap: QPixmap | None) -> None:
+        """編集中の下地（注釈を除いたページの絵。ラベルと同じ大きさ）。"""
+        self._backdrop = pixmap
+        self.viewport().update()
+
+    def _apply_line_height(self) -> None:
+        cur = QTextCursor(self.document())
+        cur.select(QTextCursor.SelectionType.Document)
+        fmt = QTextBlockFormat()
+        fmt.setLineHeight(FT_LINE * self._px, 2)   # 2 = FixedHeight（行送り固定）
+        cur.mergeBlockFormat(fmt)
+
+    def _first_baseline(self) -> float:
+        doc = self.document()
+        doc.documentLayout().documentSize()   # 割り付けを確定させる
+        blk = doc.firstBlock()
+        lay = blk.layout()
+        if lay is None or lay.lineCount() == 0:
+            return self.BASELINE * self._px
+        line = lay.lineAt(0)
+        top = doc.documentLayout().blockBoundingRect(blk).y()
+        return top + line.y() + line.ascent()
+
+    def _schedule_fit(self) -> None:
+        # 入力の処理中に大きさを変えない（IME の確定を壊さないよう次の周回で）
+        QTimer.singleShot(0, self._fit_alive)
+
+    def _fit_alive(self) -> None:
+        try:
+            self._fit()
+        except RuntimeError:
+            pass   # 発火までに欄が破棄済み
+
+    def _fit(self) -> None:
+        """中身に合わせて欄を広げる（狭めるのは最初の大きさまで）。"""
+        doc = self.document()
+        size = doc.documentLayout().documentSize()
+        if self.auto_width:
+            w = min(max(doc.idealWidth(), self._min_w), self._wrap_w)
+        else:
+            w = max(self._wrap_w, self._min_w)
+        h = max(size.height(), self._min_h, FT_LINE * self._px)
+        x, y = self._origin
+        self.setGeometry(round(x) - 1, round(y + self._shift) - 1,
+                         int(w) + self.CARET_ROOM + 2, int(h + 0.999) + 2)
+        self.viewport().update()
+
+    def text_area_origin(self) -> QPoint:
+        """文字の左上（ラベル座標）。テスト・位置合わせ用。"""
+        return self.geometry().topLeft() + QPoint(1, 1)
+
+    def wrapped_lines(self) -> list[str]:
+        """画面で見えている行（折り返しを改行に置き換えたもの）。"""
+        out: list[str] = []
+        blk = self.document().begin()
+        while blk.isValid():
+            text = blk.text()
+            lay = blk.layout()
+            n = lay.lineCount() if lay is not None else 0
+            if n == 0:
+                out.append(text)
+            for i in range(n):
+                ln = lay.lineAt(i)
+                seg = text[ln.textStart(): ln.textStart() + ln.textLength()]
+                out.append(seg.rstrip(" ") if i < n - 1 else seg)
+            blk = blk.next()
+        return out
+
+    def setPlainText(self, text: str) -> None:  # noqa: N802 (Qt 命名)
+        super().setPlainText(text)
+        self._apply_line_height()   # 差し替えで行送りの指定が消えるため
+        self._fit()
+
+    def insertFromMimeData(self, source) -> None:  # noqa: N802 (Qt 命名)
+        # 貼り付けは書式を捨てて文字だけ（行送りの指定を保つ）
+        if source.hasText():
+            self.textCursor().insertText(source.text())
+            self._apply_line_height()
+
+    def inputMethodEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        super().inputMethodEvent(event)
+        self._schedule_fit()   # 変換中の文字が欄の外に隠れないように
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        if self._backdrop is not None:
+            p = QPainter(self.viewport())
+            off = self.viewport().mapTo(self.parentWidget(), QPoint(0, 0))
+            p.drawPixmap(-off.x(), -off.y(), self._backdrop)
+            p.end()
+        super().paintEvent(event)
+
+    # --- 確定 / 取消 ------------------------------------------------------
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:
-            self._done = True
-            self.cancelled.emit()
+            # Acrobat などと同じく Esc は「入力を終える」（消さない）。
+            # 以前は打った文字ごと捨てていた。
+            self._finish()
             return
         if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
                 and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
@@ -180,13 +330,12 @@ class _TextAnnotEditor(QPlainTextEdit):
         self._finish()
 
     def _finish(self) -> None:
+        # 空でも committed を出す（新規なら何も作らず、既存なら注釈を消す。
+        # 判断は受け取る側 PageView._commit_text_edit が持つ）
         if self._done:
             return
         self._done = True
-        if self.toPlainText().strip():
-            self.committed.emit()
-        else:
-            self.cancelled.emit()
+        self.committed.emit()
 
 
 class _CombLineEdit(QLineEdit):
@@ -383,6 +532,9 @@ class _PageLabel(QLabel):
         self._cur = QPoint()
         self._stroke: list[QPoint] = []  # ペン用
         self._sel_moving = False
+        self._move_started = False   # 押してから一定以上動かして、移動が始まった
+        self._markup_press = False   # ハイライト等の上で押した（動かせば文字選択）
+        self._markup_boxes: list = []  # ハイライト等のツールで塗られる文字の枠
         self._move_offset = QPoint()
         self._text_selecting = False
         self._resizing = False
@@ -427,10 +579,24 @@ class _PageLabel(QLabel):
             super().mousePressEvent(event)
             return
         pos = event.position().toPoint()
+        if self._view._text_editor is not None:
+            # 文字の入力中にページをクリックしたら、まずその入力を確定する。
+            # ページはフォーカスを取らないので、ここで閉じないと入力欄が開いた
+            # まま残り、次のドラッグで作った欄に打った文字ごと上書きされていた。
+            self._view._text_editor._finish()
+            event.accept()
+            return
+        if tool == TOOL_TEXT:
+            # テキストツールで既存のテキスト注釈を押したら、新しく作らずに直す
+            xref = self._view.hit_annot(self._index, pos)
+            if xref is not None and self._view.is_freetext(self._index, xref):
+                self._view.edit_text_annot(self._index, xref)
+                return
         if tool == TOOL_NONE:
-            # 選択中なら、まずリサイズハンドルの上か判定
+            # 選択中なら、まずリサイズハンドルの上か判定（文字に付いた注釈は
+            # 枠で伸縮するものではないのでハンドルを出さない）
             box = self._view.selection_box_label(self._index)
-            if box is not None:
+            if box is not None and not self._view.selection_is_markup():
                 handle = self._handle_at(pos, box)
                 if handle is not None:
                     self._resizing = True
@@ -450,9 +616,17 @@ class _PageLabel(QLabel):
             xref = self._view.hit_annot(self._index, pos)
             if xref is not None:
                 self._view.set_selection(self._index, xref)
-                self._sel_moving = True
-                self._start = pos
-                self._move_offset = QPoint()
+                self._press = pos
+                if self._view.selection_is_markup():
+                    # ハイライト・下線などは文字から動かすものではない。押した
+                    # まま動かしたら、その上の文字を選ぶ（以前は掴んで文字から
+                    # ずらしてしまい、ハイライトした所の文字が選べなかった）
+                    self._markup_press = True
+                else:
+                    self._sel_moving = True
+                    self._move_started = False
+                    self._start = pos
+                    self._move_offset = QPoint()
             else:
                 self._view.clear_selection()
                 # ダブルクリック直後の3回目なら行をまるごと選ぶ
@@ -472,9 +646,22 @@ class _PageLabel(QLabel):
         self._start = pos
         self._cur = pos
         self._stroke = [pos]
+        self._markup_boxes = []
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        from PySide6.QtWidgets import QApplication
+
         pos = event.position().toPoint()
+        if self._markup_press:
+            # ハイライト等の上で押して動かした → 注釈ではなく下の文字を選ぶ
+            if (pos - self._press).manhattanLength() < QApplication.startDragDistance():
+                return
+            self._markup_press = False
+            self._view.clear_selection()
+            self._text_selecting = True
+            self._start = self._press
+            self._view.clear_text_selection()
+            self._view.begin_text_selection()
         if self._press_link is not None:
             # リンクの上で押したまま動かした → リンクではなくテキスト選択
             if (pos - self._press).manhattanLength() > 4:
@@ -500,14 +687,26 @@ class _PageLabel(QLabel):
             self.update()
             return
         if self._sel_moving:
-            self._move_offset = event.position().toPoint() - self._start
+            d = pos - self._start
+            # 選ぶつもりのクリックで手が少し動いただけで注釈がずれないよう、
+            # OS のドラッグ開始距離を超えてから動かし始める
+            if (not self._move_started
+                    and d.manhattanLength() < QApplication.startDragDistance()):
+                return
+            self._move_started = True
+            self._move_offset = d
             self.update()
             return
         if not self._drawing:
             return
         self._cur = event.position().toPoint()
-        if self._view.tool == TOOL_PEN:
+        tool = self._view.tool
+        if tool == TOOL_PEN:
             self._stroke.append(self._cur)
+        elif tool in (TOOL_HIGHLIGHT, TOOL_UNDERLINE, TOOL_STRIKEOUT):
+            # 実際に付く範囲（なぞった文字）をその場で見せる
+            self._markup_boxes = self._view.text_boxes_between(
+                self._index, self._start, self._cur)
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
@@ -521,6 +720,9 @@ class _PageLabel(QLabel):
             if (event.button() == Qt.MouseButton.LeftButton
                     and (event.position().toPoint() - at).manhattanLength() <= 4):
                 self._view.link_activated.emit(dict(link))
+            return
+        if self._markup_press:   # ハイライト等をクリックしただけ（選択のみ）
+            self._markup_press = False
             return
         if self._text_selecting:
             self._text_selecting = False
@@ -538,8 +740,9 @@ class _PageLabel(QLabel):
         if self._sel_moving:
             self._sel_moving = False
             end = event.position().toPoint()
-            if (end - self._start).manhattanLength() > 3:
+            if self._move_started:
                 self._view.move_selection(self._index, self._start, end)
+            self._move_started = False
             self._move_offset = QPoint()
             self.update()
             return
@@ -547,11 +750,13 @@ class _PageLabel(QLabel):
             return
         self._drawing = False
         tool = self._view.tool
+        self._cur = event.position().toPoint()
         if tool == TOOL_PEN:
             self._view.commit_stroke(self._index, list(self._stroke))
         else:
             self._view.commit_drag(self._index, self._start, self._cur, tool)
         self._stroke = []
+        self._markup_boxes = []
         self.update()
 
     def _update_link_hover(self, pos: QPoint) -> None:
@@ -662,16 +867,22 @@ class _PageLabel(QLabel):
         if self._view.tool == TOOL_NONE and event.button() == Qt.MouseButton.LeftButton:
             pos = event.position().toPoint()
             xref = self._view.hit_annot(self._index, pos)
-            if xref is not None:
+            if xref is not None and not self._view.selection_is_markup():
                 self._view.set_selection(self._index, xref)
                 self._view.edit_selection_text()
                 return
+            if xref is not None:
+                self._view.clear_selection()   # ハイライトの上なら下の語を選ぶ
             # 注釈でなければ語を選ぶ（もう1回クリックすれば行選択）
             self._dclick_at = pos
             self._dclick_timer.restart()
             if self._view.select_word_at(self._index, pos):
                 event.accept()
                 return
+        if self._view.tool == TOOL_TEXT and event.button() == Qt.MouseButton.LeftButton:
+            # 既定の処理は 2 回目の押下として扱い、開いたばかりの入力欄を閉じてしまう
+            event.accept()
+            return
         super().mouseDoubleClickEvent(event)
 
     def _is_triple_click(self, pos: QPoint) -> bool:
@@ -717,6 +928,8 @@ class _PageLabel(QLabel):
             hp.end()
         # 選択中の注釈の枠（移動/リサイズプレビュー・ハンドル）
         if not self._drawing:
+            if self._view._text_editor is not None:
+                return   # 入力中は入力欄の枠だけ見せる（選択枠と重ねない）
             if self._resizing and self._cur_box is not None:
                 box = self._cur_box
             else:
@@ -731,22 +944,35 @@ class _PageLabel(QLabel):
             sp.setPen(QPen(QColor(26, 115, 232), 2, Qt.PenStyle.DashLine))
             sp.drawRect(rect)
             sp.fillRect(rect, QColor(26, 115, 232, 30))
-            # リサイズハンドル（白地に青枠の四角）
-            sp.setPen(QPen(QColor(26, 115, 232), 1, Qt.PenStyle.SolidLine))
-            for hx, hy in _handle_centers(box).values():
-                hr = QRect(int(hx - HANDLE_DRAW / 2), int(hy - HANDLE_DRAW / 2),
-                           HANDLE_DRAW, HANDLE_DRAW)
-                sp.fillRect(hr, QColor(255, 255, 255))
-                sp.drawRect(hr)
+            # リサイズハンドル（白地に青枠の四角）。文字に付いた注釈には出さない
+            if not self._view.selection_is_markup():
+                sp.setPen(QPen(QColor(26, 115, 232), 1, Qt.PenStyle.SolidLine))
+                for hx, hy in _handle_centers(box).values():
+                    hr = QRect(int(hx - HANDLE_DRAW / 2), int(hy - HANDLE_DRAW / 2),
+                               HANDLE_DRAW, HANDLE_DRAW)
+                    sp.fillRect(hr, QColor(255, 255, 255))
+                    sp.drawRect(hr)
             sp.end()
             return
         painter = QPainter(self)
-        color = self._view.color
         tool = self._view.tool
+        color = self._view.tool_color(tool)
         rect = QRect(self._start, self._cur).normalized()
         qt_dash = {"solid": Qt.PenStyle.SolidLine, "dashed": Qt.PenStyle.DashLine,
                    "dotted": Qt.PenStyle.DotLine}.get(self._view.line_style, Qt.PenStyle.SolidLine)
-        if tool in (TOOL_HIGHLIGHT, TOOL_UNDERLINE, TOOL_STRIKEOUT):
+        if tool in (TOOL_HIGHLIGHT, TOOL_UNDERLINE, TOOL_STRIKEOUT) and self._markup_boxes:
+            # 確定したときに付く文字の範囲そのものを見せる
+            for (x0, y0, x1, y1) in self._markup_boxes:
+                r = QRect(int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+                if tool == TOOL_HIGHLIGHT:
+                    fill = QColor(color)
+                    fill.setAlpha(round(110 * self._view.opacity))
+                    painter.fillRect(r, fill)
+                else:
+                    painter.setPen(QPen(QColor(color), 2))
+                    y = r.bottom() - 1 if tool == TOOL_UNDERLINE else r.center().y()
+                    painter.drawLine(r.left(), y, r.right(), y)
+        elif tool in (TOOL_HIGHLIGHT, TOOL_UNDERLINE, TOOL_STRIKEOUT):
             fill = QColor(color)
             fill.setAlpha(round(70 * self._view.opacity))
             painter.fillRect(rect, fill)
@@ -828,6 +1054,52 @@ class _PageLabel(QLabel):
             painter.drawPolygon(QPolygon(pts))
 
 
+class _ResumeBar(QFrame):
+    """「前回は N ページ目まで見ていました［続きから表示］」をページの上に浮かべる。
+
+    開いた文書を勝手に前回のページへ飛ばすのではなく、先頭のまま開いて、
+    続きを読みたいときだけ 1 クリックで飛べるようにする。モーダルの質問に
+    しないのは、起動時の復元などで何枚も開いたときに質問攻めにしないため。
+    レイアウトに挟まず浮かべるので、出し入れでページの倍率や位置は動かない。
+    """
+
+    def __init__(self, view: "PageView", page: int, total: int) -> None:
+        super().__init__(view)
+        self.setObjectName("resumeBar")
+        self._view = view
+        self.page = page
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 7, 8, 7)
+        lay.setSpacing(8)
+        text = QLabel(f"前回は {page + 1} ページ目（全 {total} ページ）まで見ていました")
+        text.setObjectName("resumeText")
+        self.btn_resume = QPushButton("続きから表示")
+        self.btn_resume.setObjectName("primary")
+        self.btn_close = QPushButton("閉じる")
+        for b in (self.btn_resume, self.btn_close):
+            # ページ側のキー操作（矢印・PageDown）を奪わない
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_resume.clicked.connect(self._resume)
+        self.btn_close.clicked.connect(self.dismiss)
+        lay.addWidget(text)
+        lay.addSpacing(6)
+        lay.addWidget(self.btn_resume)
+        lay.addWidget(self.btn_close)
+        self.adjustSize()
+
+    def _resume(self) -> None:
+        view, page = self._view, self.page
+        self.dismiss()
+        view.set_page(page)
+
+    def dismiss(self) -> None:
+        if self._view._resume_bar is self:
+            self._view._resume_bar = None
+        self.hide()
+        self.deleteLater()
+
+
 class _PageCanvas(QWidget):
     """ページを並べる土台。背景色と、各ページの落ち影を描く。
 
@@ -854,6 +1126,15 @@ class _PageCanvas(QWidget):
         self._shadow = QColor(r, g, b)
         self._shadow_alpha = alpha
         self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        # ページの外（灰色の地）をクリックしても、文字の入力は確定させる
+        ed = self._view._text_editor
+        if ed is not None and event.button() == Qt.MouseButton.LeftButton:
+            ed._finish()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         p = QPainter(self)
@@ -938,10 +1219,14 @@ class PageView(QScrollArea):
         self._fit_mode: str | None = None
         self._fit_page_size: tuple | None = None
         self._in_fit = False
+        self._resume_bar: _ResumeBar | None = None   # 「前回の続き」の案内
 
         # 注釈ツールの状態
         self.tool = TOOL_NONE
-        self.color = QColor(255, 219, 46)   # 既定はハイライト用の黄
+        # 色はハイライトとそれ以外で分けて持つ。1 色を共有していた頃は、黄色の
+        # ハイライトの後にテキストを入れると黄色い文字になっていた。
+        self.color = QColor(0, 0, 0)                  # 文字・図形・ペンなど
+        self.highlight_color = QColor(255, 219, 46)   # ハイライト
         self.pen_width = 2
         self.line_style = "solid"    # solid / dashed / dotted
         self.line_start = "none"     # 直線・矢印の始点スタイル（LINE_END_STYLES のキー）
@@ -988,6 +1273,7 @@ class PageView(QScrollArea):
 
     # --- 公開 API -------------------------------------------------------
     def set_document(self, doc: PdfDocument) -> None:
+        self.dismiss_resume_offer()
         self._doc = doc
         self._index = 0
         self._zoom = 1.0
@@ -1018,6 +1304,42 @@ class PageView(QScrollArea):
     def zoom(self) -> float:
         return self._zoom
 
+    def fit_mode(self) -> str | None:
+        """"width"（幅に合わせる）/ "height"（縦に合わせる）/ None（手動倍率）。"""
+        return self._fit_mode
+
+    # --- 前回の続き -------------------------------------------------------
+    def show_resume_offer(self, page: int) -> None:
+        """前回見ていたページへ飛ぶかを、ページの上に浮かべた案内で尋ねる。"""
+        self.dismiss_resume_offer()
+        if not self._doc or not self._doc.is_open:
+            return
+        page = max(0, min(page, self._doc.page_count - 1))
+        if page <= 0:
+            return
+        self._resume_bar = _ResumeBar(self, page, self._doc.page_count)
+        self._place_resume_bar()
+        self._resume_bar.show()
+        self._resume_bar.raise_()
+
+    def resume_offer_page(self) -> int | None:
+        """案内を出しているなら、その飛び先のページ番号（0 始まり）。"""
+        return self._resume_bar.page if self._resume_bar is not None else None
+
+    def dismiss_resume_offer(self) -> None:
+        if self._resume_bar is not None:
+            self._resume_bar.dismiss()
+
+    def _place_resume_bar(self) -> None:
+        bar = self._resume_bar
+        if bar is None:
+            return
+        vp = self.viewport().geometry()
+        bar.adjustSize()
+        w = min(bar.sizeHint().width(), max(120, vp.width() - 24))
+        bar.setGeometry(vp.x() + (vp.width() - w) // 2, vp.y() + 12,
+                        w, bar.sizeHint().height())
+
     def apply_theme(self, dark: bool) -> None:
         """ページ周辺の背景・落ち影・紙の色をテーマに合わせる。"""
         self._dark = dark
@@ -1042,15 +1364,28 @@ class PageView(QScrollArea):
             TOOL_ERASE: Qt.CursorShape.PointingHandCursor,
             # 選択モードはテキスト選択ができることを示す I ビームカーソル
             TOOL_NONE: Qt.CursorShape.IBeamCursor,
+            # テキストはクリックした所から打てるので、文字入力のカーソル
+            TOOL_TEXT: Qt.CursorShape.IBeamCursor,
         }.get(tool, Qt.CursorShape.CrossCursor)
         for lbl in self._labels:
             lbl.setCursor(cursor)
 
     def set_color(self, qcolor: QColor) -> None:
-        self.color = qcolor
+        """文字・図形・ペンなど（ハイライト以外）の色。"""
+        self.color = QColor(qcolor)
         # その場入力中なら文字色を即反映（「入力しながら色を変える」）。
         if self._text_editor is not None:
+            if self._text_ctx is not None:
+                self._text_ctx["color"] = QColor(qcolor)
             self._apply_text_editor_style()
+
+    def set_highlight_color(self, qcolor: QColor) -> None:
+        self.highlight_color = QColor(qcolor)
+
+    def tool_color(self, tool: str | None = None) -> QColor:
+        """そのツールで描くときの色（ハイライトだけ別の色を持つ）。"""
+        tool = self.tool if tool is None else tool
+        return self.highlight_color if tool == TOOL_HIGHLIGHT else self.color
 
     def set_text_size(self, size: int) -> None:
         self.text_size = max(6, int(size))
@@ -1127,8 +1462,8 @@ class PageView(QScrollArea):
         self.opacity = max(0.05, min(1.0, float(opacity)))
         self.restyle_selection(opacity=self.opacity)
 
-    def _rgb(self) -> tuple:
-        c = self.color
+    def _rgb(self, tool: str | None = None) -> tuple:
+        c = self.tool_color(tool)
         return (c.redF(), c.greenF(), c.blueF())
 
     def _fill_rgb(self):
@@ -1177,17 +1512,41 @@ class PageView(QScrollArea):
                                    r.bottom() + 1)
             return
 
+        if tool == TOOL_TEXT:
+            # モーダルではなく、その場で打てる編集ボックスを重ねる。ほぼ動かさずに
+            # 離したら「その位置から打つ」（打った分だけ横に伸びる）、ドラッグなら
+            # その幅で折り返す欄にする。
+            z = self._zoom
+            if abs(p1.x() - p0.x()) < 12:
+                self._begin_text_edit(index, (p0.x() / z, p0.y() / z), click=True)
+            else:
+                x0, y0 = min(p0.x(), p1.x()) / z, min(p0.y(), p1.y()) / z
+                self._begin_text_edit(
+                    index, (x0, y0), box_w=abs(p1.x() - p0.x()) / z,
+                    min_h=abs(p1.y() - p0.y()) / z)
+            return
+
         rect = self._doc.label_to_pdf_rect(
             index, p0.x(), p0.y(), p1.x(), p1.y(), self._zoom
         )
+        if tool == TOOL_HIGHLIGHT:
+            # なぞった範囲の文字を 1 文字単位で塗る（以前は「語」単位で、区切りの
+            # 無い日本語だと行ごと塗られた）。文字が無い所（スキャン画像など）は
+            # ドラッグした四角を塗る。
+            _text, rects = self._doc.select_text(index, a, b)
+            if rects:
+                self._doc.markup_rects(index, rects, "highlight", self._rgb(tool),
+                                       opacity=self.opacity)
+            elif rect.width >= 2 and rect.height >= 2:
+                self._doc.add_highlight(index, rect, color=self._rgb(tool),
+                                        opacity=self.opacity)
+            else:
+                return
+            self._after_annot(index)
+            return
         if rect.width < 2 or rect.height < 2:
             return  # 誤クリックの極小矩形は無視
-        if tool == TOOL_HIGHLIGHT:
-            if not self._doc.add_text_highlight(index, a, b, color=self._rgb(),
-                                                opacity=self.opacity):
-                self._doc.add_highlight(index, rect, color=self._rgb(),
-                                        opacity=self.opacity)
-        elif tool == TOOL_RECT:
+        if tool == TOOL_RECT:
             self._doc.add_rect(index, rect, color=self._rgb(), width=self.pen_width,
                                fill=self._fill_rgb(), dashes=self._dashes(),
                                opacity=self.opacity)
@@ -1201,104 +1560,161 @@ class PageView(QScrollArea):
             self._doc.set_crop(index, rect)
             self.reload(index)  # ページサイズが変わるので再構築
             return
-        elif tool == TOOL_TEXT:
-            # モーダルではなく、その場で打てる編集ボックスを重ねる。
-            self._begin_text_edit(index, rect, p0, p1)
-            return
         self._after_annot(index)
 
     # --- テキスト注釈のその場入力 --------------------------------------
-    def _begin_text_edit(self, index: int, pdf_rect, p0: QPoint, p1: QPoint) -> None:
-        """ドラッグした矩形の位置に編集ボックスを出し、打った文字をそのまま
-        見ながら入力できるようにする。確定で FreeText 注釈にする。"""
-        self._discard_text_editor()
-        label = self._labels[index]
-        ed = _TextAnnotEditor(label)
-        x0, y0 = min(p0.x(), p1.x()), min(p0.y(), p1.y())
-        x1, y1 = max(p0.x(), p1.x()), max(p0.y(), p1.y())
-        ed.setGeometry(int(x0), int(y0), max(40, int(x1 - x0)), max(24, int(y1 - y0)))
-        self._text_editor = ed
-        self._text_ctx = {"index": index, "rect": pdf_rect, "xref": None}
-        self._apply_text_editor_style()
-        ed.committed.connect(self._commit_text_edit)
-        ed.cancelled.connect(self._discard_text_editor)
-        ed.show()
-        ed.setFocus()
+    #: 入力欄の字形。欧文は MuPDF の基本 14 フォントと字幅が同じもの、和文は
+    #: MuPDF が描くのに近いゴシック（どれも全角 1 em なので折り返しが揃う）
+    _EDITOR_FAMILIES = {"helv": "Arial", "tiro": "Times New Roman",
+                        "cour": "Courier New"}
+    # 「UI」の付く方はかなが詰まる（プロポーショナル）ので使わない
+    _EDITOR_JA = ["Yu Gothic", "Meiryo", "MS Gothic"]
+
+    def _begin_text_edit(self, index: int, at: tuple, *, click: bool = False,
+                         box_w: float | None = None, min_h: float = 0.0) -> None:
+        """新しいテキストを打つ欄を出す。座標はページの pt（表示の向き）。
+
+        click=True はクリックした位置から打つ欄（打った分だけ横に伸びる。
+        カーソルの縦の真ん中がクリック位置に来るよう少し上に置く）。それ以外は
+        ドラッグした幅 box_w で折り返す欄。確定で FreeText 注釈にする。
+        """
+        x, y = at
+        if click:
+            y = max(0.0, y - FT_LINE * self.text_size / 2)
+            box_w = None
+        self._open_text_editor(index, (x, y), box_w=box_w, min_h=min_h)
 
     def _begin_text_edit_existing(self, index: int, xref) -> None:
         """既存のテキスト注釈（FreeText）を、その場の編集ボックスで直接編集する。
 
         別ウィンドウ（ダイアログ）を開かず、注釈の位置に本文を載せて編集できる。
-        確定（外側クリック / Ctrl+Enter）で本文を書き戻す。Esc で取消。
+        確定（外側クリック / Esc / Ctrl+Enter）で本文を書き戻す。
         """
         if not self._doc:
             return
-        rect = self._doc.annot_rect(index, xref)
-        if rect is None:
+        desc = self._doc.describe_annot(index, xref)
+        if not desc or desc.get("kind") != "FreeText":
             return
-        self._discard_text_editor()
+        if (self._sel_index, self._sel_xref) != (index, xref):
+            # 選んでおくと、ツールバーの文字サイズ・フォントがこの注釈に揃う
+            self.set_selection(index, xref)
         style = self._doc.annot_textstyle(index, xref) or {}
-        x0, y0, x1, y1 = self._doc.pdf_rect_to_label(index, rect, self._zoom)
-        label = self._labels[index]
-        ed = _TextAnnotEditor(label)
-        ed.setGeometry(int(x0), int(y0), max(40, int(x1 - x0)), max(24, int(y1 - y0)))
-        ed.setPlainText(self._doc.annot_text(index, xref))
+        self.text_size = max(4, int(round(style.get("fontsize") or self.text_size)))
+        self.text_font = style.get("fontname") or self.text_font
+        x0, y0, x1, y1 = self._doc.pdf_rect_to_label(index, desc["rect"], 1.0)
         tc = style.get("text_color") or (0.0, 0.0, 0.0)
+        # こちらで折り返しを入れていない（クリックで置いた）注釈は、直すときも
+        # 横に伸びる欄で開く。幅を決めて作った注釈は、その幅で折り返す。
+        soft_wrapped = desc.get("soft", "") != desc.get("content", "")
+        self._open_text_editor(
+            index, (x0, y0),
+            box_w=(x1 - x0) if soft_wrapped else None,
+            min_h=(y1 - y0) if soft_wrapped else 0.0,
+            text=desc.get("soft", ""), xref=xref,
+            color=QColor.fromRgbF(*[max(0.0, min(1.0, v)) for v in tc[:3]]))
+
+    def edit_text_annot(self, index: int, xref) -> None:
+        """テキスト注釈をその場で編集する（テキストツールでクリックしたとき）。"""
+        self._begin_text_edit_existing(index, xref)
+
+    def finish_text_edit(self) -> None:
+        """入力中の文字があれば確定させる（保存・印刷・タブを閉じる前に呼ぶ）。"""
+        if self._text_editor is not None:
+            self._text_editor._finish()
+
+    def _open_text_editor(self, index: int, origin: tuple, *, box_w=None,
+                          min_h: float = 0.0, text: str = "", xref=None,
+                          color: QColor | None = None) -> None:
+        if self._text_editor is not None:
+            self._text_editor._finish()   # 前の入力は捨てずに確定させる
+        if not (0 <= index < len(self._labels)):
+            return
+        ed = _TextAnnotEditor(self._labels[index], auto_width=box_w is None)
         self._text_editor = ed
-        self._text_ctx = {
-            "index": index, "rect": rect, "xref": xref,
-            "color": QColor(int(tc[0] * 255), int(tc[1] * 255), int(tc[2] * 255)),
-        }
+        self._text_ctx = {"index": index, "xref": xref, "color": color,
+                          "origin": origin, "box_w": box_w, "min_h": min_h}
         self._apply_text_editor_style()
+        if xref is not None:
+            # 直す前の注釈が下に透けて二重に見えないよう、注釈を除いた紙面を敷く
+            try:
+                ed.set_backdrop(self._doc.render_page_without_annots(index, self._zoom))
+            except Exception:  # noqa: BLE001  下地が無くても編集はできる
+                pass
+        if text:
+            ed.setPlainText(text)
         ed.committed.connect(self._commit_text_edit)
         ed.cancelled.connect(self._discard_text_editor)
         ed.show()
+        ed.raise_()
         ed.setFocus()
         cur = ed.textCursor()
-        cur.movePosition(cur.MoveOperation.End)
+        cur.movePosition(QTextCursor.MoveOperation.End)
         ed.setTextCursor(cur)
 
     def _apply_text_editor_style(self) -> None:
-        ed = self._text_editor
-        if ed is None:
+        """入力欄の文字・色・位置を、今の倍率と設定に合わせる。"""
+        ed, ctx = self._text_editor, self._text_ctx
+        if ed is None or ctx is None:
             return
+        z = self._zoom
+        px = max(4.0, self.text_size * z)
+        f = QFont(ed.font())
+        f.setFamilies([self._EDITOR_FAMILIES.get(self.text_font, "Arial"),
+                       *self._EDITOR_JA])
+        # 端数まで合わせる（整数 px に丸めると 1 行で数 px ずれ、確定後の方が
+        # 長く見える）。ヒンティングも切って MuPDF の字幅に寄せる。
+        f.setPointSizeF(px * 72.0 / max(1, ed.logicalDpiY()))
+        f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
         # 既存注釈の編集中はその注釈の文字色、新規はツールバーの色
-        c = self.color
-        if self._text_ctx and self._text_ctx.get("color") is not None:
-            c = self._text_ctx["color"]
-        px = max(8, int(self.text_size * self._zoom))
-        f = ed.font()
-        f.setPixelSize(px)
-        f.setFamily({"tiro": "Times New Roman", "cour": "Courier New"}
-                    .get(self.text_font, "Arial"))
-        ed.setFont(f)
-        ed.setStyleSheet(
-            "QPlainTextEdit { background: rgba(255,255,255,235);"
-            " border: 1px dashed #1a73e8;"
-            " color: rgb(%d,%d,%d); }" % (c.red(), c.green(), c.blue()))
+        color = ctx.get("color") or self.color
+        label = self._labels[ctx["index"]]
+        ox, oy = ctx["origin"][0] * z, ctx["origin"][1] * z
+        if ctx["box_w"] is None:
+            wrap_w = max(px, label.width() - ox - _TextAnnotEditor.CARET_ROOM - 4)
+            min_w = px
+        else:
+            wrap_w = min_w = ctx["box_w"] * z
+        ed.configure(f, color, px, (ox, oy), wrap_w, min_w, ctx["min_h"] * z)
 
     def _commit_text_edit(self) -> None:
-        if self._text_editor is None or self._text_ctx is None:
+        ed, ctx = self._text_editor, self._text_ctx
+        if ed is None or ctx is None:
             return
-        text = self._text_editor.toPlainText()
-        ctx = self._text_ctx
-        index = ctx["index"]
+        soft = ed.toPlainText()
+        lines = ed.wrapped_lines()
         self._discard_text_editor()
-        if not text.strip() or not self._doc:
+        if not self._doc or not self._doc.is_open:
             return
-        if ctx.get("xref") is not None:
-            # 既存注釈の本文を書き換え。編集中にサイズ変更等で xref が
-            # 変わっている場合は選択中の xref（最新）を優先する。
-            xref = ctx["xref"]
-            if self._sel_index == index and self._sel_xref is not None:
-                xref = self._sel_xref
-            new_xref = self._doc.set_annot_text(index, xref, text)
+        index, xref = ctx["index"], ctx.get("xref")
+        if xref is not None and self._sel_index == index and self._sel_xref is not None:
+            # 編集中にサイズ変更等で作り直されていたら、選択中の xref（最新）を使う
+            xref = self._sel_xref
+        if not soft.strip():
+            if xref is not None:   # 中身を全部消して確定した = 注釈ごと消す
+                self.clear_selection()
+                self._doc.delete_annot_xref(index, xref)
+                self._after_annot(index)
+            return
+        fs, fn = self.text_size, self.text_font
+        wrapped = "\n".join(lines)
+        need_w, need_h = ft_needed_size(wrapped, fs, fn)
+        x, y = ctx["origin"]
+        w = need_w + 1 if ctx["box_w"] is None else max(ctx["box_w"], need_w)
+        h = max(ctx["min_h"], need_h)
+        rect = self._doc.label_to_pdf_rect(index, x, y, x + w, y + h, 1.0)
+        c = ctx.get("color") or self.color
+        rgb = (c.redF(), c.greenF(), c.blueF())
+        if xref is None:
+            self._doc.add_freetext(index, rect, soft, color=rgb, fontsize=fs,
+                                   fontname=fn, wrapped=wrapped)
+        else:
+            new_xref = self._doc.set_annot_text(
+                index, xref, soft, wrapped=wrapped, rect=rect, color=rgb,
+                fontsize=fs, fontname=fn)
             if new_xref is not None and self._sel_index == index:
                 self._sel_xref = new_xref
-        else:
-            self._doc.add_freetext(index, ctx["rect"], text,
-                                   color=self._rgb(), fontsize=self.text_size,
-                                   fontname=self.text_font)
+            if self.tool != TOOL_NONE:
+                self.clear_selection()   # テキストツールでは選択枠を残さない
         self._after_annot(index)
 
     def _discard_text_editor(self) -> None:
@@ -1306,6 +1722,7 @@ class PageView(QScrollArea):
         self._text_editor = None
         self._text_ctx = None
         if ed is not None:
+            ed._done = True
             ed.setParent(None)
             ed.deleteLater()
 
@@ -1330,7 +1747,13 @@ class PageView(QScrollArea):
             self._doc.add_text_note(index, pt, text)
             self._after_annot(index)
         elif tool == TOOL_ERASE:
-            if self._doc.delete_annot_at(index, pt):
+            # 掴むときと同じく形どおりに判定する（外接矩形の空白では消さない）。
+            # 消しゴムはこすって消す道具なので、外れの許し幅は倍にする。
+            xref = self.hit_annot(index, p, slop=self.HIT_PX * 2)
+            if xref is not None:
+                if self._sel_index == index and self._sel_xref == xref:
+                    self.clear_selection()
+                self._doc.delete_annot_xref(index, xref)
                 self._after_annot(index)
         elif tool == TOOL_STAMP and self.pending_stamp:
             s = self.pending_stamp
@@ -1477,7 +1900,7 @@ class PageView(QScrollArea):
         """選択中のテキストにハイライト/下線/取消線を付ける。"""
         if not self._doc or not self._text_sel:
             return False
-        color = (self.color.redF(), self.color.greenF(), self.color.blueF())
+        color = self._rgb(TOOL_HIGHLIGHT if kind == "highlight" else TOOL_UNDERLINE)
         done = False
         for index, rects in sorted(self._text_sel.items()):
             if self._doc.markup_rects(index, rects, kind, color):
@@ -1593,11 +2016,44 @@ class PageView(QScrollArea):
 
         QApplication.clipboard().setText(text or "")
 
-    def hit_annot(self, index: int, pos: QPoint):
+    #: 注釈を掴める距離（画面上の px）。細い線でも少し外して押せば当たる
+    HIT_PX = 5
+
+    def hit_annot(self, index: int, pos: QPoint, slop: float | None = None):
+        """表示座標 pos で掴める注釈の xref（形どおりの当たり判定）。
+
+        slop は線からどれだけ外れても当たりにするか（画面 px。既定 HIT_PX）。
+        """
         if not self._doc:
             return None
         pt = self._doc.label_to_pdf_point(index, pos.x(), pos.y(), self._zoom)
-        return self._doc.annot_at(index, pt)
+        px = self.HIT_PX if slop is None else slop
+        tol = px / max(self._zoom, 0.05)
+        xref = self._doc.annot_hit(index, pt, tol=tol)
+        if xref is None and not self._doc.text_at(index, pt):
+            # 文字の無い所なら、塗りの無い四角・円の内側をつまんでも掴める
+            # （文字の上なら掴まず、枠の中の文字を選べるようにする）
+            xref = self._doc.annot_hit(index, pt, tol=tol, interior=True)
+        return xref
+
+    def is_freetext(self, index: int, xref) -> bool:
+        return bool(self._doc) and self._doc.annot_kind(index, xref) == "FreeText"
+
+    def selection_is_markup(self) -> bool:
+        """選択中の注釈が、文字に付けるもの（ハイライト・下線・取消線）か。"""
+        if self._sel_xref is None or not self._doc:
+            return False
+        return self._doc.annot_kind(self._sel_index, self._sel_xref) in \
+            PdfDocument.MARKUP_KINDS
+
+    def text_boxes_between(self, index: int, p0: QPoint, p1: QPoint) -> list:
+        """p0→p1 でなぞった文字の枠（表示座標）。ハイライト等の下見に使う。"""
+        if not self._doc or not self._doc.is_open:
+            return []
+        a = self._doc.label_to_pdf_point(index, p0.x(), p0.y(), self._zoom)
+        b = self._doc.label_to_pdf_point(index, p1.x(), p1.y(), self._zoom)
+        _text, rects = self._doc.select_text(index, a, b)
+        return [self._doc.pdf_rect_to_label(index, r, self._zoom) for r in rects]
 
     def set_selection(self, index: int, xref) -> None:
         prev = self._sel_index
@@ -1811,6 +2267,15 @@ class PageView(QScrollArea):
         self._zoom = zoom
         self._resize_all()
         self.set_page(anchor)
+        if self._text_editor is not None:
+            # 入力中の欄も新しい倍率の位置・文字の大きさに合わせ直す
+            self._apply_text_editor_style()
+            if self._text_ctx and self._text_ctx.get("xref") is not None:
+                try:
+                    self._text_editor.set_backdrop(self._doc.render_page_without_annots(
+                        self._text_ctx["index"], self._zoom))
+                except Exception:  # noqa: BLE001
+                    pass
         if self._form_mode:
             # 旧位置の overlay を即座に消し、ズームが落ち着いてから1回だけ
             # 作り直す（毎ノッチ 270個を再生成して固まるのを防ぐ）。
@@ -2169,6 +2634,10 @@ class PageView(QScrollArea):
                     # オートスクロール中はどのボタンでも停止（ブラウザと同様）
                     self._stop_autoscroll()
                     return True
+                if (self._text_editor is not None
+                        and event.button() == Qt.MouseButton.LeftButton):
+                    self._text_editor._finish()   # ページの外のクリックでも確定
+                    return True
                 if event.button() == Qt.MouseButton.MiddleButton:
                     self._start_autoscroll(event.position().toPoint())
                     return True
@@ -2300,6 +2769,7 @@ class PageView(QScrollArea):
                     self.fit_height()
             finally:
                 self._in_fit = False
+        self._place_resume_bar()
         self._render_visible()
 
     # --- 遅延描画 -------------------------------------------------------
@@ -2371,6 +2841,8 @@ class PageView(QScrollArea):
         if index != self._index:
             self._index = index
             self._refit_for_page()
+            if self._resume_bar is not None and self._resume_bar.page == index:
+                self.dismiss_resume_offer()   # 自分でそこまで来たなら案内は不要
             self.page_changed.emit(index)
 
     def _refit_for_page(self) -> None:

@@ -52,10 +52,33 @@ def make_settings():
     """QSettings を返す（ポータブル時は INI ファイル、通常時はレジストリ）。"""
     from PySide6.QtCore import QSettings
 
+    # テスト用: 使い捨ての INI に差し替える。これが無いと、手元でテストを
+    # 回すたびに利用者本人の設定（開いた時の倍率・履歴など）が書き換わる。
+    # "throwaway" ならプロセスごとの一時ファイルを作り、終了時に消す。
+    override = os.environ.get("TRIVREADER_SETTINGS_INI")
+    if override:
+        if override == "throwaway":
+            override = _throwaway_ini()
+        return QSettings(override, QSettings.Format.IniFormat)
     if is_portable():
         ini = os.path.join(base_dir(), "TriVReader.ini")
         return QSettings(ini, QSettings.Format.IniFormat)
     return QSettings("trivreader", "trivreader")
+
+
+_THROWAWAY: list[str] = []
+
+
+def _throwaway_ini() -> str:
+    if not _THROWAWAY:
+        import atexit
+        import tempfile
+
+        fd, path = tempfile.mkstemp(prefix="_trv_settings_", suffix=".ini")
+        os.close(fd)
+        _THROWAWAY.append(path)
+        atexit.register(lambda: os.path.exists(path) and os.remove(path))
+    return _THROWAWAY[0]
 
 
 def safe_cwd() -> str:

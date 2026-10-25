@@ -12,6 +12,8 @@ import sys
 import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 利用者本人の設定（レジストリ）を書き換えないよう、使い捨ての INI で動かす
+os.environ.setdefault("TRIVREADER_SETTINGS_INI", "throwaway")
 
 import fitz
 from PySide6.QtWidgets import QApplication
@@ -193,6 +195,10 @@ def main() -> int:
           not w.default_zoom_btn.isHidden())
 
     # --- 左パネルの表示状態と前面タブの記憶 ------------------------------
+    # offscreen ではタブ化したドックが裏でも isVisible() を返すので、他の
+    # パネルは閉じた状態から始める（以前は実レジストリのこの状態に頼っていた）
+    w.page_dock.hide()
+    w.toc_dock.hide()
     w.annot_dock.show()
     w.annot_dock.raise_()
     app.processEvents()

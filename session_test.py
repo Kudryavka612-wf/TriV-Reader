@@ -11,11 +11,12 @@ import tempfile
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import fitz
-from PySide6.QtCore import QSettings
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QLabel
 
 sys.path.insert(0, os.path.dirname(__file__))
-from viewer import storage
+from viewer import settings_dialog as prefs, storage
 
 TMP = tempfile.gettempdir()
 _INI = os.path.join(TMP, "_session_test.ini")
@@ -62,22 +63,67 @@ def main() -> int:  # noqa: C901
     rows = w.settings.value("resume/pages", [], list) or []
     assert any(r.startswith("7\t") for r in rows), rows
 
+    # 既定は「たずねる」: 勝手には飛ばず、先頭のまま［続きから表示］を出す
     w.open_path(src)
     for _ in range(8):
         app.processEvents()
-    assert w.page_view.index == 7, f"前回のページに戻らない: {w.page_view.index}"
-    print("OK: 閉じたときのページから開き直せる")
+    assert w.page_view.index == 0, f"尋ねずに前回位置へ飛んでいる: {w.page_view.index}"
+    assert w.page_view.resume_offer_page() == 7, w.page_view.resume_offer_page()
+    bar = w.page_view._resume_bar
+    assert bar.isVisible() and "8 ページ目" in bar.findChild(QLabel).text()
+    vp = w.page_view.viewport().geometry()
+    assert vp.contains(bar.geometry()), (bar.geometry(), vp)
+    print("OK: 前回のページは尋ねるだけで、勝手に飛ばない")
+    QTest.mouseClick(bar.btn_resume, Qt.MouseButton.LeftButton)
+    for _ in range(4):
+        app.processEvents()
+    assert w.page_view.index == 7, f"［続きから表示］で戻らない: {w.page_view.index}"
+    assert w.page_view.resume_offer_page() is None, "押した後も案内が残っている"
+    assert w.thumbnails.currentRow() in (-1, 7)
+    print("OK: ［続きから表示］で閉じたときのページへ戻れる")
 
-    # 設定を切れば常に 1 ページ目
-    w.settings.setValue("startup/resume_page", False)
+    # 「閉じる」なら先頭のまま。案内だけ消える
+    w._close_tab(0)
+    app.processEvents()
+    w.open_path(src)
+    for _ in range(6):
+        app.processEvents()
+    QTest.mouseClick(w.page_view._resume_bar.btn_close, Qt.MouseButton.LeftButton)
+    app.processEvents()
+    assert w.page_view.index == 0 and w.page_view.resume_offer_page() is None
+    print("OK: ［閉じる］なら先頭のまま")
+    w.page_view.set_page(7)   # 次の確認のために 8 ページ目で閉じ直す
+    app.processEvents()
+
+    # 自動にすれば今までどおり飛ぶ
+    w.settings.setValue("startup/resume_mode", "always")
+    w._close_tab(0)
+    app.processEvents()
+    w.open_path(src)
+    for _ in range(8):
+        app.processEvents()
+    assert w.page_view.index == 7, f"自動でも前回のページに戻らない: {w.page_view.index}"
+    assert w.page_view.resume_offer_page() is None
+    print("OK: 設定「自動で続きから」なら黙って戻る")
+
+    # しないにすれば常に 1 ページ目・案内も出ない
+    w.settings.setValue("startup/resume_mode", "never")
     w._close_tab(0)
     app.processEvents()
     w.open_path(src)
     for _ in range(6):
         app.processEvents()
     assert w.page_view.index == 0, "設定を切っても前回位置へ飛んでいる"
-    w.settings.setValue("startup/resume_page", True)
-    print("OK: 設定で切れる")
+    assert w.page_view.resume_offer_page() is None, "設定を切っても案内が出る"
+    print("OK: 設定「常に先頭から」で切れる")
+
+    # 旧設定（前回見ていたページから開く = オフ）は「しない」に読み替える
+    w.settings.remove("startup/resume_mode")
+    w.settings.setValue("startup/resume_page", False)
+    assert prefs.resume_mode(w.settings) == "never"
+    w.settings.remove("startup/resume_page")
+    assert prefs.resume_mode(w.settings) == "ask"
+    print("OK: 旧設定のオフを引き継ぐ（無ければ「たずねる」）")
 
     # 1 ページ目しか見ていないファイルは憶えない（履歴を無駄に増やさない）
     w._close_tab(0)
@@ -94,7 +140,9 @@ def main() -> int:  # noqa: C901
     for _ in range(8):
         app.processEvents()
     assert 0 <= w.page_view.index < w.doc.page_count, w.page_view.index
-    print(f"OK: 範囲外の記録は末尾に丸める（{w.page_view.index + 1} ページ目）")
+    assert w.page_view.resume_offer_page() == w.doc.page_count - 1, \
+        w.page_view.resume_offer_page()
+    print(f"OK: 範囲外の記録は末尾に丸める（{w.page_view.resume_offer_page() + 1} ページ目）")
 
     # --- エラーログ ------------------------------------------------------
     path = errorlog.log_path()

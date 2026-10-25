@@ -397,10 +397,12 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.act_tool_erase = add_tool("消しゴム", page_view.TOOL_ERASE)
         tb.addSeparator()
 
-        # 色ボタン（現在色を表示）
+        # 色ボタン（現在色を表示）。ハイライトとそれ以外（文字・図形・ペン）で
+        # 別の色を持ち、選んでいるツールの方を表示・変更する。
         self.act_color = QAction("色", self)
         tb.addAction(self.act_color)
-        self._annot_color = QColor(255, 219, 46)
+        self._annot_color = QColor(0, 0, 0)
+        self._highlight_color = QColor(255, 219, 46)
         self._refresh_color_icon()
 
         # 線の太さ
@@ -835,11 +837,13 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         g.add_widget(self.zoom_combo)
         # PDF を開いた時にどの倍率で表示するかを固定する設定（プルダウン）
         default_zoom_btn = QToolButton()
-        default_zoom_btn.setText("開き方 ▾")
+        default_zoom_btn.setText("開いた時の倍率 ▾")
         default_zoom_btn.setAutoRaise(True)
         default_zoom_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         default_zoom_btn.setToolTip(
-            "PDFを開いた時の表示倍率を固定します（幅/縦に合わせる・前回維持・固定%）")
+            "PDF を新しく開いた時の表示を決めます\n"
+            "（幅に合わせる / 縦に合わせる / 前回の倍率 / 固定の%）\n"
+            "設定 > 表示 からも変えられます")
         dz_menu = QMenu(default_zoom_btn)
         for act in self.default_zoom_group.actions():
             dz_menu.addAction(act)
@@ -1032,7 +1036,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             page_view.TOOL_LINE: "直線を引く",
             page_view.TOOL_ARROW: "矢印を引く",
             page_view.TOOL_CIRCLE: "円/楕円を描く",
-            page_view.TOOL_TEXT: "テキストボックスを追加",
+            page_view.TOOL_TEXT: "クリックした所に文字を入れる（ドラッグで幅を決めて折り返し）",
             page_view.TOOL_NOTE: "付箋メモを追加",
             page_view.TOOL_REDACT: "墨消し範囲を指定（適用で完全削除）",
             page_view.TOOL_CROP: "トリミング範囲を指定",
@@ -1152,13 +1156,50 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             # コンパクト解除時は既定の詰めQSSに戻す（空文字だと余白が広がる）
             tb.setStyleSheet(compact_qss if on else self._TOOLBAR_QSS)
 
+    def _current_tool(self) -> str:
+        act = self.tool_group.checkedAction()
+        return act.data() if act is not None else page_view.TOOL_NONE
+
+    def _color_for_tool(self, tool: str) -> QColor:
+        return (self._highlight_color if tool == page_view.TOOL_HIGHLIGHT
+                else self._annot_color)
+
     def _refresh_color_icon(self) -> None:
-        """色ボタンに現在の色のアイコンを表示する。"""
+        """色ボタンに、選んでいるツールで使う色のアイコンを表示する。"""
         from PySide6.QtGui import QPixmap
 
         pm = QPixmap(18, 18)
-        pm.fill(self._annot_color)
+        pm.fill(self._color_for_tool(self._current_tool()))
         self.act_color.setIcon(pm)
+
+    def _all_views(self) -> list:
+        """開いている全タブのページビュー（＋タブが無いとき用の予備）。"""
+        views = [self._spare_view]
+        for i in range(self.tabs.count()):
+            t = self.tabs.widget(i)
+            if isinstance(t, DocTab):
+                views.append(t.page_view)
+        return views
+
+    def _sync_view_style(self, pv: PageView) -> None:
+        """ツールバーで選んでいるツール・色・太さなどをビューに渡す。
+
+        タブはそれぞれ自分の PageView を持つ。新しく開いたタブにこれを渡し
+        忘れると、ツールバーは「テキスト・黒」なのに実際は「選択・黄色」で
+        描く、という食い違いが起きる。
+        """
+        pv.set_color(self._annot_color)
+        pv.set_highlight_color(self._highlight_color)
+        pv.pen_width = max(1, self.width_spin.value())
+        pv.line_style = self.line_style_combo.currentData() or "solid"
+        pv.line_start = self.line_start_combo.currentData() or "none"
+        pv.line_end = self.line_end_combo.currentData() or "none"
+        pv.fill_enabled = self.act_fill_enabled.isChecked()
+        pv.fill_color = QColor(self._fill_color)
+        pv.opacity = max(0.05, min(1.0, self.opacity_spin.value() / 100.0))
+        pv.text_size = max(6, self.text_size_spin.value())
+        pv.text_font = self.text_font_combo.currentData() or "helv"
+        pv.set_tool(self._current_tool())
 
     def _refresh_fill_icon(self) -> None:
         """塗り色ボタンに現在の塗り色のアイコンを表示する。"""
@@ -1364,6 +1405,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         dark = self.act_dark.isChecked()
         pv.apply_theme(dark)
         org.apply_theme(dark)
+        self._sync_view_style(pv)   # ツールバーの状態（ツール・色など）を引き継ぐ
         return tab
 
     # --- 操作 -----------------------------------------------------------
@@ -1431,9 +1473,13 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         # レイアウトが落ち着いた次のループでもう一度当て直す。
         QTimer.singleShot(0, lambda z=remembered_zoom: self._apply_default_zoom(z))
         resume = self._remembered_page(path)
-        if resume:
+        mode = prefs.resume_mode(self.settings)
+        if resume and mode == "always":
             # 倍率が決まってレイアウトが落ち着いてから移動する
             QTimer.singleShot(0, lambda t=tab, n=resume: self._resume_to(t, n))
+        elif resume and mode == "ask":
+            # 勝手に飛ばず、先頭のまま［続きから表示］を出して本人に選ばせる
+            QTimer.singleShot(0, lambda t=tab, n=resume: self._offer_resume(t, n))
         self._add_recent(path)
         # 入力欄付き（フォーム）PDF は Adobe と同様、開いた時点で入力可能にする
         if doc.is_form():
@@ -1452,6 +1498,12 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
                     self._check_unsupported_govform(d)
             QTimer.singleShot(0, _finish_form_setup)
 
+    def _offer_resume(self, tab, page: int) -> None:
+        """前回見ていたページへ飛ぶかを尋ねる案内を出す（閉じられていたら何もしない）。"""
+        if self.tabs.indexOf(tab) < 0 or not tab.doc.is_open:
+            return
+        tab.page_view.show_resume_offer(page)
+
     def _resume_to(self, tab, page: int) -> None:
         """前回見ていたページへ移動する（閉じられていたら何もしない）。"""
         if self.tabs.indexOf(tab) < 0 or not tab.doc.is_open:
@@ -1469,15 +1521,11 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         # 先にウィンドウを出す。非表示のまま開くとビューポートの幅が確定して
         # おらず、「幅に合わせる」が極端な倍率になる（トレイ常駐中にエクスプ
         # ローラから開いたときに、ファイルごとに表示がばらつく原因）。
-        self.setWindowState(
-            (self.windowState() & ~Qt.WindowState.WindowMinimized)
-            | Qt.WindowState.WindowActive
-        )
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        self._show_from_tray()
         if path:
             self.open_path(path)
+            # 読み込みやパスワード入力の間に前面が奪われていることがある
+            self._bring_to_front()
 
     # --- システムトレイ常駐 --------------------------------------------
     def _setup_tray(self) -> None:
@@ -1530,6 +1578,56 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.show()
         self.raise_()
         self.activateWindow()
+        self._bring_to_front()
+
+    def _bring_to_front(self) -> None:
+        """ウィンドウを本当に最前面へ出し、キーボード入力を受けられるようにする。
+
+        Qt の activateWindow() は、アプリが裏にいるとタスクバーを点滅させる
+        だけで前に出ない（Windows の前面ロック）。エクスプローラーから PDF を
+        開いたときに、開いたのに後ろに隠れたままになるのはこのため。起動側が
+        AllowSetForegroundWindow で権利を譲ってくれていれば SetForegroundWindow
+        が通る。通らなければ、前面のスレッドに入力キューをつないでから頼む。
+        """
+        if sys.platform != "win32" or QApplication.platformName() != "windows":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            for fn in ("IsIconic", "ShowWindow", "SetForegroundWindow",
+                       "BringWindowToTop"):
+                getattr(user32, fn).argtypes = (
+                    [wintypes.HWND, ctypes.c_int] if fn == "ShowWindow"
+                    else [wintypes.HWND])
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD,
+                                                 wintypes.BOOL]
+
+            hwnd = int(self.winId())
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)   # SW_RESTORE
+            if user32.GetForegroundWindow() == hwnd:
+                return
+            if user32.SetForegroundWindow(hwnd):
+                return
+            fg = user32.GetForegroundWindow()
+            fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            my_tid = kernel32.GetCurrentThreadId()
+            if not fg_tid or fg_tid == my_tid:
+                return
+            user32.AttachThreadInput(my_tid, fg_tid, True)
+            try:
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+            finally:
+                user32.AttachThreadInput(my_tid, fg_tid, False)
+        except Exception:  # noqa: BLE001  前面に出せなくても開く処理は続ける
+            pass
 
     def _quit_app(self) -> None:
         """トレイメニューの「終了」：本当にアプリを終了する。"""
@@ -1555,6 +1653,9 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             self._update_status()
             self._update_title()
             return
+        # ツールバーはタブ共通。別タブで変えた太さ・ツールなどを合わせ直す
+        self._sync_view_style(tab.page_view)
+        self._sync_zoom_widgets()
         self.thumbnails.load(tab.doc)
         self.toc_dock.load(tab.doc.get_toc())
         self._refresh_annot_list()
@@ -1582,6 +1683,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         tab = self.tabs.widget(index)
         if not isinstance(tab, DocTab):
             return
+        tab.page_view.finish_text_edit()   # 打ちかけの文字を「未保存の変更」に含める
         self._remember_page(tab)   # 次に開いたとき同じページから出せるように
         if tab.doc.is_open and tab.doc.modified:
             self.tabs.setCurrentIndex(index)
@@ -1643,6 +1745,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
     def _on_tool_changed(self, action) -> None:
         self.page_view.set_tool(action.data())
         tool = action.data()
+        self._refresh_color_icon()   # ハイライトとそれ以外で色が違う
         # 直線/矢印ツールを選んだ時は終点スタイルを分かりやすい既定値にする
         # （ユーザーがコンボボックスで手動変更した後は、その値を尊重する）
         if tool == page_view.TOOL_ARROW:
@@ -1655,6 +1758,11 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             self.statusBar().showMessage(
                 "スナップショット: 画像にしたい範囲をドラッグすると"
                 "クリップボードへコピーします", 0)
+        elif tool == page_view.TOOL_TEXT:
+            self.statusBar().showMessage(
+                "テキスト: 書きたい所をクリックしてそのまま入力（ドラッグすると幅を"
+                "決めて折り返し）。Esc か枠の外のクリックで確定 / 既存の文字は"
+                "クリックで直せます", 0)
         else:
             self.statusBar().showMessage(
                 f"注釈ツール: {action.text()}（ページ上でドラッグ/クリック）", 0
@@ -1667,15 +1775,28 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             combo.setCurrentIndex(i)
 
     def _pick_color(self) -> None:
-        col = QColorDialog.getColor(self._annot_color, self, "注釈の色")
+        pv = self.page_view
+        tool = self._current_tool()
+        if tool == page_view.TOOL_NONE and pv.has_selection():
+            # 選んだ注釈の色だけを変える。ここで既定色まで変えると、ハイライトを
+            # 緑にした直後のテキストが緑になる、という巻き込みが起きる。
+            col = QColorDialog.getColor(self._color_for_tool(tool), self, "注釈の色")
+            if col.isValid():
+                pv.recolor_selection(col)
+            return
+        is_hl = tool == page_view.TOOL_HIGHLIGHT
+        col = QColorDialog.getColor(self._color_for_tool(tool), self,
+                                    "ハイライトの色" if is_hl else "文字・図形の色")
         if not col.isValid():
             return
-        self._annot_color = col
-        self.page_view.set_color(col)
+        if is_hl:
+            self._highlight_color = col
+        else:
+            self._annot_color = col
+        for v in self._all_views():
+            v.set_highlight_color(self._highlight_color)
+            v.set_color(self._annot_color)
         self._refresh_color_icon()
-        # 注釈を選択中なら、その色を変更する
-        if self.page_view.has_selection():
-            self.page_view.recolor_selection(col)
 
     def _pick_fill_color(self) -> None:
         col = QColorDialog.getColor(self._fill_color, self, "塗りつぶしの色")
@@ -2011,7 +2132,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         if not hits:
             self.statusBar().showMessage("先に検索してください", 3000)
             return
-        c = self._annot_color
+        c = self._highlight_color
         n = self.doc.add_search_highlights(
             hits, (c.redF(), c.greenF(), c.blueF())
         )
@@ -2099,14 +2220,37 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
                 pass
 
     def _on_zoom_changed(self, zoom: float) -> None:
-        pct = int(round(zoom * 100))
+        self._sync_zoom_widgets()
+        self._update_status()
+        # 「前回の倍率を維持」モード用に、実際の倍率を都度記憶しておく
+        self.settings.setValue("last_zoom", zoom)
+
+    def _sync_zoom_widgets(self) -> None:
+        """スライダーと倍率欄を、表示中のタブの実際の倍率に合わせる。
+
+        倍率欄は「幅/縦に合わせる」中ならその名前を、プリセットに無い倍率
+        （Ctrl+ホイールなど）なら先頭の行にその値を出す。以前は選んだ
+        プリセットのまま残り、157% なのに「100%」と出ていた。
+        """
+        pv = self.page_view
+        pct = int(round(pv.zoom * 100))
         self.zoom_slider.blockSignals(True)
         self.zoom_slider.setValue(max(self.zoom_slider.minimum(),
                                       min(pct, self.zoom_slider.maximum())))
         self.zoom_slider.blockSignals(False)
-        self._update_status()
-        # 「前回の倍率を維持」モード用に、実際の倍率を都度記憶しておく
-        self.settings.setValue("last_zoom", zoom)
+        text = {"width": "幅に合わせる", "height": "縦に合わせる"}.get(
+            pv.fit_mode(), f"{pct}%")
+        combo = self.zoom_combo
+        combo.blockSignals(True)
+        i = combo.findText(text)
+        if i < 0:
+            if combo.itemData(0) == "current":
+                combo.setItemText(0, text)
+            else:
+                combo.insertItem(0, text, "current")
+            i = 0
+        combo.setCurrentIndex(i)
+        combo.blockSignals(False)
 
     def _toggle_facing(self, on: bool) -> None:
         self.page_view.set_facing(on)
@@ -2300,11 +2444,16 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         """注釈の既定スタイル（作成者・色・太さ・不透明度・文字サイズ）を反映。"""
         s = self.settings
         PdfDocument.annot_author = prefs.value(s, "annot/author")
-        col = QColor(prefs.value(s, "annot/color"))
+        col = QColor(prefs.value(s, "annot/ink_color"))
         if col.isValid():
             self._annot_color = col
-            self._refresh_color_icon()
-            self.page_view.set_color(col)
+        col = QColor(prefs.value(s, "annot/highlight_color"))
+        if col.isValid():
+            self._highlight_color = col
+        for v in self._all_views():
+            v.set_color(self._annot_color)
+            v.set_highlight_color(self._highlight_color)
+        self._refresh_color_icon()
         self.width_spin.setValue(prefs.value(s, "annot/width"))
         self.opacity_spin.setValue(prefs.value(s, "annot/opacity"))
         self.text_size_spin.setValue(prefs.value(s, "annot/text_size"))
@@ -2381,9 +2530,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
                 self._remember_page(t)
 
     # --- 前回見ていたページ ---------------------------------------------
-    # ファイルごとに「最後に見ていたページ」を憶えて、次に開いたときそこから
-    # 出す。長い規程や申請書の束を毎日開き直す使い方だと、毎回1ページ目から
-    # 探し直すのは地味に手間なので。設定（前回見ていたページから開く）で切れる。
+    # ファイルごとに「最後に見ていたページ」を憶えて、次に開いたとき続きから
+    # 読めるようにする。長い規程や申請書の束を毎日開き直す使い方だと、毎回
+    # 1 ページ目から探し直すのは地味に手間なので。ただし勝手に飛ばれると
+    # 困ることもあるので、既定は「たずねる」（設定 > 全般 で自動/しないも可）。
     RESUME_MAX = 200   # 憶えておくファイル数
 
     def _remember_page(self, tab) -> None:
@@ -2399,8 +2549,6 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.settings.setValue("resume/pages", rows[:self.RESUME_MAX])
 
     def _remembered_page(self, path: str) -> int:
-        if not prefs.value(self.settings, "startup/resume_page"):
-            return 0
         key = os.path.normcase(os.path.abspath(path))
         for row in (self.settings.value("resume/pages", [], list) or []):
             if isinstance(row, str) and row.endswith("\t" + key):
@@ -2844,6 +2992,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
     def save(self) -> None:
         if not self.doc.is_open:
             return
+        self.page_view.finish_text_edit()   # 打ちかけの文字も保存に入れる
         # 上書き保存の確認（「次回から表示しない」を選べる）
         if self.settings.value("confirm_overwrite", True, bool) and self.doc.path:
             from PySide6.QtWidgets import QCheckBox
@@ -2881,6 +3030,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
     def save_as(self) -> None:
         if not self.doc.is_open:
             return
+        self.page_view.finish_text_edit()   # 打ちかけの文字も保存に入れる
         suggested = self.doc.path or "untitled.pdf"
         path, _ = QFileDialog.getSaveFileName(
             self, "名前を付けて保存", suggested, "PDF ファイル (*.pdf)"

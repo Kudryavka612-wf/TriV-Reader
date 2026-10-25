@@ -102,7 +102,10 @@ def test_roundtrip(app: QApplication, w: MainWindow) -> None:
     check(w.width_spin.value() == 7, "線の太さがツールバーに反映される")
     check(w.opacity_spin.value() == 55, "不透明度がツールバーに反映される")
     check(w.text_size_spin.value() == 28, "文字サイズがツールバーに反映される")
-    check(w._annot_color.name() == prefs.value(s, "annot/color"), "注釈色が同期する")
+    check(w._annot_color.name() == prefs.value(s, "annot/ink_color") == "#000000",
+          "文字・図形の色が既定で黒になり、ウィンドウに同期する")
+    check(w._highlight_color.name() == prefs.value(s, "annot/highlight_color"),
+          "ハイライト色が同期する")
     check(w._autosave_timer.isActive() and w._autosave_timer.interval() == 120000,
           f"自動保存タイマーが2分で動く（{w._autosave_timer.interval()}ms）")
 

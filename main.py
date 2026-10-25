@@ -67,8 +67,29 @@ def _app_icon() -> QIcon:
     return QIcon(pm)
 
 
+def _allow_running_to_take_focus() -> None:
+    """起動中のインスタンスが、ウィンドウを前面に出せるようにする。
+
+    Windows は裏にいるプロセスが勝手に前面へ出ることを禁じている（タスク
+    バーが点滅するだけ）。エクスプローラーから起動されたこのプロセスは前面に
+    出る権利を持っているので、それを起動中のインスタンスに譲る。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        allow = ctypes.windll.user32.AllowSetForegroundWindow
+        allow.argtypes = [wintypes.DWORD]
+        allow(0xFFFFFFFF)   # ASFW_ANY
+    except Exception:  # noqa: BLE001  前面に出なくてもファイルは開ける
+        pass
+
+
 def _send_to_running(path: str) -> bool:
     """既に起動中のインスタンスがあれば path を送り、True を返す。"""
+    _allow_running_to_take_focus()
     sock = QLocalSocket()
     sock.connectToServer(_SERVER_NAME)
     if not sock.waitForConnected(300):

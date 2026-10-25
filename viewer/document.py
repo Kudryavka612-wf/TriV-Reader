@@ -99,6 +99,114 @@ def _char_class(ch: str) -> str:
     return "symbol"
 
 
+# --- テキスト注釈（FreeText）の折り返し ----------------------------------
+# MuPDF は FreeText の外観を作るとき、空白でしか折り返さない（句読点を含むと
+# 別の経路に入って折り返すこともあるが、当てにならない）。句読点の無い日本語は
+# 1 行のまま枠の右で切られて消えるので、改行はこちらで入れてから渡す。
+FT_LINE = 1.2   # 行送り（文字サイズの倍率）。MuPDF の FreeText と同じ
+
+# 行頭に来てはいけない文字（前の行にぶら下げる）
+_KINSOKU_HEAD = set("、。，．,.)）]］}｝」』】〕〉》’”ゝゞー々！？!?ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ・：；:;")
+
+
+def ft_line_width(line: str, fontsize: float, fontname: str = "helv") -> float:
+    """1 行を FreeText で描いたときの幅（pt）。
+
+    欧文は MuPDF と同じ基本 14 フォントで測る。それ以外（かな・漢字・記号）は
+    1 文字 1 em とみなす（MuPDF の簡易経路は半角カナも 1 em で並べるので、
+    狭く見積もってはみ出すよりは広めに取る）。
+    """
+    fn = fontname if fontname in ("helv", "tiro", "cour") else "helv"
+    width = 0.0
+    run: list[str] = []
+    wide = False   # 直前の文字が和文か（空白は直前の文字のフォントで描かれる）
+    for ch in line:
+        if ch == " " and wide:
+            width += fontsize   # 和文の後ろの空白は全角幅になる
+            continue
+        wide = not (ord(ch) < 0x100 and ch != "\t")
+        if not wide:
+            run.append(ch)
+            continue
+        if run:
+            width += fitz.get_text_length("".join(run), fontname=fn, fontsize=fontsize)
+            run.clear()
+        width += fontsize
+    if run:
+        width += fitz.get_text_length("".join(run), fontname=fn, fontsize=fontsize)
+    return width
+
+
+def _ft_tokens(para: str) -> list[str]:
+    """折り返しの単位に切る。欧文は語（後ろの空白込み）、それ以外は 1 文字ずつ。"""
+    tokens: list[str] = []
+    for m in re.finditer(r"[\x21-\xff]+[ ]*|[ ]+|.", para):
+        tokens.append(m.group(0))
+    return tokens
+
+
+def wrap_freetext(text: str, width: float, fontsize: float,
+                  fontname: str = "helv") -> str:
+    """text を幅 width（pt）に収まるよう改行を入れて返す（元の改行は保つ）。"""
+    out: list[str] = []
+    for para in text.split("\n"):
+        line = ""
+        for tok in _ft_tokens(para):
+            cand = line + tok
+            if not line or ft_line_width(cand.rstrip(" "), fontsize, fontname) <= width:
+                line = cand
+                continue
+            if tok[0] in _KINSOKU_HEAD:
+                line = cand          # 句読点は前の行にぶら下げる
+                continue
+            if ft_line_width(tok.rstrip(" "), fontsize, fontname) > width:
+                # 1 語で幅を超える（長い URL など）は文字単位で割る
+                for ch in tok:
+                    if line and ft_line_width((line + ch).rstrip(" "), fontsize,
+                                              fontname) > width:
+                        out.append(line.rstrip(" "))
+                        line = ""
+                    line += ch
+                continue
+            out.append(line.rstrip(" "))
+            line = tok.lstrip(" ") if tok.strip() else ""
+        out.append(line.rstrip(" ") if line.strip() else line)
+    return "\n".join(out)
+
+
+def ft_needed_size(wrapped: str, fontsize: float, fontname: str = "helv") -> tuple:
+    """改行済みの本文を切らずに描くのに要る (幅, 高さ) pt。"""
+    lines = wrapped.split("\n")
+    w = max((ft_line_width(ln, fontsize, fontname) for ln in lines), default=0.0)
+    # 最終行のディセンダ（g や y の下）まで入る高さ
+    h = len(lines) * FT_LINE * fontsize + 0.3 * fontsize
+    return w + 1.0, h
+
+
+# --- 注釈の当たり判定 -----------------------------------------------------
+def _seg_dist(p, a, b) -> float:
+    """点 p と線分 a-b の距離。"""
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        return ((p.x - ax) ** 2 + (p.y - ay) ** 2) ** 0.5
+    t = max(0.0, min(1.0, ((p.x - ax) * dx + (p.y - ay) * dy) / (dx * dx + dy * dy)))
+    cx, cy = ax + t * dx, ay + t * dy
+    return ((p.x - cx) ** 2 + (p.y - cy) ** 2) ** 0.5
+
+
+def _rect_dist(p, r) -> float:
+    """点 p と矩形 r の距離（中にあれば 0）。"""
+    dx = _span_dist(r.x0, r.x1, p.x)
+    dy = _span_dist(r.y0, r.y1, p.y)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _pt(v) -> tuple:
+    return (float(v[0]), float(v[1])) if not hasattr(v, "x") else (float(v.x), float(v.y))
+
+
 class PdfDocument:
     """PyMuPDF の Document を薄くラップしたクラス。"""
 
@@ -331,6 +439,19 @@ class PdfDocument:
         self._cache_render(key, pixmap)
         return pixmap
 
+    def render_page_without_annots(self, index: int, zoom: float = 1.0) -> QPixmap:
+        """注釈を描かずにページを描く（テキスト注釈の編集中の下地に使う）。
+
+        編集中の注釈そのものが下に透けて二重に見えないようにしつつ、罫線や
+        記入欄などの紙面は見せて、どこに書いているかを分かるようにする。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        page = self._doc.load_page(index)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False,
+                              annots=False)
+        return self._pixmap_from_fitz(pix)
+
     def page_svg(self, index: int, text_as_path: bool = True) -> str:
         """ページを SVG（ベクター）で書き出す。
 
@@ -487,14 +608,32 @@ class PdfDocument:
         self.modified = True
 
     def add_freetext(self, index, rect, text, color=(0.0, 0.0, 0.0),
-                     fontsize=12, fontname="helv") -> None:
+                     fontsize=12, fontname="helv", wrapped: str | None = None) -> int:
+        """テキスト注釈を置く。新しい xref を返す。
+
+        wrapped は画面の入力欄で見えていた折り返し（改行入り）。省略すると
+        rect の幅で折り返す。どちらの場合も、文字が切れないよう枠を広げる。
+        """
         self._push_undo(index)
         page = self._doc.load_page(index)
+        if wrapped is None:
+            wrapped = wrap_freetext(text, rect.width, fontsize, fontname)
+        rect = self._fit_freetext_rect(rect, wrapped, fontsize, fontname)
         annot = page.add_freetext_annot(
-            rect, text, fontsize=fontsize, fontname=fontname, text_color=color
+            rect, wrapped, fontsize=fontsize, fontname=fontname, text_color=color
         )
         self._finish_annot(annot)
+        self._set_soft_text(annot.xref, text, wrapped)
         self.modified = True
+        return annot.xref
+
+    @staticmethod
+    def _fit_freetext_rect(rect, wrapped, fontsize, fontname):
+        """改行済みの本文が切れずに入るよう、枠を右と下へ広げる（縮めはしない）。"""
+        need_w, need_h = ft_needed_size(wrapped, fontsize, fontname)
+        r = fitz.Rect(rect)
+        return fitz.Rect(r.x0, r.y0, r.x0 + max(r.width, need_w),
+                         r.y0 + max(r.height, need_h))
 
     def add_text_note(self, index, point, text, icon="Note") -> None:
         """付箋（テキスト注釈）。point は PDF 座標。"""
@@ -777,6 +916,80 @@ class PdfDocument:
                 hit = annot.xref  # 後勝ち＝最前面
         return hit
 
+    #: 文字に沿って付ける注釈（動かしたり枠で伸縮したりするものではない）
+    MARKUP_KINDS = ("Highlight", "Underline", "StrikeOut", "Squiggly")
+
+    def annot_hit(self, index, point, tol: float = 4.0, interior: bool = False):
+        """point（PDF 座標）で掴める注釈の xref（無ければ None）。
+
+        annot_at は外接矩形に入れば当たりにするため、斜めの線のまわりの空白や
+        塗りの無い四角の内側をクリックしただけで掴んでしまい、その下の文字を
+        選べなかった。ここでは形どおりに測る：線・ペンは線から tol 以内、塗りの
+        無い四角/円は枠線の近く、ハイライト等は文字の帯の上。いくつも当たれば
+        近いもの、同じ近さなら前面のものを返す。interior=True なら塗りの無い
+        四角/円の内側も「いちばん弱い当たり」として数える。
+        """
+        page = self._doc.load_page(index)
+        best = None
+        for order, annot in enumerate(page.annots()):
+            if _rect_dist(point, annot.rect) > tol:
+                continue
+            try:
+                d = self._annot_distance(annot, point)
+            except Exception:  # noqa: BLE001  形が読めなければ矩形で判定
+                d = _rect_dist(point, annot.rect)
+            if (d > tol and interior and annot.type[1] in ("Square", "Circle")
+                    and fitz.Rect(annot.rect).contains(point)):
+                d = tol
+            if d > tol:
+                continue
+            key = (d, -order)
+            if best is None or key < best[0]:
+                best = (key, annot.xref)
+        return best[1] if best else None
+
+    @staticmethod
+    def _annot_distance(annot, p) -> float:
+        """注釈の「見えている形」と点 p の距離（pt）。"""
+        kind = annot.type[1]
+        rect = fitz.Rect(annot.rect)
+        half = max(0.5, float((annot.border or {}).get("width") or 1.0) / 2)
+        verts = annot.vertices
+        if kind == "Ink" and verts:
+            return max(0.0, min(_seg_dist(p, _pt(s[i]), _pt(s[min(i + 1, len(s) - 1)]))
+                                for s in verts if s for i in range(len(s))) - half)
+        if kind in ("Line", "PolyLine", "Polygon") and verts and len(verts) >= 2:
+            pts = [_pt(v) for v in verts]
+            if kind == "Polygon":
+                pts.append(pts[0])
+            return max(0.0, min(_seg_dist(p, pts[i], pts[i + 1])
+                                for i in range(len(pts) - 1)) - half)
+        if kind in PdfDocument.MARKUP_KINDS and verts and len(verts) >= 4:
+            quads = []
+            for i in range(0, len(verts) - 3, 4):
+                xs = [_pt(v)[0] for v in verts[i:i + 4]]
+                ys = [_pt(v)[1] for v in verts[i:i + 4]]
+                quads.append(fitz.Rect(min(xs), min(ys), max(xs), max(ys)))
+            return min(_rect_dist(p, q) for q in quads)
+        if kind in ("Square", "Circle") and not (annot.colors or {}).get("fill"):
+            # 塗りの無い図形は枠線の上だけ（内側の文字を選べるように）
+            inner = rect + (half, half, -half, -half)
+            if kind == "Square":
+                if inner.contains(p):
+                    return max(0.0, min(p.x - inner.x0, inner.x1 - p.x,
+                                        p.y - inner.y0, inner.y1 - p.y) - half)
+                return max(0.0, _rect_dist(p, inner) - half)
+            a, b = max(inner.width / 2, 0.5), max(inner.height / 2, 0.5)
+            cx, cy = (inner.x0 + inner.x1) / 2, (inner.y0 + inner.y1) / 2
+            norm = (((p.x - cx) / a) ** 2 + ((p.y - cy) / b) ** 2) ** 0.5
+            return max(0.0, abs(norm - 1.0) * min(a, b) - half)
+        return _rect_dist(p, rect)
+
+    def annot_kind(self, index, xref) -> str | None:
+        page = self._doc.load_page(index)
+        annot = self._find_on(page, xref)
+        return annot.type[1] if annot else None
+
     def annot_rect(self, index, xref):
         """注釈の矩形（PDF 座標）。"""
         page = self._doc.load_page(index)  # page はこの関数内で生かし続ける
@@ -784,9 +997,33 @@ class PdfDocument:
         return fitz.Rect(annot.rect) if annot else None
 
     def annot_text(self, index, xref) -> str:
+        """注釈の本文。テキスト注釈は、こちらで入れた折り返しを除いた元の文。"""
         page = self._doc.load_page(index)
         annot = self._find_on(page, xref)
-        return annot.info.get("content", "") if annot else ""
+        return self._soft_text(annot) if annot else ""
+
+    #: 折り返す前の本文を FreeText に控えておく独自キー。/Contents には表示
+    #: どおりの改行入りを入れる（どのビューワーで外観を作り直しても同じ見た目に
+    #: なる）ので、編集し直すときや幅を変えたときはこちらから組み直す。
+    _SOFT_KEY = "TrivText"
+
+    def _soft_text(self, annot) -> str:
+        content = annot.info.get("content", "") or ""
+        if annot.type[1] != "FreeText":
+            return content
+        try:
+            kind, val = self._doc.xref_get_key(annot.xref, self._SOFT_KEY)
+        except Exception:  # noqa: BLE001
+            return content
+        if kind == "string" and "".join(val.split()) == "".join(content.split()):
+            return val   # 他のアプリで本文が書き換えられていたら /Contents を信じる
+        return content
+
+    def _set_soft_text(self, xref, soft: str, wrapped: str) -> None:
+        if soft != wrapped:
+            self._doc.xref_set_key(xref, self._SOFT_KEY, fitz.get_pdf_str(soft))
+        else:
+            self._doc.xref_set_key(xref, self._SOFT_KEY, "null")
 
     def annot_is_textual(self, index, xref) -> bool:
         page = self._doc.load_page(index)
@@ -1232,6 +1469,14 @@ class PdfDocument:
             # サイズも色も失われる。
             (desc["fontsize"], desc["text_color"],
              desc["fontname"]) = self._parse_freetext_da(annot)
+            desc["soft"] = self._soft_text(annot)
+            # スタンプの枠と中央寄せ。拾わないと動かしただけで枠が消えていた
+            desc["ft_border"] = float(border.get("width") or 0)
+            try:
+                q = self._doc.xref_get_key(annot.xref, "Q")
+                desc["align"] = int(q[1]) if q[0] == "int" else 0
+            except Exception:  # noqa: BLE001
+                desc["align"] = 0
         return desc
 
     # /DA のフォント資源名 → add_freetext_annot に渡す短縮名
@@ -1266,7 +1511,8 @@ class PdfDocument:
 
     def _recreate(self, page, desc, dx=0.0, dy=0.0, color=None, width=None,
                   text=None, new_rect=None, dashes=_UNSET, opacity=_UNSET,
-                  fill=_UNSET, line_ends=_UNSET, fontsize=None, fontname=None):
+                  fill=_UNSET, line_ends=_UNSET, fontsize=None, fontname=None,
+                  wrapped=None):
         """捕捉した注釈情報から、平行移動・リサイズ・色/太さ/線種/不透明度/塗り/
         本文を変更して作り直す。
 
@@ -1304,8 +1550,21 @@ class PdfDocument:
             fs = fontsize if fontsize else (desc.get("fontsize", 12) or 12)
             fn = fontname if fontname else (desc.get("fontname") or "helv")
             tc = color if color is not None else desc.get("text_color", stroke)
-            annot = page.add_freetext_annot(target, content, fontsize=fs,
-                                            fontname=fn, text_color=tc)
+            soft = text if text is not None else desc.get("soft", content)
+            if wrapped is None:
+                if (text is not None or new_rect is not None
+                        or fontsize or fontname):
+                    # 本文・幅・文字の大きさが変わったら折り返し直す
+                    wrapped = wrap_freetext(soft, target.width, fs, fn)
+                else:
+                    wrapped = content   # 移動・色替えなどは見た目の行をそのまま
+            if desc.get("ft_border", 0) <= 0:
+                target = self._fit_freetext_rect(target, wrapped, fs, fn)
+            annot = page.add_freetext_annot(
+                target, wrapped, fontsize=fs, fontname=fn, text_color=tc,
+                border_width=desc.get("ft_border", 0) or 0,
+                align=desc.get("align", 0) or 0)
+            self._set_soft_text(annot.xref, soft, wrapped)
         elif kind == "Text":
             annot = page.add_text_annot(fitz.Point(target.x0, target.y0), content)
         elif kind == "Ink":
@@ -1415,8 +1674,17 @@ class PdfDocument:
                                 opacity=opacity, fill=fill, line_ends=line_ends,
                                 fontsize=fontsize, fontname=fontname)
 
-    def set_annot_text(self, index, xref, text):
-        return self._edit_annot(index, xref, text=text)
+    def set_annot_text(self, index, xref, text, *, wrapped=None, rect=None,
+                       color=None, fontsize=None, fontname=None):
+        """注釈の本文を書き換える。新しい xref を返す。
+
+        テキスト注釈では、画面の入力欄の折り返し（wrapped）と枠（rect）・
+        文字色・大きさ・フォントもまとめて受け取れる（入力欄で見えていた
+        とおりに確定させるため）。省略した分は元の注釈から引き継ぐ。
+        """
+        return self._edit_annot(index, xref, text=text, wrapped=wrapped,
+                                new_rect=rect, color=color, fontsize=fontsize,
+                                fontname=fontname)
 
     def annot_textstyle(self, index, xref):
         """注釈の種別と文字スタイルを返す（UI 同期用）。無ければ None。
@@ -1458,7 +1726,7 @@ class PdfDocument:
                     kind = a.type[1]
                     colors = a.colors or {}
                     col = colors.get("stroke") or colors.get("fill")
-                    content = a.info.get("content", "") or ""
+                    content = self._soft_text(a)
                     label = self._ANNOT_LABELS.get(kind, kind)
                     text = content.strip().replace("\n", " ") if content.strip() else label
                     out.append({
@@ -2050,6 +2318,11 @@ class PdfDocument:
         self._layout_cache[index] = (chars, lines)
         return self._layout_cache[index]
 
+    def text_at(self, index, point) -> bool:
+        """point（PDF 座標）がページの文字の行の上か。"""
+        _chars, lines = self._page_layout(index)
+        return any(fitz.Rect(bbox).contains(point) for _lid, _ix, bbox in lines)
+
     def invalidate_text_layout(self) -> None:
         """憶えている文字レイアウトを捨てる（選択を始めるときに呼ぶ）。"""
         self._layout_cache.clear()
@@ -2169,10 +2442,12 @@ class PdfDocument:
                 parts.append(text)
         return ("\n".join(parts), out)
 
-    def markup_rects(self, index: int, rects, kind: str, color) -> bool:
+    def markup_rects(self, index: int, rects, kind: str, color,
+                     opacity: float = 1.0) -> bool:
         """すでに決まっている矩形に、ハイライト/下線/取消線を付ける。
 
-        右クリックメニューのように「選択済みの範囲」へ注釈を付ける経路で使う。
+        右クリックメニューのように「選択済みの範囲」へ注釈を付ける経路と、
+        ハイライトツールのドラッグ（文字単位で選んだ範囲）で使う。
         """
         if not self._doc or not rects:
             return False
@@ -2186,6 +2461,8 @@ class PdfDocument:
         else:
             annot = page.add_highlight_annot(quads)
         annot.set_colors(stroke=color)
+        if opacity < 1.0:
+            annot.set_opacity(opacity)
         self._finish_annot(annot)
         self.modified = True
         return True
