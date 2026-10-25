@@ -230,7 +230,7 @@ class UpdateMixin:
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            info = updater.check(url)
+            info = updater.check(url, include_skipped=True)
         except Exception as exc:  # noqa: BLE001
             QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "更新の確認", f"確認できませんでした:\n{exc}")
@@ -240,6 +240,13 @@ class UpdateMixin:
             QMessageBox.information(self, "更新の確認", "お使いのバージョンは最新です。")
             return
 
+        if info.get("skipped"):
+            ret = QMessageBox.question(
+                self, "更新があります",
+                f"新しいバージョン {info['version']} は、以前この PC で起動の確認が"
+                "できなかったため見送っています。\nもう一度試しますか？")
+            if ret != QMessageBox.StandardButton.Yes:
+                return
         notes = info.get("notes", "")
         ret = QMessageBox.question(
             self, "更新があります",
@@ -274,8 +281,35 @@ class UpdateMixin:
                 "更新を中止します。",
             )
             return
+        # 入れ替える前に、新しい版がこの PC で起動できるかを試す（壊れた版を
+        # 入れてしまうと、起動できず自動更新でも直せなくなる）
+        wait = QProgressDialog("新しい版がこの PC で動くかを確かめています…", None, 0, 0, self)
+        wait.setWindowTitle("更新")
+        wait.setMinimumDuration(0)
+        wait.show()
+        QApplication.processEvents()
         try:
-            updater.apply_and_restart(zip_path)
+            src_dir = updater.extract(zip_path)
+            ok, detail = updater.trial_run(src_dir, poll=QApplication.processEvents)
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = False, str(exc)
+        wait.close()
+        if not ok:
+            from . import errorlog, rollback
+            rollback.skip_version(info["version"])
+            try:
+                errorlog.write(detail, context=f"更新の確認で失敗（{info['version']}）")
+            except Exception:  # noqa: BLE001
+                pass
+            last = (detail.strip().splitlines() or [""])[-1][:300]
+            QMessageBox.warning(
+                self, "更新を見送りました",
+                f"新しいバージョン {info['version']} は、この PC で起動の確認ができなかった"
+                "ため、更新を見送りました。今の版のままお使いいただけます。\n\n"
+                f"（詳しい内容: {last}）")
+            return
+        try:
+            updater.apply_and_restart(zip_path, extracted=src_dir)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "更新", f"更新の適用に失敗しました:\n{exc}")
             return

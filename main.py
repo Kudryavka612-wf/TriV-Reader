@@ -73,13 +73,40 @@ def _selftest(out_path: str) -> None:
 if __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[1] == "--selftest":
     _selftest(sys.argv[2])
 
-from PySide6.QtCore import QLibraryInfo, Qt, QTranslator
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import QApplication
 
-from viewer import errorlog, storage, theme
-from viewer.main_window import MainWindow
+def _startup_failed(detail: str) -> None:
+    """起動の途中で失敗した（更新で入った版が壊れている等）。
+
+    配布版なら、前の版に戻すか（控えが無ければ配布ページを開くか）を聞く。
+    Qt や PyMuPDF が壊れていることもあるので、rollback は標準ライブラリだけで動く。
+    """
+    if not getattr(sys, "frozen", False):
+        return   # ソースから動かしているときは、そのままエラーを出す
+    try:
+        from viewer import rollback
+        from viewer.version import APP_VERSION
+        rollback.offer(f"TriV-Reader {APP_VERSION} を起動できませんでした。",
+                       APP_VERSION, detail)
+    except Exception:  # noqa: BLE001
+        return   # 知らせられなかったときだけ、いつものエラー画面に任せる
+    # 戻すなら、このプロセスが終わってから書き戻して起動し直す。戻さないときも、
+    # 内容はもう知らせて記録したので、英語の技術的なエラー画面は重ねて出さない
+    os._exit(1)
+
+
+try:
+    from PySide6.QtCore import QLibraryInfo, Qt, QTimer, QTranslator
+    from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    from PySide6.QtWidgets import QApplication
+
+    from viewer import errorlog, rollback, storage, theme
+    from viewer.main_window import MainWindow
+    from viewer.version import APP_VERSION
+except Exception:  # noqa: BLE001
+    import traceback
+    _startup_failed(traceback.format_exc())
+    raise
 
 # ユーザー毎に一意なサーバー名（同一PCの複数ユーザーでも衝突しない）
 try:
@@ -226,8 +253,16 @@ def main() -> int:
         _dark = False
     theme.apply_theme(app, dark=bool(_dark))
 
+    if getattr(sys, "frozen", False):
+        # 起動が最後まで進んだかの記録（Python ごと落ちて例外にならない失敗に
+        # 備える。2 回続けて進まなければ、前の版に戻すかを聞く）
+        if rollback.begin_startup(APP_VERSION):
+            return 0   # 前の版に戻す（終わったら書き戻して起動し直す）
+        app.aboutToQuit.connect(rollback.startup_done)
     window = MainWindow()
     window.show()
+    if getattr(sys, "frozen", False):
+        QTimer.singleShot(2000, rollback.startup_done)
     app._single_server = _start_server(window)  # GC されないよう参照を保持
 
     # 前回開いていたファイルを復元（設定が有効なときだけ）
@@ -242,4 +277,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        _code = main()
+    except Exception:  # noqa: BLE001
+        import traceback
+        _startup_failed(traceback.format_exc())
+        raise
+    raise SystemExit(_code)
