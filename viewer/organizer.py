@@ -13,12 +13,14 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMenu,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -229,7 +231,13 @@ class PageOrganizer(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
 
-        bar = QHBoxLayout()
+        # 操作ボタン（12 個）の列。そのまま置くと、この画面が（隠れていても）窓の
+        # 最小幅を 1100px 超に押し上げ、PDF を開いただけで窓を狭められなくなる
+        # （ノート PC の画面や、半分に並べる配置に収まらない）。狭いときは横に
+        # スクロールさせる。
+        bar_host = QWidget()
+        bar = QHBoxLayout(bar_host)
+        bar.setContentsMargins(0, 0, 0, 0)
         self._sel_label = QLabel("未選択")
         self._sel_label.setStyleSheet("font-weight:bold; color:#1a73e8;")
         bar.addWidget(self._sel_label)
@@ -263,12 +271,25 @@ class PageOrganizer(QWidget):
             self._btn_security,
         ):
             bar.addWidget(b)
-        layout.addLayout(bar)
+        bar_scroll = self._bar_scroll = QScrollArea()
+        bar_scroll.setWidget(bar_host)
+        bar_scroll.setWidgetResizable(True)
+        bar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        bar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        bar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        bar_scroll.setAutoFillBackground(False)
+        bar_scroll.viewport().setAutoFillBackground(False)
+        bar_host.setAutoFillBackground(False)
+        # スクロールバーが出ても、ボタンが欠けない高さにする
+        bar_scroll.setFixedHeight(bar_host.sizeHint().height()
+                                  + bar_scroll.horizontalScrollBar().sizeHint().height() + 2)
+        layout.addWidget(bar_scroll)
         hint = QLabel(
             "ページを選択して操作します（右クリックでもメニューが出ます）。"
             "Ctrl/Shift で複数選択できます。"
         )
         hint.setStyleSheet("color:#777;")
+        hint.setWordWrap(True)   # 折り返さないと、この 1 行ぶんの幅が窓の最小幅になる
         layout.addWidget(hint)
 
         self.grid = _Grid(self.THUMB)

@@ -27,6 +27,13 @@ from viewer.version import APP_VERSION, GITHUB_REPO
 
 def main() -> int:
     argv = sys.argv[1:]
+    if "--local-publish" not in argv:
+        print("release.py は使いません。viewer/version.py の APP_VERSION を上げてコミットし、\n"
+              "注釈付きタグ（git tag -a vX.Y.Z -m ...）を push すると、GitHub Actions が\n"
+              "テスト → ビルド → exe の起動確認 → 公開まで行います（BUILD.md を参照）。\n"
+              "手元から公開したいときだけ --local-publish を付けてください。")
+        return 2
+    argv = [a for a in argv if a != "--local-publish"]
     notes = "更新"
     if "--notes" in argv:
         i = argv.index("--notes")

@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 from . import ocr
 from . import settings_dialog as prefs
 from .document import PdfDocument
-from .util import parse_ranges
+from .util import unique_path, parse_ranges
 
 
 class ConvertMixin:
@@ -100,7 +100,8 @@ class ConvertMixin:
         op, ok = QInputDialog.getItem(self, "バッチ処理", "操作:", ops, 0, False)
         if not ok:
             return
-        out_dir = QFileDialog.getExistingDirectory(self, "出力先フォルダ")
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "出力先フォルダ", os.path.dirname(paths[0]) or self._export_dir())
         if not out_dir:
             return
         tessdata = None
@@ -131,15 +132,15 @@ class ConvertMixin:
                     continue
                 if op.startswith("圧縮"):
                     d.compress_to_advanced(
-                        os.path.join(out_dir, f"{stem}_compressed.pdf"),
+                        unique_path(os.path.join(out_dir, f"{stem}_compressed.pdf")),
                         max_dpi=150, jpeg_quality=72)
                 elif op.startswith("最適化"):
-                    d.compress_to(os.path.join(out_dir, f"{stem}_optimized.pdf"))
+                    d.compress_to(unique_path(os.path.join(out_dir, f"{stem}_optimized.pdf")))
                 elif op.startswith("各ページ"):
                     d.export_page_images(list(range(d.page_count)), out_dir,
                                          "png", 150, stem)
                 else:  # OCR
-                    d.ocr_to(os.path.join(out_dir, f"{stem}_ocr.pdf"),
+                    d.ocr_to(unique_path(os.path.join(out_dir, f"{stem}_ocr.pdf")),
                              "jpn+eng", tessdata, dpi=300)
                 d.close()
                 done += 1
@@ -210,6 +211,15 @@ class ConvertMixin:
         dlg = CompressDialog(self.doc, self.settings, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        try:
+            self._compress_with(dlg, human_size)
+        finally:
+            # 試算の結果を使わなかったとき（保存先でキャンセル・自分自身へ上書き・設定を
+            # 変えた・失敗）も、一時フォルダに数百 MB の試算ファイルを残さない
+            dlg.discard_cache()
+
+    def _compress_with(self, dlg, human_size) -> None:
+        """圧縮ダイアログで決めた設定で、保存先を選んで圧縮する。"""
         dlg.save_settings()
         opts = dlg.options()
 
@@ -368,10 +378,14 @@ class ConvertMixin:
         )
         if not ok:
             return
-        out_dir = QFileDialog.getExistingDirectory(self, "出力先フォルダを選択")
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "出力先フォルダを選択", self._export_dir())
         if not out_dir:
             return
         stem = os.path.splitext(os.path.basename(self.doc.path or "page"))[0]
+        if not self._confirm_overwrite(
+                [self.doc.image_output_name(out_dir, stem, i, fmt) for i in indices]):
+            return
         try:
             outputs = self.doc.export_page_images(indices, out_dir, fmt, dpi, stem)
         except Exception as exc:  # noqa: BLE001
@@ -390,7 +404,9 @@ class ConvertMixin:
         if not paths:
             return
         out, _ = QFileDialog.getSaveFileName(
-            self, "保存先 PDF", "images.pdf", "PDF ファイル (*.pdf)"
+            self, "保存先 PDF",
+            os.path.join(os.path.dirname(paths[0]) or self._export_dir(), "images.pdf"),
+            "PDF ファイル (*.pdf)"
         )
         if not out:
             return

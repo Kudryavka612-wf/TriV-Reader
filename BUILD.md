@@ -18,7 +18,7 @@ python build_exe.py            # フォルダ形式（推奨・起動が速い�
 - 初回ビルドは数分、サイズは約 210MB（PySide6/PyMuPDF を同梱するため）。
 
 ### 必要なもの（開発機）
-`pip install -r requirements.txt pyinstaller`
+`pip install -r requirements.txt "pyinstaller>=6.11,<7"`
 
 ### 補足
 - OCR の言語データはアプリが初回利用時に `%LOCALAPPDATA%\trivreader\tessdata` へ
@@ -118,23 +118,15 @@ python build_exe.py --sign C:\path\to\cert.pfx
   アプリは `https://github.com/<repo>/releases/latest/download/update.json` を見ます。
   （public リポジトリ推奨。利用者側の設定は不要）
 
-### ★ いちばん簡単な方法（1コマンド公開）
-GitHub CLI を使うと、ビルド〜zip化〜GitHub公開まで `release.py` 1つで完結します。
+### ★ 公開のしかた（タグを push する。`release.py` は使わない）
+`viewer/version.py` の `APP_VERSION` を上げてコミットし、`vX.Y.Z` の**注釈付き**タグを push します。
+GitHub Actions（`.github/workflows/release.yml`）が、テスト（`*_test.py` 全部）→ ビルド →
+できた exe の起動確認 → zip / Setup.exe / update.json の生成 → GitHub Releases への公開まで
+行います。次の節（リリースノート）を参照。
 
-準備（最初の一度だけ）:
-```powershell
-winget install GitHub.cli   # GitHub CLI を導入
-gh auth login               # ブラウザで認証（質問はEnter連打でOK）
-# viewer/version.py の GITHUB_REPO = "オーナー/リポジトリ" を設定
-```
-毎回:
-```powershell
-# version.py の APP_VERSION を上げてから
-python release.py --notes "更新内容"
-# ポータブル版なら: python release.py --portable --notes "..."
-```
-→ ビルド → zip/update.json生成 → タグ作成 → GitHubへアップロードまで自動。
-Webでのドラッグ＆ドロップは不要です。
+`release.py`（手元で 1 コマンド公開）は、テストも exe の起動確認もインストーラー生成も通らず、
+先にリリースを作ってしまって、あとから走る CI が「同じタグのリリースがある」で落ちます。
+そのため、`--local-publish` を付けない限り動かないようにしてあります。
 
 ### リリースノート
 GitHub Actions で公開する場合、**注釈付きタグのメッセージがそのまま

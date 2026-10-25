@@ -13,15 +13,17 @@ import datetime
 import os
 import sys
 import threading
+import time
 import traceback
 
 from . import storage
 
 MAX_BYTES = 512 * 1024      # これを超えたら 1 世代だけ回す
-MAX_DIALOGS = 3             # 同じ実行中にダイアログを出す上限（連発を防ぐ）
+MAX_DIALOGS = 3             # この時間内にダイアログを出す上限（連発を防ぐ）
+WINDOW_SEC = 600            # 上限を数える時間（秒）。常駐で何日も動くので、累計では数えない
 
 _lock = threading.Lock()
-_dialogs = 0
+_shown: list[float] = []    # ダイアログを出した時刻（time.monotonic）
 _installed = False
 
 
@@ -105,9 +107,11 @@ def open_log() -> bool:
 
 def _notify(path: str, summary: str) -> None:
     """利用者に短く知らせる。GUI が無ければ何もしない。"""
-    global _dialogs
-    if _dialogs >= MAX_DIALOGS:
-        return
+    now = time.monotonic()
+    _shown[:] = [t for t in _shown if now - t < WINDOW_SEC]
+    if len(_shown) >= MAX_DIALOGS:
+        return   # 連発のときだけ止める。累計で数えると、常駐で動き続けるうちに 3 回で
+                 # 以後は何も表示されず、ボタンが効かないように見えた
     try:
         from PySide6.QtCore import QTimer
         from PySide6.QtWidgets import QApplication, QMessageBox
@@ -116,7 +120,7 @@ def _notify(path: str, summary: str) -> None:
     app = QApplication.instance()
     if app is None:
         return
-    _dialogs += 1
+    _shown.append(now)
 
     def show() -> None:
         box = QMessageBox()
@@ -124,7 +128,7 @@ def _notify(path: str, summary: str) -> None:
         box.setWindowTitle("エラーが発生しました")
         box.setText("予期しないエラーが発生しました。\n"
                     "作業中の内容は残っていることが多いので、"
-                    "まず「名前を付けて保存」で保存してください。")
+                    "まず「別名保存」で保存してください。")
         box.setInformativeText(f"内容をログに記録しました:\n{path}\n\n{summary}")
         open_btn = box.addButton("ログを開く", QMessageBox.ButtonRole.ActionRole)
         box.addButton("閉じる", QMessageBox.ButtonRole.RejectRole)

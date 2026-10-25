@@ -200,6 +200,10 @@ class CompressDialog(QDialog):
     def _cache_key(opts: dict) -> tuple:
         return tuple(sorted(opts.items()))
 
+    def discard_cache(self) -> None:
+        """使われなかった試算ファイルを消す（呼び出し側が、使い終わったあとに呼ぶ）。"""
+        self._drop_cache()
+
     def _drop_cache(self) -> None:
         c, self._cache = self._cache, None
         if c and os.path.exists(c["path"]):
@@ -245,12 +249,14 @@ class CompressDialog(QDialog):
         try:
             stats = self._doc.compress_to_advanced(tmp, progress=progress, **opts)
         except Exception as exc:  # noqa: BLE001
+            self._remove_quietly(tmp)   # mkstemp が作った空のファイルを残さない
             self.result.setText(f"試算できませんでした: {exc}")
             return
         finally:
             self.btn_estimate.setEnabled(True)
             dlg.close()
         if stats.get("canceled"):
+            self._remove_quietly(tmp)
             self.result.setText("試算を中止しました")
             return
         after = os.path.getsize(tmp) if os.path.exists(tmp) else 0
@@ -258,6 +264,13 @@ class CompressDialog(QDialog):
             self._cache = {"key": self._cache_key(opts), "path": tmp, "stats": stats}
         self.result.setText(self.describe(self._before, after, stats)
                             + "　（この設定で保存すれば、試算の結果をそのまま使います）")
+
+    @staticmethod
+    def _remove_quietly(path: str) -> None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     @staticmethod
     def describe(before: int, after: int, stats: dict) -> str:

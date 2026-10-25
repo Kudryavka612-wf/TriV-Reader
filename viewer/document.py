@@ -236,6 +236,10 @@ class PdfDocument:
         # これが変わったら作り直す（MainWindow._after_renumber）。
         self.xref_epoch: int = 0
         self._renumber_listeners: list = []
+        # ページの構成・向きを変える操作の直前に呼ぶ関数（画面側が入力中の文字を
+        # 書き込み、古いページ番号を持つ検索結果・文字選択を捨てる）
+        self._pre_change_listeners: list = []
+        self._in_pre_change = False
         # ページ描画のキャッシュ（LRU）。スクロールで画面外に出たページを
         # 戻ったときに描き直さずに済ませる。合計バイト数で上限を決める。
         self._render_cache: "OrderedDict[tuple, QPixmap]" = OrderedDict()
@@ -244,6 +248,9 @@ class PdfDocument:
         # 中身が変わらない限り widgets() の再走査を避ける。
         self._fields_cache: dict[int, list] = {}
         self._authenticated: bool = True
+        # パスワード付きで開いた文書の保護（開いた時のパスワード・権限）。None=保護なし。
+        # 開いている文書は復号済みの作業用複製で、保存のたびにこれで付け直す
+        self._protect: dict | None = None
         self._doc_scripts_cache: dict[str, str] | None = None
         # 直前のコンボ選択でフォームの JS が変えた欄（画面の入力欄に反映する）
         self.last_form_effects = None
@@ -302,6 +309,38 @@ class PdfDocument:
             self._render_bytes -= (old.width() * old.height()
                                    * max(1, old.depth()) // 8)
 
+    def _protection_kwargs(self) -> dict:
+        """保存先にパスワードを付け直す指定（保護なしなら空）。
+
+        保存は AES-256 で、開いたときのパスワードを開くパスワード・所有者パスワード
+        の両方にし、権限（印刷・コピー等の許可）は元のままにする。元の所有者
+        パスワードは MuPDF が教えてくれないので引き継げない（開くパスワードと同じになる）。
+        """
+        if not self._protect:
+            return {}
+        return {"encryption": fitz.PDF_ENCRYPT_AES_256,
+                "user_pw": self._protect["user_pw"],
+                "owner_pw": self._protect["owner_pw"],
+                "permissions": self._protect["permissions"]}
+
+    def _adopt_decrypted(self, password: str) -> None:
+        """認証できた暗号化文書を、復号済みの作業用複製に差し替える。
+
+        MuPDF は、認証済みの暗号化文書で needs_pass を読んだり tobytes() を呼んだり
+        すると復号の鍵を壊し、その後の保存が「全ページ白紙・題名が文字化け」のファイル
+        になる（保存・印刷・ページ操作の取り消し用の控えが、どれもこの道を通る）。
+        認証した直後に 1 度だけ tobytes() で復号したバイト列を取り、以降はその複製
+        を作業用の文書にする。保存のたびに _protection_kwargs() で保護を付け直す。
+        """
+        old = self._doc
+        permissions = old.permissions   # 読むだけなら安全（先に控える）
+        data = old.tobytes()
+        self._doc = fitz.open("pdf", data)
+        old.close()
+        self._protect = {"user_pw": password, "owner_pw": password,
+                         "permissions": permissions}
+        self._invalidate_view_caches()
+
     def _save_doc(self, path: str, **kwargs) -> None:
         """開いている文書を path に保存する。開いている文書の番号は変えない。
 
@@ -310,26 +349,45 @@ class PdfDocument:
         注釈・注釈一覧が覚えているので、以前は保存した後に入れた値が PDF に
         書き込まれず、黙って消えていた。整理は複製の方でだけ行う。
         """
-        if self._doc.needs_pass or self._doc.is_encrypted:
-            # パスワード付きの文書は、指定が無ければパスワードを付けたまま保存
-            # する（PyMuPDF の既定は「外す」で、上書き保存しただけで保護が
-            # 外れていた）
+        for key, value in self._protection_kwargs().items():
+            # パスワード付きの文書は、指定が無ければパスワードを付けたまま保存する
+            # （PyMuPDF の既定は「外す」で、上書き保存しただけで保護が外れていた）
+            kwargs.setdefault(key, value)
+        if self._doc.is_encrypted and not self._protect:
+            # 開くパスワードの無い暗号化（編集・印刷の制限だけ）はそのまま引き継ぐ。
+            # needs_pass は読まない（認証済みの文書では鍵を壊す）
             kwargs.setdefault("encryption", fitz.PDF_ENCRYPT_KEEP)
-        if int(kwargs.get("garbage", 0) or 0) < 2:
+        if (int(kwargs.get("garbage", 0) or 0) < 2
+                or kwargs.get("encryption") == fitz.PDF_ENCRYPT_KEEP):
+            # 暗号化を引き継ぐ文書は複製すると外れてしまう。直接保存し、番号が変わった
+            # ことを知らせる
             self._doc.save(path, **kwargs)
-            return
-        if self._doc.needs_pass or self._doc.is_encrypted:
-            # パスワード付きの文書は複製するとパスワードが外れてしまう（解錠後は
-            # is_encrypted が False になるので needs_pass で見る）。直接保存し、
-            # 番号が変わったことを知らせる
-            self._doc.save(path, **kwargs)
-            self._renumbered()
+            if int(kwargs.get("garbage", 0) or 0) >= 2:
+                self._renumbered()
             return
         work = fitz.open("pdf", self._doc.tobytes())
         try:
             work.save(path, **kwargs)
         finally:
             work.close()
+
+    def add_pre_change_listener(self, fn) -> None:
+        """ページの構成・向きを変える操作の直前に呼ぶ関数を登録する。"""
+        if fn not in self._pre_change_listeners:
+            self._pre_change_listeners.append(fn)
+
+    def _notify_pre_change(self) -> None:
+        if self._in_pre_change:
+            return
+        self._in_pre_change = True
+        try:
+            for fn in list(self._pre_change_listeners):
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001  画面側の都合で操作を失敗させない
+                    pass
+        finally:
+            self._in_pre_change = False
 
     def add_renumber_listener(self, fn) -> None:
         """オブジェクト番号が付け直されたときに呼ぶ関数を登録する。"""
@@ -345,6 +403,30 @@ class PdfDocument:
             except Exception:  # noqa: BLE001  画面側の都合で保存を失敗させない
                 pass
 
+    @staticmethod
+    def _replace_atomically(path: str, write) -> None:
+        """write(一時ファイルのパス) で書いてから、path に置き換える。
+
+        保存先へ直接書くと、書き込みの途中で失敗した（容量不足・USB を抜いた・
+        ネットワークが切れた）とき、そこにあった既存のファイルが切り詰められて壊れ、
+        開けなくなる。一時ファイルに書き切ってから置き換えれば、失敗しても元のファイルは
+        そのまま残る。失敗したら一時ファイルも消す（OneDrive に残さない）。
+        """
+        tmp = path + ".tmp_save"
+        try:
+            write(tmp)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _save_to(self, path: str, **kwargs) -> None:
+        """開いている文書を path に保存する（元のファイルを壊さない書き方）。"""
+        self._replace_atomically(path, lambda tmp: self._save_doc(tmp, **kwargs))
+
     def _save_over_self(self, out_path: str, **kwargs) -> None:
         """開いているファイル自身へ上書きする（安全な順序で置き換える）。
 
@@ -354,16 +436,7 @@ class PdfDocument:
         閉じたきりの文書だけが残って未保存の編集ごと巻き添えになる。
         置き換えが成功してから開き直す。
         """
-        tmp = out_path + ".tmp_save"
-        self._save_doc(tmp, **kwargs)
-        try:
-            os.replace(tmp, out_path)
-        except OSError:
-            try:
-                os.remove(tmp)      # 中途半端な一時ファイルを残さない
-            except OSError:
-                pass
-            raise
+        self._save_to(out_path, **kwargs)
         # 開き直さない。開いている文書は保存した中身と同じで、ファイルも
         # 掴んでいない（メモリに読んで開いている）。開き直すとオブジェクト
         # 番号が付け直され、入力欄などが古い番号を指したままになる。
@@ -433,6 +506,13 @@ class PdfDocument:
             self._doc = fitz.open(stream=data, filetype="pdf")
         except Exception as exc:  # noqa: BLE001  英語の内部エラーを出さない
             raise RuntimeError(friendly_error(exc)) from exc
+        if self._doc.page_count == 0 and not self._doc.needs_pass:
+            # ページが 1 枚も無い（ページの木が壊れた）PDF は、開けたように見えて、
+            # 以後のどの操作も「ドキュメントが開かれていません」になる
+            self._doc.close()
+            self._doc = None
+            raise RuntimeError(
+                "このファイルにはページが 1 枚もありません（壊れている可能性があります）")
         self._invalidate_view_caches()  # 別の中身に差し替えた
         self.path = path
         self.modified = False
@@ -453,7 +533,8 @@ class PdfDocument:
 
     @property
     def is_encrypted(self) -> bool:
-        return bool(self._doc) and self._doc.is_encrypted
+        # 認証した文書は復号済みの作業用複製に差し替えるので、_protect でも見る
+        return self._protect is not None or (bool(self._doc) and self._doc.is_encrypted)
 
     @staticmethod
     def check_password(path: str, password: str) -> bool:
@@ -476,15 +557,20 @@ class PdfDocument:
     def authenticate(self, password: str) -> bool:
         if not self._doc:
             return False
+        # 認証の前に読む（認証済みの文書で needs_pass を読むと、復号の鍵を壊す）
+        needs = bool(self._doc.needs_pass)
         ok = self._doc.authenticate(password) > 0
         if ok:
             self._authenticated = True
+            if needs:
+                self._adopt_decrypted(password)
         return ok
 
     def close(self) -> None:
         if self._doc is not None:
             self._doc.close()
             self._doc = None
+            self._protect = None
             self.path = None
             self.modified = False
             self._doc_scripts_cache = None
@@ -710,16 +796,41 @@ class PdfDocument:
         """
         self._push_undo(index)
         page = self._doc.load_page(index)
+        rot = page.rotation
+        # 回転したページ（横向きのスキャンなど）では、rect は回転前の座標。画面で見える
+        # 向き（幅・高さ）で折り返しと枠を決め、回転前の座標に戻して、向きも渡す。
+        # 渡さないと、確定した文字が横倒し・上下逆になる
+        disp = self._to_display_rect(page, rect)
         if wrapped is None:
-            wrapped = wrap_freetext(text, rect.width, fontsize, fontname)
-        rect = self._fit_freetext_rect(rect, wrapped, fontsize, fontname)
+            wrapped = wrap_freetext(text, disp.width, fontsize, fontname)
+        disp = self._fit_freetext_rect(disp, wrapped, fontsize, fontname)
         annot = page.add_freetext_annot(
-            rect, wrapped, fontsize=fontsize, fontname=fontname, text_color=color
+            self._from_display_rect(page, disp), wrapped, fontsize=fontsize,
+            fontname=fontname, text_color=color, rotate=rot
         )
         self._finish_annot(annot)
         self._set_soft_text(annot.xref, text, wrapped)
         self.modified = True
         return annot.xref
+
+    @staticmethod
+    def _to_display_rect(page, rect):
+        """回転前の座標の rect を、画面に見える向きの rect にする（回転なしならそのまま）。"""
+        r = fitz.Rect(rect)
+        if not page.rotation:
+            return r
+        out = r * page.rotation_matrix
+        out.normalize()
+        return out
+
+    @staticmethod
+    def _from_display_rect(page, rect):
+        r = fitz.Rect(rect)
+        if not page.rotation:
+            return r
+        out = r * page.derotation_matrix
+        out.normalize()
+        return out
 
     @staticmethod
     def _fit_freetext_rect(rect, wrapped, fontsize, fontname):
@@ -737,8 +848,14 @@ class PdfDocument:
         self._finish_annot(annot)
         self.modified = True
 
+    @staticmethod
+    def stamp_size(text: str, fontsize: float = 20) -> tuple[float, float]:
+        """スタンプの箱の大きさ (幅, 高さ) pt。置く前の見本（ゴースト）も同じ式で出す。"""
+        tw = fitz.get_text_length(text or " ", fontname="japan", fontsize=fontsize)
+        return max(28.0, tw + fontsize * 0.9), fontsize + fontsize * 0.7
+
     def add_stamp(self, index, point, text, color=(0.85, 0.1, 0.1),
-                  fontsize=20) -> int:
+                  fontsize=20, center: bool = True) -> int:
         """枠付きテキストスタンプ（承認・済・日付など）を point に置く。
 
         文字幅からボックスサイズを見積もり、中央寄せの枠付き FreeText にする。
@@ -746,14 +863,18 @@ class PdfDocument:
         """
         self._push_undo(index)
         page = self._doc.load_page(index)
-        tw = fitz.get_text_length(text or " ", fontname="japan", fontsize=fontsize)
-        w = max(28.0, tw + fontsize * 0.9)
-        h = fontsize + fontsize * 0.7
-        x, y = float(point.x), float(point.y)
-        rect = fitz.Rect(x, y, x + w, y + h)
+        w, h = self.stamp_size(text, fontsize)
+        # 回転したページでは、画面で見える向きに箱を置いて回転前の座標に戻し、向きも渡す。
+        # center=True は、クリックした点が箱の中心（印鑑を押すのと同じ。左上を点に合わせると、
+        # 押したつもりの所から箱の分だけ右下にずれて、置き直しが要った）
+        dp = fitz.Point(point) * page.rotation_matrix if page.rotation else fitz.Point(point)
+        if center:
+            dp = fitz.Point(dp.x - w / 2, dp.y - h / 2)
+        rect = self._from_display_rect(
+            page, fitz.Rect(dp.x, dp.y, dp.x + w, dp.y + h))
         annot = page.add_freetext_annot(
             rect, text, fontsize=fontsize, text_color=color,
-            border_width=2, align=1)  # align=1: 中央寄せ
+            border_width=2, align=1, rotate=page.rotation)  # align=1: 中央寄せ
         self._finish_annot(annot)
         self.modified = True
         return annot.xref
@@ -835,11 +956,50 @@ class PdfDocument:
         n = 0
         for i in range(self.page_count):
             page = self._doc.load_page(i)
+            marks = [fitz.Rect(a.rect) for a in page.annots(types=(fitz.PDF_ANNOT_REDACT,))]
+            if marks:
+                self._blank_fields_under(page, marks)
+                # 範囲にかかる、本文を持つ注釈（付箋・コメント付きの注釈）も消す。
+                # apply_redactions は範囲に全部収まる注釈しか消さない
+                for a in list(page.annots()):
+                    if (a.type[0] != fitz.PDF_ANNOT_REDACT
+                            and (a.info.get("content") or "").strip()
+                            and any(fitz.Rect(a.rect).intersects(m) for m in marks)):
+                        page.delete_annot(a)
             applied = page.apply_redactions()
             # apply_redactions の戻りは版により bool/None。件数は annots から数える。
             n += 1 if applied else 0
         self.modified = True
         return n
+
+    def _blank_fields_under(self, page, marks: list) -> int:
+        """墨消しの範囲に（少しでも）かかる入力欄の値を空にする。空にした数を返す。
+
+        page.apply_redactions() はページの文字と絵だけを消し、入力欄（Widget）の値は
+        そのまま残す。黒い帯の下に値が残るので、コピーや文字の抽出で取り出せてしまう
+        （マイナンバーなどを伏せたつもりで配る使い方で、いちばん困る）。外観も作り直す。
+        """
+        blanked = 0
+        for w in page.widgets():
+            if not any(fitz.Rect(w.rect).intersects(m) for m in marks):
+                continue
+            try:
+                if w.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+                    if not self._set_checkbox(w, False):
+                        continue
+                elif w.field_type in (fitz.PDF_WIDGET_TYPE_TEXT,
+                                      fitz.PDF_WIDGET_TYPE_COMBOBOX,
+                                      fitz.PDF_WIDGET_TYPE_LISTBOX):
+                    # PyMuPDF は空の値を書かないので、set_field_value と同じ
+                    # jpfonts.update_widget で空にする
+                    w.field_value = ""
+                    jpfonts.update_widget(w)
+                else:
+                    continue
+                blanked += 1
+            except Exception:  # noqa: BLE001  1 欄の失敗で墨消し全体を止めない
+                continue
+        return blanked
 
     def pending_redactions(self, index: int) -> int:
         """そのページの未適用の墨消し注釈数。"""
@@ -880,6 +1040,16 @@ class PdfDocument:
         """
         if not self._doc:
             return 0
+        # 書式は、変更を始める前に確かめる。途中で「{会社名}」のような未知の項目に
+        # 当たると、1 ページ目だけ文字が入り、「未変更」のまま中途半端に残っていた
+        probe = {"date": "", "filename": "", "page": "1", "total": "1"}
+        for text in (left, center, right):
+            try:
+                (text or "").format(**probe)
+            except (KeyError, IndexError, ValueError) as exc:
+                raise ValueError(
+                    f"書式に使えない項目、またはかっこがあります（{exc}）。"
+                    "使えるのは {date} {filename} {page} {total} です") from exc
         self._push_doc_undo("ヘッダー/フッターの追加", None)
         import datetime
         today = datetime.date.today().isoformat()
@@ -928,15 +1098,29 @@ class PdfDocument:
         """index ページを複製して直後に挿入する（独立コピー）。"""
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        if not 0 <= index < self.page_count:
+            raise ValueError("複製するページが範囲外です")
         self._push_doc_undo("ページの複製", index)
-        self._doc.fullcopy_page(index, index + 1)
+        # 末尾のページは to=-1（最後へ）で複製する。to=ページ数は無効で、
+        # 1 ページだけの PDF や最終ページで ValueError になっていた
+        self._doc.fullcopy_page(index, index + 1 if index + 1 < self.page_count else -1)
         self.modified = True
 
     def set_crop(self, index: int, rect) -> None:
         """表示/出力範囲(CropBox)を設定する。rect は PDF 座標。"""
-        self._push_doc_undo("余白のトリミング", index)
         page = self._doc.load_page(index)
-        page.set_cropbox(rect)
+        # 画面で選んだ範囲は「今のページ」（今の CropBox の左上が原点）の座標。set_cropbox は
+        # MediaBox の左上が原点なので、今の CropBox の位置を足す。足さないと、トリミング済みの
+        # ページをもう一度切るとき、ドラッグした所とずれた範囲が切り取られていた
+        pos = page.cropbox_position
+        r = fitz.Rect(rect) + (pos.x, pos.y, pos.x, pos.y)
+        # ページの外へはみ出したぶんは切り詰める（ドラッグがページの端を越えただけで
+        # 「CropBox not in MediaBox」の例外になり、何も切れていなかった）
+        r &= fitz.Rect(page.mediabox)
+        if r.is_empty or r.width < 2 or r.height < 2:
+            raise ValueError("トリミングの範囲がページの外です")
+        self._push_doc_undo("余白のトリミング", index)
+        page.set_cropbox(r)
         self.modified = True
 
     def auto_crop_rect(self, index: int, margin=4.0):
@@ -948,8 +1132,13 @@ class PdfDocument:
             bbox = r if bbox is None else (bbox | r)
         if bbox is None:
             return None
+        # 文字の座標は回転前の向き。page.rect は回転後（横縦が入れ替わる）なので、
+        # /Rotate 90・270 のページでは、下側の文字が切れていた。回転前のページの
+        # 大きさ（今の CropBox の大きさ）で切り詰める
+        cb = page.cropbox
         bbox = fitz.Rect(bbox.x0 - margin, bbox.y0 - margin,
-                         bbox.x1 + margin, bbox.y1 + margin) & page.rect
+                         bbox.x1 + margin, bbox.y1 + margin) & fitz.Rect(
+                             0, 0, cb.width, cb.height)
         return bbox
 
     # --- メタデータ ----------------------------------------------------
@@ -1383,8 +1572,8 @@ class PdfDocument:
         """チェックボックスの ON/OFF を /AS・/V を直接書いて反映する。
 
         ON にするときは外観辞書(/AP/N)にある "Off" 以外の状態名を使う。
-        /V はフィールド（親があれば親、無ければウィジェット自身）に、/AS は
-        見た目を持つウィジェットに書く。
+        /V は欄（名前 /T のある辞書。jpfonts.field_xref）に、/AS は見た目を持つ
+        ウィジェットに書く。
         """
         xref = w.xref
         if on:
@@ -1398,9 +1587,10 @@ class PdfDocument:
             name = "/" + on_states[0]
         else:
             name = "/Off"
-        parent = self._doc.xref_get_key(xref, "Parent")
-        v_xref = int(parent[1].split()[0]) if parent and parent[0] == "xref" else xref
-        self._doc.xref_set_key(v_xref, "V", name)
+        # /V は欄（名前 /T のある辞書）に書く。「親があれば親」と決め打ちすると、欄と
+        # 一体のウィジェットの上にある /T 付きの途中ノードに書いてしまい、本人の値は
+        # Off のまま、兄弟のチェックボックスが全部 ON と読める
+        self._doc.xref_set_key(jpfonts.field_xref(self._doc, xref), "V", name)
         self._doc.xref_set_key(xref, "AS", name)
         return True
 
@@ -1700,8 +1890,14 @@ class PdfDocument:
             "line_ends": annot.line_ends,
             "opacity": annot.opacity,
             "content": annot.info.get("content", ""),
+            "title": annot.info.get("title", ""),   # 作成者名
         }
+        if desc["kind"] == "Text":
+            desc["icon"] = annot.info.get("name") or "Note"   # 付箋のアイコン
         if desc["kind"] == "FreeText":
+            # テキスト注釈の背景の塗りは /C に入る（annot.colors では "stroke" に出る）。
+            # 無いものは None（既定の "stroke" は黒で埋めてあるので、区別できない）
+            desc["ft_fill"] = colors.get("stroke") or None
             # 文字サイズ・フォント・文字色は /DA に入る（annot.colors の stroke は
             # 枠線色であって本文色ではない）。ここで拾わないと移動/リサイズ/Undo で
             # サイズも色も失われる。
@@ -1765,6 +1961,8 @@ class PdfDocument:
         w = width if width is not None else desc["width"]
         content = text if text is not None else desc["content"]
         old = desc["rect"]
+        fill_given = fill is not _UNSET
+        fill_arg = fill
         fill = desc.get("fill") if fill is _UNSET else fill
         dashes = desc.get("dashes") if dashes is _UNSET else dashes
         opacity = desc.get("opacity") if opacity is _UNSET else opacity
@@ -1774,7 +1972,10 @@ class PdfDocument:
             target = fitz.Rect(old.x0 + dx, old.y0 + dy, old.x1 + dx, old.y1 + dy)
 
         if kind == "Highlight":
-            annot = page.add_highlight_annot(target)
+            # 何行にもわたるハイライトは quad の列。外接矩形 1 枚で作り直すと、
+            # 塗られていなかった語（行間・行末の余白）まで塗れてしまう
+            quads = self._map_quads(desc.get("vertices"), old, target)
+            annot = page.add_highlight_annot(quads or target)
             annot.set_colors(stroke=stroke)
         elif kind == "Square":
             annot = page.add_rect_annot(target)
@@ -1789,22 +1990,29 @@ class PdfDocument:
             fn = fontname if fontname else (desc.get("fontname") or "helv")
             tc = color if color is not None else desc.get("text_color", stroke)
             soft = text if text is not None else desc.get("soft", content)
+            disp = self._to_display_rect(page, target)   # 画面で見える向きの枠
             if wrapped is None:
                 if (text is not None or new_rect is not None
                         or fontsize or fontname):
                     # 本文・幅・文字の大きさが変わったら折り返し直す
-                    wrapped = wrap_freetext(soft, target.width, fs, fn)
+                    wrapped = wrap_freetext(soft, disp.width, fs, fn)
                 else:
                     wrapped = content   # 移動・色替えなどは見た目の行をそのまま
             if desc.get("ft_border", 0) <= 0:
-                target = self._fit_freetext_rect(target, wrapped, fs, fn)
+                disp = self._fit_freetext_rect(disp, wrapped, fs, fn)
+            ft_kwargs = {}
+            ft_fill = fill_arg if fill_given else desc.get("ft_fill")
+            if ft_fill:   # 背景の塗り。渡さないと、動かす・書式を変える・取り消すたびに消えた
+                ft_kwargs["fill_color"] = tuple(ft_fill)
             annot = page.add_freetext_annot(
-                target, wrapped, fontsize=fs, fontname=fn, text_color=tc,
+                self._from_display_rect(page, disp), wrapped, fontsize=fs,
+                fontname=fn, text_color=tc,
                 border_width=desc.get("ft_border", 0) or 0,
-                align=desc.get("align", 0) or 0)
+                align=desc.get("align", 0) or 0, rotate=page.rotation, **ft_kwargs)
             self._set_soft_text(annot.xref, soft, wrapped)
         elif kind == "Text":
-            annot = page.add_text_annot(fitz.Point(target.x0, target.y0), content)
+            annot = page.add_text_annot(fitz.Point(target.x0, target.y0), content,
+                                        icon=desc.get("icon") or "Note")
         elif kind == "Ink":
             annot = page.add_ink_annot(self._map_ink(desc["vertices"], old, target))
             annot.set_colors(stroke=stroke)
@@ -1829,6 +2037,11 @@ class PdfDocument:
             return None
         if opacity is not None and 0 <= opacity < 1.0:
             annot.set_opacity(opacity)
+        if desc.get("title"):
+            try:
+                annot.set_info(title=desc["title"])   # 作成者名を引き継ぐ
+            except Exception:  # noqa: BLE001
+                pass
         self._update_annot(annot)
         self.modified = True
         return annot.xref
@@ -1870,6 +2083,10 @@ class PdfDocument:
         page = self._doc.load_page(index)
         annot = self._find_on(page, xref)
         if not annot:
+            return None
+        if annot.type[1] not in self._RECREATABLE:
+            # 他のアプリで付けたスタンプ・波線・多角形などは、作り直せない。消してから
+            # 気づくと、動かしただけで注釈が無くなる（取り消しでも戻らない）。何もしない
             return None
         self._push_undo(index)
         desc = self._describe(annot)
@@ -2032,13 +2249,48 @@ class PdfDocument:
             return
         self._append_history(("annot", index, snap, "注釈"))
 
+    # _recreate で作り直せる注釈の種類。これ以外（Acrobat などで付けたスタンプ・波線・
+    # 多角形・墨消しの印など）は、アプリが作らず、編集もしないので、取り消しでも触らない
+    _RECREATABLE = frozenset({"Highlight", "Square", "Circle", "FreeText", "Text",
+                              "Ink", "Line", "Underline", "StrikeOut"})
+
+    @staticmethod
+    def _desc_key(desc: dict) -> tuple:
+        """注釈の記述を、同じ注釈かどうかの比較用に丸めた形にする（xref は見ない）。"""
+        def norm(v):
+            if isinstance(v, (fitz.Rect, fitz.Point)):
+                return tuple(round(float(x), 1) for x in v)
+            if isinstance(v, float):
+                return round(v, 2)
+            if isinstance(v, (list, tuple)):
+                return tuple(norm(x) for x in v)
+            return v
+        return tuple(sorted((k, norm(v)) for k, v in desc.items()))
+
     def _restore_snapshot(self, index: int, snap: list) -> None:
-        """そのページの注釈を snap の状態に戻す。"""
+        """そのページの注釈を snap の状態に戻す。
+
+        ページの注釈を全部消して作り直すと、作り直せない種類（他のアプリで付けた
+        スタンプ・波線・多角形）や、作り直しで失われる属性（作成者・ハイライトの
+        複数行）まで、関係のない注釈を壊す。そのため、snap と同じ注釈には触らず、
+        違うもの（後から足した／編集した）だけを消して、無くなったものだけを作り直す。
+        """
         page = self._doc.load_page(index)
-        for a in list(page.annots()):
-            page.delete_annot(a)
+        want: dict[tuple, list] = {}
         for desc in snap:
-            self._recreate(page, desc)
+            want.setdefault(self._desc_key(desc), []).append(desc)
+        for annot in list(page.annots()):
+            if annot.type[1] not in self._RECREATABLE:
+                continue   # アプリが編集しない種類は、いつでもそのまま
+            bucket = want.get(self._desc_key(self._describe(annot)))
+            if bucket:
+                bucket.pop()          # 戻したい状態にも同じ注釈がある: 触らない
+            else:
+                page.delete_annot(annot)   # 戻したい状態には無い
+        for bucket in want.values():
+            for desc in bucket:
+                if desc["kind"] in self._RECREATABLE:
+                    self._recreate(page, desc)
         self._modified = True   # setter だと履歴を巻き込むので直接立てる
         self._invalidate_view_caches()
 
@@ -2052,6 +2304,9 @@ class PdfDocument:
         """
         if not self._doc:
             return
+        # 画面側の入力中の文字を、構成が変わる前に書き込む（ページ操作のボタンは
+        # フォーカスを取らないので、何もしないと打ちかけの文字が確認なしで消える）
+        self._notify_pre_change()
         if self._undo_group > 0 and self._group_pushed:
             return  # 同じ操作の 2 回目以降（1 回分にまとめる）
         try:
@@ -2220,11 +2475,11 @@ class PdfDocument:
         """複数ページをまとめて削除する（順序は維持）。"""
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
-        self._push_doc_undo("ページの削除", None)
         drop = set(indices)
         keep = [i for i in range(self.page_count) if i not in drop]
         if not keep:
             raise ValueError("すべてのページは削除できません")
+        self._push_doc_undo("ページの削除", None)   # 検証のあと（失敗で空の履歴を残さない）
         self._doc.select(keep)
         self.modified = True
 
@@ -2232,10 +2487,19 @@ class PdfDocument:
         """別の PDF を取り込む。at=None なら末尾に追加。挿入したページ数を返す。"""
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
-        self._push_doc_undo("PDF の結合", None)
         with fitz.open(other_path) as other:
+            # 挿入する前に確かめる。パスワード付きの PDF は、ページが 1 枚増えたあとで
+            # 英語の例外（document closed or encrypted）になり、空のページと無意味な
+            # 取り消しが残っていた
+            if other.needs_pass:
+                raise ValueError(
+                    "パスワード付きの PDF は結合・挿入できません。先にパスワードを外して"
+                    "（保護 → 解除）から、もう一度お試しください。")
             n = other.page_count
+            if n == 0:
+                raise ValueError("挿入する PDF にページがありません")
             start_at = self.page_count if at is None else at
+            self._push_doc_undo("PDF の結合", None)
             self._doc.insert_pdf(other, start_at=start_at)
         self.modified = True
         return n
@@ -2246,12 +2510,20 @@ class PdfDocument:
         """画像ファイルをページとして取り込む。挿入したページ数を返す。"""
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        # 全部の画像を先に PDF にしておく。途中の 1 枚が壊れていたとき、先の分だけ入って
+        # 画面に反映されず、取り消しにも無意味な項目が残っていた
+        converted = []
+        for p in image_paths:
+            try:
+                with fitz.open(p) as img_doc:
+                    converted.append(img_doc.convert_to_pdf())
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(
+                    f"画像「{os.path.basename(p)}」を読み込めません: {friendly_error(exc)}") from exc
         self._push_doc_undo("画像の取り込み", None)
         start = self.page_count if at is None else at
         added = 0
-        for p in image_paths:
-            with fitz.open(p) as img_doc:
-                pdf_bytes = img_doc.convert_to_pdf()
+        for pdf_bytes in converted:
             with fitz.open("pdf", pdf_bytes) as img_pdf:
                 self._doc.insert_pdf(img_pdf, start_at=start + added)
                 added += img_pdf.page_count
@@ -2259,6 +2531,19 @@ class PdfDocument:
         return added
 
     # --- 画像変換 -------------------------------------------------------
+    @staticmethod
+    def image_output_name(out_dir: str, stem: str, index: int, fmt: str) -> str:
+        """ページ画像の書き出し先（0 始まりの index）。確認と書き出しで同じ名前を使う。"""
+        ext = fmt.lower().lstrip(".")
+        ext = "jpg" if ext in ("jpg", "jpeg") else ext
+        return os.path.join(out_dir, f"{stem}_{index + 1:03d}.{ext}")
+
+    def split_output_names(self, n: int, out_dir: str, stem: str) -> list[str]:
+        """split_every が書き出すファイル名の一覧。"""
+        total = self.page_count
+        return [os.path.join(out_dir, f"{stem}_part{part:02d}.pdf")
+                for part in range(1, (total + max(1, n) - 1) // max(1, n) + 1)]
+
     def export_page_images(
         self,
         indices: list[int],
@@ -2281,7 +2566,7 @@ class PdfDocument:
         for i in indices:
             page = self._doc.load_page(i)
             pix = page.get_pixmap(matrix=matrix, alpha=False)
-            out_path = os.path.join(out_dir, f"{stem}_{i + 1:03d}.{ext}")
+            out_path = self.image_output_name(out_dir, stem, i, ext)
             pix.save(out_path)
             outputs.append(out_path)
         return outputs
@@ -2291,8 +2576,10 @@ class PdfDocument:
         """スキャンページの傾きを補正する。補正したページ数を返す。
 
         - テキストを持つページ（born-digital）は触らず原本を保持
-        - 画像/スキャンページは傾き角を推定し、補正画像で作り直す
-        progress(done, total) が False を返したら中断（変更は破棄）。
+        - 傾きが小さいスキャンページも触らず原本を保持（画像の作り直しで劣化・肥大させない）
+        - 傾いているスキャンページだけ、補正した画像を、元のページと同じ大きさのページに
+          貼って作り直す
+        しおり・文書情報は引き継ぐ。progress(done, total) が False を返したら中断（変更は破棄）。
         """
         import io
 
@@ -2308,24 +2595,35 @@ class PdfDocument:
         try:
             for i in range(total):
                 page = self._doc.load_page(i)
-                if skip_text_pages and page.get_text().strip():
-                    new.insert_pdf(self._doc, from_page=i, to_page=i)
-                else:
+                text_page = (skip_text_pages and page.get_text().strip()
+                             and not self._is_scanned(page))
+                fixed = None
+                if not text_page:
                     pix = page.get_pixmap(dpi=dpi, alpha=False)
                     img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
                     angle = deskew_mod.estimate_skew(img, limit=limit)
                     if abs(angle) >= 0.2:
                         img = img.rotate(angle, resample=Image.Resampling.BICUBIC,
                                          fillcolor=(255, 255, 255), expand=False)
-                        corrected += 1
-                    buf = io.BytesIO()
-                    img.save(buf, format="png")
-                    with fitz.open("png", buf.getvalue()) as imgdoc:
-                        with fitz.open("pdf", imgdoc.convert_to_pdf()) as ip:
-                            new.insert_pdf(ip)
+                        fixed = img
+                if fixed is None:
+                    new.insert_pdf(self._doc, from_page=i, to_page=i)   # 原本のまま
+                else:
+                    # 小さいほうを使う（文字のスキャンは PNG、写真は JPEG のほうが小さい）
+                    png, jpg = io.BytesIO(), io.BytesIO()
+                    fixed.save(png, format="png", optimize=True)
+                    fixed.save(jpg, format="jpeg", quality=88)
+                    data = png.getvalue() if png.tell() <= jpg.tell() else jpg.getvalue()
+                    # 元のページと同じ大きさ（画面に見える向きの大きさ）に貼る。画像だけの
+                    # ページを作ると解像度の指定が無く、96dpi 扱いで約 2 倍の大きさになった
+                    rect = page.rect
+                    out = new.new_page(width=rect.width, height=rect.height)
+                    out.insert_image(out.rect, stream=data)
+                    corrected += 1
                 if progress and not progress(i + 1, total):
                     new.close()
                     return -1  # 中断
+            self._carry_over_outline(new)
         except Exception:
             new.close()
             raise
@@ -2354,6 +2652,44 @@ class PdfDocument:
             new.close()
 
     # --- OCR（文字認識：透明テキスト層を付与） -----------------------
+    def _is_scanned(self, page) -> bool:
+        """ページ全体を 1 枚の画像が覆っている（スキャン）か。
+
+        ページ番号やスタンプなど、あとから少し文字を足したスキャンページは、文字が
+        あるというだけで「文字のあるページ」とされ、OCR も傾き補正もされなかった。
+        ロゴなど一部だけの画像は、スキャンとは見なさない（元の文書のまま残す）。
+        """
+        area = page.rect.width * page.rect.height
+        if area <= 0:
+            return False
+        try:
+            for info in page.get_image_info():
+                r = fitz.Rect(info["bbox"]) & page.rect
+                if r.width * r.height >= 0.8 * area:
+                    return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
+    def _carry_over_outline(self, new) -> None:
+        """作り直した文書 new に、しおり・文書情報（題名など）を移す。
+
+        ページ数が同じ作り直し（OCR・傾き補正）では、ページ番号のまま移せる。
+        """
+        try:
+            new.set_metadata(self._doc.metadata or {})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            toc = self._doc.get_toc(simple=False)
+            if toc and new.page_count == self._doc.page_count:
+                new.set_toc(toc)
+        except Exception:  # noqa: BLE001
+            try:
+                new.set_toc(self._doc.get_toc(simple=True))
+            except Exception:  # noqa: BLE001
+                pass
+
     def ocr_to(
         self,
         out_path: str,
@@ -2377,7 +2713,7 @@ class PdfDocument:
             total = self.page_count
             for i in range(total):
                 page = self._doc.load_page(i)
-                if skip_text_pages and page.get_text().strip():
+                if skip_text_pages and page.get_text().strip() and not self._is_scanned(page):
                     new.insert_pdf(self._doc, from_page=i, to_page=i)
                 else:
                     pix = page.get_pixmap(dpi=dpi)
@@ -2388,7 +2724,9 @@ class PdfDocument:
                         new.insert_pdf(opdf)
                 if progress and not progress(i + 1, total):
                     return False  # キャンセル
-            new.save(out_path, garbage=4, deflate=True)
+            self._carry_over_outline(new)   # 新しい文書に作り直すので、しおり・文書情報を移す
+            self._replace_atomically(
+                out_path, lambda t: new.save(t, garbage=4, deflate=True))
         finally:
             new.close()
         return True
@@ -2402,7 +2740,8 @@ class PdfDocument:
         try:
             for i in indices:
                 new.insert_pdf(self._doc, from_page=i, to_page=i)
-            new.save(out_path, garbage=4, deflate=True)
+            self._replace_atomically(out_path, lambda t: new.save(
+                t, garbage=4, deflate=True, **self._protection_kwargs()))
         finally:
             new.close()
 
@@ -2421,7 +2760,8 @@ class PdfDocument:
             new = fitz.open()
             try:
                 new.insert_pdf(self._doc, from_page=start, to_page=end)
-                new.save(out_path, garbage=4, deflate=True)
+                self._replace_atomically(out_path, lambda t: new.save(
+                    t, garbage=4, deflate=True, **self._protection_kwargs()))
             finally:
                 new.close()
             outputs.append(out_path)
@@ -2444,7 +2784,7 @@ class PdfDocument:
             if self.path and _same_path(self.path, out_path):
                 self._save_over_self(out_path, garbage=4, deflate=True)
             else:
-                self._save_doc(out_path, garbage=4, deflate=True)
+                self._save_to(out_path, garbage=4, deflate=True)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(friendly_error(exc, saving=True)) from exc
         self.path = out_path
@@ -2464,7 +2804,7 @@ class PdfDocument:
         if self.path and _same_path(self.path, out_path):
             raise ValueError("開いているファイルとは別名で保存してください")
         self._japanize_before_saving()
-        self._save_doc(
+        self._save_to(
             out_path,
             encryption=fitz.PDF_ENCRYPT_AES_256,
             owner_pw=owner_pw or user_pw,
@@ -2480,7 +2820,7 @@ class PdfDocument:
             raise RuntimeError("ドキュメントが開かれていません")
         if self.path and _same_path(self.path, out_path):
             raise ValueError("開いているファイルとは別名で保存してください")
-        self._save_doc(
+        self._save_to(
             out_path, encryption=fitz.PDF_ENCRYPT_NONE, garbage=3, deflate=True
         )
 
@@ -2501,7 +2841,8 @@ class PdfDocument:
         work = fitz.open("pdf", self._doc.tobytes())
         try:
             work.bake(annots=annots, widgets=widgets)
-            work.save(out_path, garbage=4, deflate=True)
+            self._replace_atomically(out_path, lambda t: work.save(
+                t, garbage=4, deflate=True, **self._protection_kwargs()))
         finally:
             work.close()
 
@@ -2783,6 +3124,12 @@ class PdfDocument:
         """
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        try:
+            fmt.format(n=start, total=1)
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                f"書式に使えない項目、またはかっこがあります（{exc}）。"
+                "使えるのは {n} {total} です") from exc
         self._push_doc_undo("ページ番号の追加", None)
         total = self.page_count
         for i in range(total):
@@ -2819,9 +3166,15 @@ class PdfDocument:
 
     def add_bookmark(self, title: str, page1: int, level: int = 1) -> None:
         """末尾にしおりを1件追加（page1 は1始まり）。"""
-        toc = self.get_toc()
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        # 既存のしおりは、飛び先の位置・倍率・色・太字などを持つ辞書（4 つ目）ごと取り直す。
+        # simple=True だと、ページ番号しか残らず、1 件足しただけで既存のしおり全部が
+        # ページの左上へ飛ぶ・書式なしになった
+        toc = self._doc.get_toc(simple=False)
         toc.append([max(1, level), title, page1])
-        self.set_toc(toc)
+        self._doc.set_toc(toc)
+        self.modified = True
 
     # --- 最適化（無劣化圧縮） -----------------------------------------
     def compress_to(self, out_path: str) -> None:
@@ -2842,7 +3195,7 @@ class PdfDocument:
                 self.path = out_path
                 self.modified = False
             else:
-                self._save_doc(out_path, **kwargs)
+                self._save_to(out_path, **kwargs)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(friendly_error(exc, saving=True)) from exc
 
@@ -3085,7 +3438,8 @@ class PdfDocument:
                     progress(len(targets), len(targets))
 
             kwargs = dict(garbage=4, deflate=True, deflate_images=True,
-                          deflate_fonts=True, clean=True, use_objstms=1)
+                          deflate_fonts=True, clean=True, use_objstms=1,
+                          **self._protection_kwargs())
             try:
                 if self.path and _same_path(self.path, out_path):
                     # 自分自身への上書き。置き換えが成功してから開き直す
@@ -3106,11 +3460,14 @@ class PdfDocument:
                         data = f.read()
                     self._doc.close()
                     self._doc = fitz.open(stream=data, filetype="pdf")
+                    if self._protect:   # 保護を付けて書いたので、開き直して復号する
+                        self._doc.authenticate(self._protect["user_pw"])
+                        self._adopt_decrypted(self._protect["user_pw"])
                     self._renumbered()   # 別の中身に差し替えた
                     self.path = out_path
                     self.modified = False
                 else:
-                    work.save(out_path, **kwargs)
+                    self._replace_atomically(out_path, lambda t: work.save(t, **kwargs))
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(friendly_error(exc, saving=True)) from exc
         finally:
@@ -3137,7 +3494,7 @@ class PdfDocument:
 
         # 現在の内容（注釈・回転等を反映）を一時PDFへ
         tmp = out_path + ".pre_pdfa"
-        self._save_doc(tmp, garbage=4, deflate=True)
+        self._save_doc(tmp, garbage=4, deflate=True, encryption=fitz.PDF_ENCRYPT_NONE)
         try:
             with pikepdf.open(tmp) as pdf:
                 with open(self.SRGB_ICC, "rb") as f:

@@ -212,23 +212,31 @@ def update_widget(widget) -> None:
         japanize_ap(doc, xref, serif=serif)
 
 
-def _clear_value(doc: "fitz.Document", xref: int) -> None:
-    """欄の値を空にする。PyMuPDF は空の値を書かない（消した文字が残っていた）。
+def field_xref(doc: "fitz.Document", xref: int) -> int:
+    """ウィジェット xref が属する「欄」（名前 /T を持つ辞書）の xref。
 
-    値（/V）はフィールド＝名前（/T）のある辞書が持つ。名前の無いウィジェットは
-    親のフィールドに書く。
+    値（/V）はフィールド＝名前（/T）のある辞書が持つ。ウィジェットが自分で /T を
+    持つ（欄と一体）ならその辞書、持たなければ（ラジオボタンのように）/T のある
+    親までさかのぼる。/T の無い途中のノードは欄ではない。
     """
     target = xref
     try:
         for _ in range(8):
             if doc.xref_get_key(target, "T")[0] == "string":
-                break
+                return target
             parent = doc.xref_get_key(target, "Parent")
             if parent[0] != "xref":
-                target = xref
-                break
+                return xref
             target = int(parent[1].split()[0])
-        doc.xref_set_key(target, "V", "()")
+    except Exception:  # noqa: BLE001
+        pass
+    return xref
+
+
+def _clear_value(doc: "fitz.Document", xref: int) -> None:
+    """欄の値を空にする。PyMuPDF は空の値を書かない（消した文字が残っていた）。"""
+    try:
+        doc.xref_set_key(field_xref(doc, xref), "V", "()")
     except Exception:  # noqa: BLE001
         pass
 

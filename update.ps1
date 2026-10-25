@@ -6,10 +6,12 @@ $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
 
-Write-Host "[1/3] 依存ライブラリを最新化..." -ForegroundColor Cyan
+Write-Host "[1/3] 依存ライブラリを最新化（requirements.txt の上限の範囲で）..." -ForegroundColor Cyan
 python -m pip install --upgrade pip
-# 描画/PDF エンジンを含め最新へ（脆弱性修正の取り込み）
-python -m pip install --upgrade PySide6 PyMuPDF pikepdf Pillow numpy pyinstaller
+# 描画/PDF エンジンを含め、試した版の範囲で最新へ（脆弱性修正の取り込み）。
+# パッケージ名を並べて --upgrade すると上限を無視して最新が入り、試していない版
+# （PyMuPDF 2.0 など）で再ビルドしてしまう。必ず requirements.txt 経由にする。
+python -m pip install --upgrade -r requirements.txt "pyinstaller>=6.11,<7"
 
 Write-Host "[2/3] バージョン確認..." -ForegroundColor Cyan
 python -c "import fitz, PySide6, pikepdf; print('PyMuPDF', fitz.__doc__.split()[1]); print('PySide6', PySide6.__version__); print('pikepdf', pikepdf.__version__)"

@@ -13,6 +13,30 @@ from PySide6.QtWidgets import QMessageBox, QProgressDialog
 from .util import parse_ranges
 
 
+_ORIGINAL_PAPER: dict[int, object] = {}   # 共有の QPrinter（id）→ 書き換える前の用紙
+
+
+def set_paper(printer, size) -> None:
+    """プリンターの用紙を指定する。
+
+    QPrinter はアプリを開いている間ずっと使い回す。プレビューや印刷で用紙を書き換えた
+    まま戻さないと、次に「プリンターの既定」で刷るときも前の用紙（B5 など）のまま
+    プレビューも出力も出てしまう。元の用紙を覚えておき、restore_paper で戻す。
+    """
+    _ORIGINAL_PAPER.setdefault(id(printer), printer.pageLayout().pageSize())
+    printer.setPageSize(size)
+
+
+def restore_paper(printer) -> None:
+    """set_paper で書き換えた用紙を、元（プリンターの既定）に戻す。"""
+    orig = _ORIGINAL_PAPER.pop(id(printer), None)
+    if orig is not None:
+        try:
+            printer.setPageSize(orig)
+        except Exception:  # noqa: BLE001  戻せないプリンターもある
+            pass
+
+
 def select_pages(opt: dict, total: int, current: int) -> list[int]:
     """ダイアログの選択内容から、刷るページ（0 始まり）を順に返す。
 
@@ -134,7 +158,9 @@ class PrintMixin:
         # 用紙。"auto"（PDF のページサイズに合わせる）はページごとに指定する。
         paper = opt.get("paper")
         if isinstance(paper, QPageSize):
-            printer.setPageSize(paper)
+            set_paper(printer, paper)
+        elif paper != "auto":
+            restore_paper(printer)   # 「プリンターの既定」: 前に変えた用紙を残さない
         # 向きは必ず指定する。指定しないとプリンター側の既定（横のまま等）が
         # 残り、「縦」を選んだのに横で出ることがある。
         printer.setPageOrientation(
@@ -215,6 +241,22 @@ class PrintMixin:
                     self._draw_page_in(painter, source, index, slot, opt, res,
                                        fit_only=True)
             progress.setValue(len(sheets))
+        except Exception as exc:  # noqa: BLE001
+            # 途中で失敗したら、描いた分は送らず捨てる（end だけだと、そこまでのページと
+            # できかけの 1 枚がプリンターから出てしまう）
+            printer.abort()
+            progress.cancel()
+            try:
+                from . import errorlog
+                errorlog.write(f"{type(exc).__name__}: {exc}", context="印刷の途中で失敗")
+            except Exception:  # noqa: BLE001
+                pass
+            QMessageBox.warning(
+                self, "印刷",
+                "印刷の途中で失敗したため、プリンターには送らずに中止しました。\n"
+                f"（{type(exc).__name__}: {exc}）\n\n"
+                "ページ数を減らすか、画質を「ベクター」にして、もう一度お試しください。")
+            return
         finally:
             if painter.isActive():
                 painter.end()
@@ -232,7 +274,7 @@ class PrintMixin:
         if size is None:
             return
         try:
-            printer.setPageSize(size)
+            set_paper(printer, size)
             # 横長のページは「A4 の横向き」として渡す。横長の寸法のまま渡すと
             # 定形外（ユーザー定義）用紙になり、複合機が手差しを待って止まる
             printer.setPageOrientation(

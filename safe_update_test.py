@@ -150,6 +150,74 @@ def test_backup_and_restore() -> None:
           and read(os.path.join(app, "unins000.exe")) == "uninstaller")
 
 
+def test_unusual_paths() -> None:
+    """日本語・空白・記号を含むパスでも、控え・入れ替え・戻しが動く。
+
+    入れ替え役の .cmd は OEM コードページ（日本語の Windows では cp932）で読まれる。
+    UTF-8 で書いて日本語のパスを埋めていた版は、利用者名やインストール先が日本語の
+    PC で、控えも入れ替えも戻しも黙って失敗した（ASCII の一時フォルダのテストでは
+    見つからなかった）。
+    """
+    saved = os.environ["LOCALAPPDATA"]
+    os.environ["LOCALAPPDATA"] = os.path.join(TMP, "山田 太郎", "AppData", "Local")
+    try:
+        app = os.path.join(TMP, "Program Files (x86)", "トリブ リーダー!&%^")
+        make_app(app, "old")
+        write(os.path.join(app, "TriVReader_data", "user.txt"), "my data")
+        new = os.path.join(TMP, "新しい版 (1)", "TriVReader")
+        make_app(new, "new")
+        write(os.path.join(new, "_internal", "only_in_new.txt"), "broken extra")
+        exe = os.path.join(app, "TriVReader.exe")
+        updater.apply_and_restart("", extracted=new, app_dir=app, exe_path=exe,
+                                  wait_pid=short_lived_pid(), restart=False)
+        check("[unusual paths] the update replaces the program",
+              wait_for(lambda: read(exe) == "exe new"))
+        backup = rollback.backup_dir()
+        check("[unusual paths] …after keeping the previous version",
+              wait_for(lambda: read(os.path.join(backup, "TriVReader.exe")) == "exe old", 10))
+        info = json.loads(read(rollback.info_path()) or "{}")
+        check("[unusual paths] …and records where it belongs", info.get("app_dir") == app,
+              str(info))
+        rollback.restore_and_restart(target_dir=app, exe=exe, wait_pid=short_lived_pid())
+        check("[unusual paths] going back restores the previous version",
+              wait_for(lambda: read(exe) == "exe old")
+              and wait_for(lambda: not os.path.exists(
+                  os.path.join(app, "_internal", "only_in_new.txt")), 10)
+              and read(os.path.join(app, "TriVReader_data", "user.txt")) == "my data")
+    finally:
+        os.environ["LOCALAPPDATA"] = saved
+
+
+def test_gives_up_when_the_app_does_not_exit() -> None:
+    """アプリが終わらないなら、動いている版を上書きしない（何もせず諦める）。
+
+    終了が取りやめられた（未保存の確認でキャンセル等）のにアプリが動き続けているとき、
+    入れ替え役が 60 秒で待ちきれて新しい版を上に書くと、実行中の exe は書き換えられず
+    新旧のファイルが混ざった状態になる。
+    """
+    app = os.path.join(TMP, "stuck_app")
+    write(os.path.join(app, "cmd.exe"), "exe old")   # 待つ相手の名前（cmd.exe）に合わせる
+    write(os.path.join(app, "_internal", "lib.txt"), "lib old")
+    new = os.path.join(TMP, "stuck_new")
+    write(os.path.join(new, "cmd.exe"), "exe new")
+    write(os.path.join(new, "_internal", "lib.txt"), "lib new")
+    stuck = subprocess.Popen(["cmd", "/c", "ping -n 60 127.0.0.1 >nul"],
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+    helper = os.path.join(tempfile.gettempdir(), "trivreader_update.cmd")
+    try:
+        updater.apply_and_restart("", extracted=new, app_dir=app,
+                                  exe_path=os.path.join(app, "cmd.exe"),
+                                  wait_pid=stuck.pid, restart=False, max_wait=2)
+        done = wait_for(lambda: not os.path.exists(helper), 30)
+        check("the helper gives up and removes itself when the app never exits", done)
+        check("…leaving the running version untouched",
+              read(os.path.join(app, "cmd.exe")) == "exe old"
+              and read(os.path.join(app, "_internal", "lib.txt")) == "lib old")
+    finally:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(stuck.pid)], capture_output=True)
+        stuck.wait()
+
+
 def test_startup_counter() -> None:
     # previous() は「このアプリのフォルダ（＝今の実行ファイルの場所）の控え」だけを見る
     shutil.rmtree(rollback.backup_dir(), ignore_errors=True)
@@ -189,6 +257,8 @@ def main() -> int:
         test_trial_run()
         test_skip()
         test_backup_and_restore()
+        test_unusual_paths()
+        test_gives_up_when_the_app_does_not_exit()
         test_startup_counter()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

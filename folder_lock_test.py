@@ -146,11 +146,16 @@ def test_ensure_safe_cwd(root: str) -> None:
 def test_launch_from_folder(root: str) -> None:
     """実際に CWD=そのフォルダ でアプリを起動しても掴んだままにしない。
 
-    エクスプローラのダブルクリック起動と同じ条件。既にアプリが起動中だと
-    単一インスタンス機構で即終了してしまうため、その場合はスキップする。
+    エクスプローラのダブルクリック起動と同じ条件。手元で本物のアプリが起動中でも
+    その窓に PDF を渡してしまわない（単一インスタンスの待ち受け名は利用者名で決まる
+    ので、試験用の名前に変える）。この環境変数を付けないと、起動中の本物のアプリ
+    のタブに試験用の PDF が開き、この確認は「別インスタンスが起動中」で省かれていた。
     """
     folder, _ = make_case(root, "launch")
-    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", TRIVREADER_SETTINGS_INI="throwaway",
+               USERNAME=f"trv_lock_test_{os.getpid()}")
+    for k in ("LOGNAME", "USER", "LNAME"):
+        env.pop(k, None)
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "main.py"), "sample.pdf"],
         cwd=folder, env=env,
@@ -158,8 +163,9 @@ def test_launch_from_folder(root: str) -> None:
     )
     try:
         time.sleep(2.0)  # インタプリタと PySide6 の読み込みを待つ
+        ok("the app launched from that folder is up", proc.poll() is None,
+           f"(exit {proc.poll()})")
         if proc.poll() is not None:
-            print("SKIP: 別インスタンスが起動中のため実プロセス検証を省略")
             return
         # 起動途中は CWD を掴んでいて当然なので、退避されるまで待って判定する
         check_movable(folder, "CWD=そのフォルダ で起動してもフォルダを移動できる",
@@ -210,6 +216,48 @@ def test_find_users(app: QApplication, root: str) -> None:
            "申請書.pdf" in text and "cmd.exe" in text and "作業フォルダ" in text
            and "→" in text, text[:200])
 
+        # 画面は固まらない: run() はすぐ戻り、調べている間もイベントが回る
+        # （同期で動かしていた版は、ファイル 300 個のフォルダで 5 秒、5000 個で 47 秒、
+        #  「応答なし」になった）
+        dlg = FolderUsersDialog(folder)
+        t0 = time.monotonic()
+        dlg.run()
+        ok("the lookup runs in the background and the dialog says so",
+           dlg.running() and time.monotonic() - t0 < 1.0
+           and "調べています" in dlg.text.toPlainText() and not dlg.again.isEnabled())
+        ticks = []
+        timer = QTimer()
+        timer.timeout.connect(lambda: ticks.append(1))
+        timer.start(10)
+        finished = dlg.wait_until_done()
+        timer.stop()
+        ok("…and shows the result when it is done",
+           finished and "申請書.pdf" in dlg.text.toPlainText() and dlg.again.isEnabled(),
+           dlg.text.toPlainText()[:60])
+        dlg.deleteLater()
+
+        # 閉じれば止まる。走っている最中に閉じても落ちない
+        from viewer import mw_tools
+        crowd = os.path.join(root, "多いフォルダ")
+        os.makedirs(crowd)
+        for i in range(400):
+            with open(os.path.join(crowd, f"f{i}.txt"), "w") as fh:
+                fh.write("x")
+        t0 = time.monotonic()
+        stopped = lockfinder.find(crowd, cancelled=lambda: True)
+        ok("a lookup that is cancelled returns at once, marked as cancelled",
+           stopped["cancelled"] and time.monotonic() - t0 < 5, f"{time.monotonic() - t0:.1f}s")
+        dlg = FolderUsersDialog(crowd)
+        dlg.run()
+        time.sleep(0.3)
+        dlg.reject()
+        ok("closing the dialog while it looks stops the lookup", not dlg.running())
+        for w in list(mw_tools._WORKERS):
+            w.wait(60000)
+        ok("…and the background thread ends by itself",
+           all(w.isFinished() for w in mw_tools._WORKERS))
+        dlg.deleteLater()
+
         # 上書き保存に失敗したときの画面から調べられる
         w = MainWindow()
         w.show()
@@ -236,6 +284,7 @@ def test_find_users(app: QApplication, root: str) -> None:
         orig_exec = FolderUsersDialog.exec
 
         def capture(self):
+            self.wait_until_done()   # 調べは別スレッドで動く
             seen["text"] = self.text.toPlainText()
             seen["folder"] = self.folder
             return 0

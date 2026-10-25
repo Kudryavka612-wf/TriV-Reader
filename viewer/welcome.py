@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .util import exists_fast
+
 MAX_RECENT = 5  # カードで出す最近のファイル数
 
 
@@ -123,7 +125,7 @@ class WelcomeWidget(QWidget):
             self._recent_box.removeWidget(tile)
             tile.deleteLater()
         self._tiles.clear()
-        alive = [p for p in (paths or []) if p and os.path.exists(p)][:MAX_RECENT]
+        alive = [p for p in (paths or []) if p and exists_fast(p)][:MAX_RECENT]
         self._recent_head.setVisible(bool(alive))
         for path in alive:
             tile = _RecentTile(path)

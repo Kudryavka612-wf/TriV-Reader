@@ -32,6 +32,8 @@ class TocDock(QDockWidget):
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.itemClicked.connect(self._on_clicked)
+        # キーボード（↑↓ で選んで Enter）でも飛べるように
+        self.tree.itemActivated.connect(self._on_clicked)
         self.setWidget(self.tree)
 
     def load(self, toc: list) -> None:
@@ -56,7 +58,8 @@ class TocDock(QDockWidget):
 
     def _on_clicked(self, item: QTreeWidgetItem) -> None:
         page = item.data(0, PAGE_ROLE)
-        if page:
+        # 行き先の無いしおり（ページ番号 -1）は何もしない。飛ぶと先頭ページへ行ってしまう
+        if page and int(page) > 0:
             self.page_requested.emit(int(page) - 1)
 
 
@@ -152,6 +155,12 @@ class TocEditDialog(QDialog):
                 raise ValueError(f"{r + 1} 行目: ページは 1〜{self._page_count} です")
             if not title:
                 raise ValueError(f"{r + 1} 行目: タイトルが空です")
+            # 階層は 1 つずつ深くなる（レベル 1 の次にいきなり 3 は PDF の決まりで
+            # 作れず、保存の段階で例外になって入力が失われていた）
+            if toc and level > toc[-1][0] + 1:
+                raise ValueError(
+                    f"{r + 1} 行目: レベルは、前の項目（レベル {toc[-1][0]}）より"
+                    f" 1 つ深い {toc[-1][0] + 1} までです")
             toc.append([level, title, page])
         # 先頭はレベル1である必要がある
         if toc and toc[0][0] != 1:

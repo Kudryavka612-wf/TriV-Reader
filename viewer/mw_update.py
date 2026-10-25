@@ -21,6 +21,10 @@ from . import settings_dialog as prefs
 from .version import APP_VERSION, TELEMETRY_URL
 
 
+class _Cancelled(Exception):
+    """待ち画面でキャンセルされた。"""
+
+
 class UpdateMixin:
     """更新の確認と、未対応フォームの匿名レポート。MainWindow に混ぜて使う。"""
 
@@ -43,7 +47,7 @@ class UpdateMixin:
         if names:
             self.statusBar().showMessage(
                 f"このフォームには未対応の入力補助が {len(names)} 件あります。"
-                "［ヘルプ > 未対応フォーム機能を報告用に保存］で書き出せます。", 8000)
+                "［リボン「表示」→ ヘルプ →「フォーム報告」］で書き出せます。", 8000)
             self._maybe_send_govform_telemetry(doc)
 
     def _telemetry_url(self) -> str:
@@ -94,7 +98,7 @@ class UpdateMixin:
             "送信する内容: 未対応の関数名 / フォーム側の定義 / アプリ・ライブラリ版 /\n"
             "　フォームの指紋（同一判定用）\n"
             "送信しない内容: あなたが入力した値・氏名・住所等の個人情報・ファイル名\n\n"
-            "この選択は［ヘルプ > 匿名レポートを送信する］でいつでも変更できます。")
+            "この選択は［設定（Ctrl+,）→ 更新 →「未対応フォームの匿名レポートを送る」］でいつでも変更できます。")
         yes = box.addButton("送信する", QMessageBox.ButtonRole.YesRole)
         no = box.addButton("送信しない", QMessageBox.ButtonRole.NoRole)
         box.setDefaultButton(no)
@@ -185,7 +189,7 @@ class UpdateMixin:
         if info:
             self.statusBar().showMessage(
                 f"新しいバージョン {info.get('version', '')} があります"
-                "（ファイル > 設定 > 更新 から更新できます）", 15000)
+                "（リボン「表示」→ ヘルプ →「更新を確認」から更新できます）", 15000)
 
     # --- 更新 / バージョン情報 ----------------------------------------
     def show_about(self) -> None:
@@ -210,6 +214,44 @@ class UpdateMixin:
             self.settings.setValue("update_url", url.strip())
             self.statusBar().showMessage("更新元URLを保存しました", 3000)
 
+    def _pump(self, text: str | None, fn, dialog: QProgressDialog | None = None):
+        """fn() を別スレッドで走らせ、終わるまで画面を動かし続けて結果を返す。
+
+        遅い処理（通信・展開）を画面のスレッドで直接走らせると「応答なし」になる。
+        text があれば、キャンセルできる待ち画面を出す（閉じられたら _Cancelled）。
+        fn が投げた例外はそのまま投げ直す。
+        """
+        import threading
+        import time
+
+        box: dict = {}
+
+        def work() -> None:
+            try:
+                box["result"] = fn()
+            except BaseException as exc:  # noqa: BLE001  画面側で投げ直す
+                box["error"] = exc
+
+        own = dialog is None
+        if own:
+            dialog = QProgressDialog(text, "キャンセル", 0, 0, self)
+            dialog.setWindowTitle("更新")
+            dialog.setMinimumDuration(0)
+            dialog.show()
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        while t.is_alive():
+            QApplication.processEvents()
+            if own and dialog.wasCanceled():
+                dialog.close()
+                raise _Cancelled()
+            time.sleep(0.02)
+        if own:
+            dialog.close()
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
     def check_for_update(self) -> None:
         from . import updater
 
@@ -225,17 +267,18 @@ class UpdateMixin:
             QMessageBox.information(
                 self, "更新元が未設定",
                 "更新元URLが設定されていません。\n"
-                "［ヘルプ > 更新元URLを設定］で update.json のURLを設定してください。",
+                "［リボン「表示」→ ヘルプ →「更新元URL」］で update.json のURLを設定してください。",
             )
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            info = updater.check(url, include_skipped=True)
+            # 通信が詰まっても画面を固めない（つながらない PC では最長 10 秒待つ）
+            info = self._pump("更新を確認しています…",
+                              lambda: updater.check(url, include_skipped=True))
+        except _Cancelled:
+            return
         except Exception as exc:  # noqa: BLE001
-            QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "更新の確認", f"確認できませんでした:\n{exc}")
             return
-        QApplication.restoreOverrideCursor()
         if not info:
             QMessageBox.information(self, "更新の確認", "お使いのバージョンは最新です。")
             return
@@ -283,13 +326,15 @@ class UpdateMixin:
             return
         # 入れ替える前に、新しい版がこの PC で起動できるかを試す（壊れた版を
         # 入れてしまうと、起動できず自動更新でも直せなくなる）
-        wait = QProgressDialog("新しい版がこの PC で動くかを確かめています…", None, 0, 0, self)
+        wait = QProgressDialog("新しい版を展開しています…", None, 0, 0, self)
         wait.setWindowTitle("更新")
         wait.setMinimumDuration(0)
         wait.show()
         QApplication.processEvents()
         try:
-            src_dir = updater.extract(zip_path)
+            # 展開は 300MB ほどを書くので、画面を固めないよう別スレッドで
+            src_dir = self._pump(None, lambda: updater.extract(zip_path), dialog=wait)
+            wait.setLabelText("新しい版がこの PC で動くかを確かめています…")
             ok, detail = updater.trial_run(src_dir, poll=QApplication.processEvents)
         except Exception as exc:  # noqa: BLE001
             ok, detail = False, str(exc)
@@ -308,12 +353,38 @@ class UpdateMixin:
                 "ため、更新を見送りました。今の版のままお使いいただけます。\n\n"
                 f"（詳しい内容: {last}）")
             return
-        try:
-            updater.apply_and_restart(zip_path, extracted=src_dir)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "更新", f"更新の適用に失敗しました:\n{exc}")
-            return
-        QMessageBox.information(
-            self, "更新", "アプリを終了して更新を適用します。\n自動的に再起動します。"
-        )
-        QApplication.instance().quit()
+        self._apply_update_and_quit(zip_path, src_dir)
+
+    def _apply_update_and_quit(self, zip_path: str, src_dir: str) -> None:
+        """アプリを本当に終了して、更新を入れ替える。
+
+        QApplication.quit() だけでは終わらない: 終了は closeEvent を通るので、タブが
+        開いていると「ウィンドウを閉じます。どうしますか？」が出る（既定の選択は
+        キャンセル）し、未保存の変更の確認でもキャンセルできる。取りやめると終了しない
+        のに、入れ替え役はアプリが終わるのを待つだけで、60 秒で待ちきれて、動いている
+        版の上に新しい版を書いてしまっていた（実行中の exe は書き換えられず、新旧が
+        混ざる）。そのため、先に本当に終了させ（未保存の変更は聞く）、終わると決まって
+        から入れ替え役を起動する。
+        """
+        from . import errorlog, updater
+
+        def _apply() -> None:
+            try:
+                updater.apply_and_restart(zip_path, extracted=src_dir)
+            except Exception as exc:  # noqa: BLE001  終了のさなかなので、記録だけ残す
+                try:
+                    errorlog.write(str(exc), context="更新の適用に失敗")
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # quit() は aboutToQuit をその場で（closeEvent の中で）出すので、close() の前につなぐ
+        app = QApplication.instance()
+        app.aboutToQuit.connect(_apply)
+        self._force_quit = True   # 確認とトレイへの退避を飛ばす（未保存の変更は聞く）
+        if not self.close():      # 未保存の確認で取りやめられた
+            self._force_quit = False
+            app.aboutToQuit.disconnect(_apply)
+            QMessageBox.information(
+                self, "更新",
+                "更新を取りやめました。保存していない変更が残っているため、"
+                "アプリを終了していません。\n保存してから、もう一度更新してください。")

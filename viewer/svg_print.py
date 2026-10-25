@@ -154,15 +154,16 @@ class _Renderer:
             ident = el.get("id")
             if ident:
                 self.ids[ident] = el
-        self._paths: dict[int, QPainterPath] = {}
+        self._paths: dict[tuple, QPainterPath] = {}
         self._images: dict[int, QImage] = {}
 
-    def path_of(self, el: ET.Element) -> QPainterPath:
-        key = id(el)
+    def path_of(self, el: ET.Element, rule: str = "fill-rule") -> QPainterPath:
+        """rule は塗りなら "fill-rule"、クリップなら "clip-rule"（偶奇規則の穴あきを守る）。"""
+        key = (id(el), rule)
         p = self._paths.get(key)
         if p is None:
             p = parse_path(el.get("d", ""))
-            p.setFillRule(Qt.FillRule.OddEvenFill if el.get("fill-rule") == "evenodd"
+            p.setFillRule(Qt.FillRule.OddEvenFill if el.get(rule) == "evenodd"
                           else Qt.FillRule.WindingFill)
             self._paths[key] = p
         return p
@@ -192,7 +193,10 @@ class _Renderer:
         for child in el:
             if child.tag != _SVG + "path":
                 raise Unsupported(f"clip child {child.tag}")
-            shape = (parse_transform(child.get("transform")) * xf).map(self.path_of(child))
+            # クリップの穴は clip-rule で決まる（fill-rule ではない）。読まないと、偶奇規則の
+            # 穴あきのクリップが塗りつぶされ、ロゴや複雑な図版が崩れる
+            shape = (parse_transform(child.get("transform")) * xf).map(
+                self.path_of(child, "clip-rule"))
             out = shape if out is None else out.united(shape)
         return out if out is not None else QPainterPath()
 

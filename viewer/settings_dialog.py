@@ -467,12 +467,17 @@ class SettingsDialog(QDialog):
         s.setValue("toc_dock_visible", self.cb_toc_dock.isChecked())
         s.setValue("annot_dock_visible", self.cb_annot_dock.isChecked())
 
+        annot_keys = ("annot/author", "annot/ink_color", "annot/highlight_color",
+                      "annot/width", "annot/opacity", "annot/text_size")
+        before = tuple(value(s, k) for k in annot_keys)
         s.setValue("annot/author", self.ed_author.text().strip())
         s.setValue("annot/ink_color", self._colors[self.btn_color].name())
         s.setValue("annot/highlight_color", self._colors[self.btn_hl_color].name())
         s.setValue("annot/width", self.sp_width.value())
         s.setValue("annot/opacity", self.sp_opacity.value())
         s.setValue("annot/text_size", self.sp_text.value())
+        # 注釈の既定を変えたときだけ、作業中のスタイルを既定に合わせ直す
+        self.annot_changed = before != tuple(value(s, k) for k in annot_keys)
 
         s.setValue("confirm_overwrite", self.cb_confirm_overwrite.isChecked())
         s.setValue("save/backup", self.cb_backup.isChecked())
@@ -489,7 +494,7 @@ class SettingsDialog(QDialog):
 
     def apply(self) -> None:
         self._store()
-        self.window.apply_preferences()
+        self.window.apply_preferences(annot_changed=self.annot_changed)
 
     def _on_ok(self) -> None:
         self.apply()
@@ -538,7 +543,9 @@ class SettingsDialog(QDialog):
         QMessageBox.information(self, "入力候補", "フォームの入力候補の履歴を消去しました。")
 
     def _check_update_now(self) -> None:
-        self._store()
+        # 確認に要るのは更新元だけ。_store() で全部の項目を確定すると、そのあとの
+        # 「キャンセル」で取り消せなくなる
+        self.settings.setValue("update_url", self.ed_update_url.text().strip())
         self.window.check_for_update()
 
     def _open_data_dir(self) -> None:

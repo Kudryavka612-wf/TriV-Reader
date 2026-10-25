@@ -57,6 +57,18 @@ def _selftest(out_path: str) -> None:
         lines.append(f"vector print path {'ok' if ok else 'fell back'}")
         from py_mini_racer import MiniRacer
         lines.append(f"V8 {MiniRacer().eval('6 * 7')}")
+        # 保存（パスワード・最適化）と、画像の再圧縮・傾き補正が使う部品。同梱漏れは
+        # 使った人の画面で初めて分かるので、ここで読み込みまで確かめる。軽量版は
+        # numpy / Pillow を同梱しない（lite.ini）ので、その 2 つは見ない。
+        import pikepdf
+        with pikepdf.open(path) as pk:
+            lines.append(f"pikepdf {pikepdf.__version__} pages={len(pk.pages)}")
+        from viewer import storage
+        if not storage.is_lite():
+            import numpy
+            from PIL import Image
+            Image.new("L", (4, 4)).tobytes()
+            lines.append(f"numpy {numpy.__version__} / Pillow {Image.__version__}")
         w.doc.modified = False
         w._force_quit = True
         w.close()
@@ -186,13 +198,64 @@ def _send_to_running(path: str) -> bool:
     sock.connectToServer(_SERVER_NAME)
     if not sock.waitForConnected(300):
         return False
-    sock.write((path or "").encode("utf-8"))
+    # 空のパス（引数なしの再起動）は 0 バイトの書き込みになり、相手に何も届かず
+    # ウィンドウが出てこない。改行を 1 つ送って「前面に出すだけ」を伝える
+    sock.write((path or "\n").encode("utf-8"))
     sock.flush()
     sock.waitForBytesWritten(1000)
     sock.disconnectFromServer()
     if sock.state() != QLocalSocket.LocalSocketState.UnconnectedState:
         sock.waitForDisconnected(1000)
     return True
+
+
+_primary_mutex = None   # 主インスタンスの印（プロセスが終わるまで握る）
+
+
+def _claim_primary() -> bool:
+    """このプロセスが主インスタンスになれるか。なれたら、終わるまで印を握る。
+
+    「起動中のインスタンスに接続できなければ自分が主」だけだと、エクスプローラーで
+    PDF を複数選んで Enter したときのように、ほぼ同時に起動した複数のプロセスが
+    全部「主」になる（先頭が待ち受けを始める前に、みな接続を試すため）。結果、
+    ウィンドウもトレイのアイコンも選んだ数だけ出て、後から開いた PDF は最後に
+    待ち受けを始めた 1 つにしか届かない。名前付きミューテックスで 1 つだけに決める。
+    """
+    global _primary_mutex
+    try:
+        import ctypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = k32.CreateMutexW(None, False, "Local\\" + _SERVER_NAME.replace("\\", "_"))
+        if not handle:
+            return True   # 印が作れないなら、これまで通り自分で動く
+        if ctypes.get_last_error() == 183:   # ERROR_ALREADY_EXISTS: ほかのプロセスが主
+            k32.CloseHandle(handle)
+            return False
+        _primary_mutex = handle
+        return True
+    except Exception:  # noqa: BLE001  Windows 以外・取れないときは従来どおり
+        return True
+
+
+def _hand_over_to_starting(path: str, timeout: float = 20.0) -> bool:
+    """起動の途中の主インスタンスが待ち受けを始めるのを待って、path を渡す。
+
+    渡せたら True（このプロセスは終わる）。主が終わった／現れなかったなら、
+    印を取り直して自分が主になる（False）。
+    """
+    import time
+
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if _send_to_running(path):
+            return True
+        if _claim_primary():
+            return False
+        time.sleep(0.15)
+    return False   # 主が固まっているときまで待たない（従来どおり自分でも動く）
 
 
 def _start_server(window: MainWindow) -> QLocalServer:
@@ -234,6 +297,9 @@ def main() -> int:
 
     # 既に起動中なら、そのインスタンスにパスを渡して即終了（同一ウィンドウのタブで開く）
     if _send_to_running(file_arg):
+        return 0
+    # 接続できなくても、ほぼ同時に起動した別のプロセスが主になりかけているかもしれない
+    if not _claim_primary() and _hand_over_to_starting(file_arg):
         return 0
 
     app.setApplicationName("TriV-Reader")

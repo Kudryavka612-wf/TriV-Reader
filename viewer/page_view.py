@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import (
-    QElapsedTimer, QEvent, QPoint, QRect, Qt, QTimer, Signal,
+    QElapsedTimer, QEvent, QPoint, QRect, QRectF, Qt, QTimer, Signal,
 )
 from PySide6.QtGui import (
     QColor,
@@ -327,6 +327,15 @@ class _TextAnnotEditor(QTextEdit):
         super().paintEvent(event)
 
     # --- 確定 / 取消 ------------------------------------------------------
+    def event(self, e) -> bool:
+        # Esc は、ウィンドウのショートカット（全画面の解除など）より先にここで受ける。
+        # 受けないと、全画面中に入力を Esc で終えようとして、全画面だけが解除され、
+        # 入力欄は開いたままだった
+        if e.type() == QEvent.Type.ShortcutOverride and e.key() == Qt.Key.Key_Escape:
+            e.accept()
+            return True
+        return super().event(e)
+
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:
             # Acrobat などと同じく Esc は「入力を終える」（消さない）。
@@ -354,6 +363,10 @@ class _TextAnnotEditor(QTextEdit):
         fw = _App.focusWidget()
         if isinstance(fw, (QAbstractSpinBox, QComboBox, QAbstractButton)):
             return  # ツールバーで設定調整中 → 編集を続ける
+        # 色の選択などのダイアログが開いている間（別のウィンドウに移っただけ）は、
+        # 確定しない。確定すると、選んだ色が入力中の文字に反映されない
+        if _App.activeModalWidget() is not None or _App.activeWindow() is not self.window():
+            return
         self._finish()
 
     def _finish(self) -> None:
@@ -612,6 +625,25 @@ HANDLE_DRAW = 9   # ハンドルの描画サイズ(px)
 HANDLE_HIT = 8    # ハンドルの当たり判定半径(px)
 
 
+def _active_handles(box):
+    """選択枠 box の、実際に使うハンドル {番号: 中心} と当たり判定の半径。
+
+    当たり判定の半径が 8px のままだと、1 文字だけの小さいテキストや細い線など、枠が
+    数十 px しかない注釈では、枠の中ほぼ全部がどれかのハンドルに当たる。掴んで動かした
+    つもりが、拡大縮小になっていた。枠が小さいときは、辺の中点のハンドルをやめて
+    四隅だけにし、当たりも枠に合わせて小さくする。
+    """
+    x0, y0, x1, y1 = box
+    w, h = abs(x1 - x0), abs(y1 - y0)
+    handles = _handle_centers(box)
+    if min(w, h) < 3 * HANDLE_DRAW or max(w, h) < 4 * HANDLE_DRAW:
+        handles = {k: v for k, v in handles.items() if k < 4}
+    radius = HANDLE_HIT if min(w, h) >= 4 * HANDLE_HIT else max(3.0, min(w, h) / 3.0)
+    if max(w, h) < 2 * HANDLE_DRAW:
+        return {}, radius   # ごく小さい枠は、動かすだけ（ハンドルは出さない）
+    return handles, radius
+
+
 def _handle_centers(box):
     """選択枠 (x0,y0,x1,y1) の8ハンドル中心。0-3=四隅, 4-7=各辺中点。"""
     x0, y0, x1, y1 = box
@@ -679,6 +711,13 @@ class _PageLabel(QLabel):
         self.setMouseTracking(True)   # ボタンを押していなくても move が来る
         self._press_link = None
         self._hover_link = None
+        self._hover_pos: QPoint | None = None   # スタンプを置く前の見本（ゴースト）の位置
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        super().leaveEvent(event)
+        if self._hover_pos is not None:
+            self._hover_pos = None
+            self.update()
 
     def apply_theme(self, dark: bool) -> None:
         """紙（未描画時のプレースホルダ）の色をテーマに合わせる。"""
@@ -786,6 +825,9 @@ class _PageLabel(QLabel):
         from PySide6.QtWidgets import QApplication
 
         pos = event.position().toPoint()
+        if self._view.tool == TOOL_STAMP and self._view.pending_stamp:
+            self._hover_pos = pos    # 置く前の見本（ゴースト）を、カーソルに付けて動かす
+            self.update()
         if self._markup_press:
             # ハイライト等の上で押して動かした → 注釈ではなく下の文字を選ぶ
             if (pos - self._press).manhattanLength() < QApplication.startDragDistance():
@@ -824,8 +866,11 @@ class _PageLabel(QLabel):
             d = pos - self._start
             # 選ぶつもりのクリックで手が少し動いただけで注釈がずれないよう、
             # OS のドラッグ開始距離を超えてから動かし始める
+            # しきい値は OS 既定（Windows で約 10px）の半分まで。大きいと、数 px だけ
+            # ずらしたいときに動かせず、動かし始めの瞬間に 10px 飛んで、思った位置に
+            # 置けなかった
             if (not self._move_started
-                    and d.manhattanLength() < QApplication.startDragDistance()):
+                    and d.manhattanLength() < min(4, QApplication.startDragDistance())):
                 return
             self._move_started = True
             self._move_offset = d
@@ -864,10 +909,15 @@ class _PageLabel(QLabel):
         if self._resizing:
             self._resizing = False
             box = self._cur_box
+            start_box = self._box_start
             self._cur_box = None
             self._box_start = None
             self._resize_handle = None
-            if box is not None:
+            # 掴んだだけで動かしていないなら何もしない。作り直すと、注釈の番号が変わり、
+            # 未保存の扱いになり、取り消しが 1 つ積まれ、テキストは折り返しが変わる
+            moved = (box is not None and start_box is not None
+                     and any(abs(a - b) >= 0.5 for a, b in zip(box, start_box)))
+            if moved:
                 self._view.resize_selection(self._index, box)
             self.update()
             return
@@ -1036,8 +1086,9 @@ class _PageLabel(QLabel):
         return abs(d.x()) <= 4 and abs(d.y()) <= 4
 
     def _handle_at(self, pos, box):
-        for hid, (hx, hy) in _handle_centers(box).items():
-            if abs(pos.x() - hx) <= HANDLE_HIT and abs(pos.y() - hy) <= HANDLE_HIT:
+        handles, radius = _active_handles(box)
+        for hid, (hx, hy) in handles.items():
+            if abs(pos.x() - hx) <= radius and abs(pos.y() - hy) <= radius:
                 return hid
         return None
 
@@ -1065,6 +1116,27 @@ class _PageLabel(QLabel):
                 else:
                     hp.fillRect(rect, QColor(255, 235, 0, 90))
             hp.end()
+        # スタンプを置く前の見本。クリックした点が箱の中心になるので、その位置・大きさ・
+        # 枠・文字のとおりに薄く見せる（置いてから位置や大きさが違うと分かる、をなくす）
+        if (self._hover_pos is not None and not self._drawing
+                and self._view.tool == TOOL_STAMP and self._view.pending_stamp):
+            st = self._view.pending_stamp
+            zz = max(0.1, self._view.zoom)
+            w_pt, h_pt = PdfDocument.stamp_size(st["text"], st["fontsize"])
+            # 枠線（2pt）の分、確定した注釈は左右・上下に 1pt ずつ広がる。見本も同じに
+            w_pt, h_pt = w_pt + 2, h_pt + 2
+            gr = QRectF(self._hover_pos.x() - w_pt * zz / 2, self._hover_pos.y() - h_pt * zz / 2,
+                        w_pt * zz, h_pt * zz)
+            gp = QPainter(self)
+            gp.setOpacity(0.6)
+            col = QColor(st["color"])
+            gp.setPen(QPen(col, 2 * zz))
+            gp.drawRect(gr.adjusted(zz, zz, -zz, -zz))   # 枠線は箱の内側に収まる
+            gf = QFont()
+            gf.setPixelSize(max(6, int(round(st["fontsize"] * zz))))
+            gp.setFont(gf)
+            gp.drawText(gr, Qt.AlignmentFlag.AlignCenter, st["text"])
+            gp.end()
         # 選択中の注釈の枠（移動/リサイズプレビュー・ハンドル）
         if not self._drawing:
             if self._view._text_editor is not None:
@@ -1080,13 +1152,25 @@ class _PageLabel(QLabel):
             x0, y0, x1, y1 = box
             rect = QRect(int(x0), int(y0), int(x1 - x0), int(y1 - y0))
             sp = QPainter(self)
+            if self._sel_moving and self._move_started and not self._resizing:
+                # 動かしている注釈の絵そのものを、動かす先に重ねて見せる（枠だけだと、
+                # 離したあとの見え方が分からず、一度で思った位置に置けなかった）
+                pm = self.pixmap()
+                if pm is not None and not pm.isNull():
+                    b0 = self._view.selection_box_label(self._index) or box
+                    src = QRect(int(b0[0]), int(b0[1]), int(b0[2] - b0[0]),
+                                int(b0[3] - b0[1])).intersected(pm.rect())
+                    if not src.isEmpty():
+                        sp.setOpacity(0.85)
+                        sp.drawPixmap(src.translated(self._move_offset).topLeft(), pm, src)
+                        sp.setOpacity(1.0)
             sp.setPen(QPen(QColor(26, 115, 232), 2, Qt.PenStyle.DashLine))
             sp.drawRect(rect)
             sp.fillRect(rect, QColor(26, 115, 232, 30))
             # リサイズハンドル（白地に青枠の四角）。文字に付いた注釈には出さない
             if not self._view.selection_is_markup():
                 sp.setPen(QPen(QColor(26, 115, 232), 1, Qt.PenStyle.SolidLine))
-                for hx, hy in _handle_centers(box).values():
+                for hx, hy in _active_handles(box)[0].values():
                     hr = QRect(int(hx - HANDLE_DRAW / 2), int(hy - HANDLE_DRAW / 2),
                                HANDLE_DRAW, HANDLE_DRAW)
                     sp.fillRect(hr, QColor(255, 255, 255))
@@ -1097,6 +1181,15 @@ class _PageLabel(QLabel):
         tool = self._view.tool
         color = self._view.tool_color(tool)
         rect = QRect(self._start, self._cur).normalized()
+        # 線の太さは pt（PDF）で決めているので、画面では倍率をかける。かけないと、
+        # ドラッグ中は細く見えて、確定すると太くなった（倍率 2 倍なら 2 倍）
+        z = max(0.1, self._view.zoom)
+        wpx = max(1.0, self._view.pen_width * z)
+        # 四角・円は、確定すると枠線が指定した範囲の内側に収まる。プレビューも同じに
+        half = wpx / 2.0
+        inner = QRectF(rect).adjusted(half, half, -half, -half)
+        if inner.width() < 1 or inner.height() < 1:
+            inner = QRectF(rect)
         qt_dash = {"solid": Qt.PenStyle.SolidLine, "dashed": Qt.PenStyle.DashLine,
                    "dotted": Qt.PenStyle.DotLine}.get(self._view.line_style, Qt.PenStyle.SolidLine)
         if tool in (TOOL_HIGHLIGHT, TOOL_UNDERLINE, TOOL_STRIKEOUT) and self._markup_boxes:
@@ -1118,26 +1211,26 @@ class _PageLabel(QLabel):
         elif tool == TOOL_PEN:
             pen_color = QColor(color)
             pen_color.setAlphaF(self._view.opacity)
-            painter.setPen(QPen(pen_color, max(1, self._view.pen_width), Qt.PenStyle.SolidLine,
+            painter.setPen(QPen(pen_color, wpx, Qt.PenStyle.SolidLine,
                                 Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
             for i in range(1, len(self._stroke)):
                 painter.drawLine(self._stroke[i - 1], self._stroke[i])
         elif tool in (TOOL_LINE, TOOL_ARROW):
             painter.setOpacity(self._view.opacity)
-            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width), qt_dash))
+            painter.setPen(QPen(QColor(color), wpx, qt_dash))
             painter.drawLine(self._start, self._cur)
             end_key = self._view.line_end
             if end_key == "none" and tool == TOOL_ARROW:
                 end_key = "closed_arrow"
-            self._draw_arrowhead(painter, self._start, self._cur, end_key, color)
-            self._draw_arrowhead(painter, self._cur, self._start, self._view.line_start, color)
+            self._draw_arrowhead(painter, self._start, self._cur, end_key, color, z)
+            self._draw_arrowhead(painter, self._cur, self._start, self._view.line_start, color, z)
         elif tool == TOOL_CIRCLE:
             painter.setOpacity(self._view.opacity)
-            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width), qt_dash))
+            painter.setPen(QPen(QColor(color), wpx, qt_dash))
             fill_rgb = self._view._fill_rgb()
             if fill_rgb is not None:
                 painter.setBrush(self._view.fill_color)
-            painter.drawEllipse(rect)
+            painter.drawEllipse(inner)
         elif tool == TOOL_REDACT:
             painter.fillRect(rect, QColor(0, 0, 0, 160))
         elif tool == TOOL_SNAPSHOT:
@@ -1147,18 +1240,19 @@ class _PageLabel(QLabel):
             painter.drawRect(rect)
         elif tool == TOOL_RECT:
             painter.setOpacity(self._view.opacity)
-            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width), qt_dash))
+            painter.setPen(QPen(QColor(color), wpx, qt_dash))
             fill_rgb = self._view._fill_rgb()
             if fill_rgb is not None:
                 painter.setBrush(self._view.fill_color)
-            painter.drawRect(rect)
+            painter.drawRect(inner)
         else:  # テキスト枠等のプレビュー
             painter.setPen(QPen(QColor(color), 1, Qt.PenStyle.DashLine))
             painter.drawRect(rect)
         painter.end()
 
     @staticmethod
-    def _draw_arrowhead(painter: QPainter, tail: QPoint, tip: QPoint, style: str, color) -> None:
+    def _draw_arrowhead(painter: QPainter, tail: QPoint, tip: QPoint, style: str, color,
+                        zoom: float = 1.0) -> None:
         """tail→tip 方向の終端に、style に応じた簡易的な線端記号を描く（ドラッグ中プレビュー用）。"""
         if style in ("none", None):
             return
@@ -1168,7 +1262,7 @@ class _PageLabel(QLabel):
         if length < 1:
             return
         ux, uy = dx / length, dy / length
-        size = 10
+        size = max(10, int(round(10 * zoom)))
         if style in ("open_arrow", "closed_arrow", "r_open_arrow", "r_closed_arrow"):
             spread = 0.5
             back = -ux if style.startswith("r_") else ux
@@ -1356,6 +1450,9 @@ class PageView(QScrollArea):
         self._index: int = 0
         self._zoom: float = 1.0
         self._cols = 1  # 1=通常 / 2=見開き
+        # 右ドラッグのジェスチャーを使うか。設定で切った状態は、文書を開き直しても
+        # 保つ（set_document で入れ直すと、新しいタブで有効に戻っていた）
+        self._gesture_enabled = True
         self._suspend_scroll = False
         self._dark = False
         # 「幅/縦に合わせる」の状態。文書を開く前でもリサイズが飛んでくる
@@ -1420,9 +1517,9 @@ class PageView(QScrollArea):
         self.dismiss_resume_offer()
         self._doc = doc
         doc.add_renumber_listener(self._on_doc_renumbered)
+        doc.add_pre_change_listener(self._before_doc_change)
         self._index = 0
         self._zoom = 1.0
-        self._gesture_enabled = True   # 右ドラッグのジェスチャーを使うか
         # 「幅/縦に合わせる」を選んでいるか（None=手動倍率）。
         # 選んでいる間はウィンドウ幅が変わるたびに合わせ直す。
         self._fit_mode = None
@@ -1703,7 +1800,11 @@ class PageView(QScrollArea):
         elif tool == TOOL_REDACT:
             self._doc.add_redaction(index, rect)
         elif tool == TOOL_CROP:
-            self._doc.set_crop(index, rect)
+            try:
+                self._doc.set_crop(index, rect)
+            except ValueError as exc:   # 範囲がページの外
+                self.status_message.emit(str(exc))
+                return
             self.reload(index)  # ページサイズが変わるので再構築
             return
         self._after_annot(index)
@@ -1793,6 +1894,15 @@ class PageView(QScrollArea):
                 w.committed.emit()
         finally:
             self._no_field_checks = prev
+
+    def _before_doc_change(self) -> None:
+        """ページの構成・向きが変わる直前。打ちかけの文字を書き込み、ページ番号で
+        持っている検索結果・文字選択を捨てる（変わったあとでは別のページを指す）。"""
+        self.finish_text_edit()
+        if self._search_hits:
+            self.clear_search()
+        if self._text_sel_text or self._text_sel:
+            self.clear_text_selection()
 
     def _on_doc_renumbered(self) -> None:
         """文書のオブジェクト番号が付け直された（パスワード付きの保存など）。
@@ -2450,10 +2560,26 @@ class PageView(QScrollArea):
         if not self._doc or not self._doc.is_open:
             self._zoom = zoom
             return
+        if self._labels and abs(zoom - self._zoom) < 1e-6:
+            return   # 同じ倍率。全ページの大きさ直し・入力欄の作り直しをしない
         anchor = self._index  # ズーム後も同じページを画面に保つ
+        # ページの中の、画面の上端がある位置（ページの高さに対する割合）。倍率を変えた
+        # あとも同じ所を見せる（ページの先頭へ飛ぶと、読んでいた所や入力中の欄を見失う）
+        frac = 0.0
+        if 0 <= anchor < len(self._labels) and self._labels[anchor].height() > 0:
+            lab = self._labels[anchor]
+            frac = (self.verticalScrollBar().value() - (lab.y() - PAGE_SPACING)) / lab.height()
+            frac = max(0.0, min(frac, 1.0))
         self._zoom = zoom
         self._resize_all()
         self.set_page(anchor)
+        if frac > 0 and 0 <= anchor < len(self._labels):
+            lab = self._labels[anchor]
+            self._suspend_scroll = True
+            self.verticalScrollBar().setValue(
+                int(lab.y() - PAGE_SPACING + frac * lab.height()))
+            self._suspend_scroll = False
+            self._render_visible()
         if self._text_editor is not None:
             # 入力中の欄も新しい倍率の位置・文字の大きさに合わせ直す
             self._apply_text_editor_style()
@@ -2484,7 +2610,12 @@ class PageView(QScrollArea):
             margin = PAGE_SPACING * (self._cols + 2) + 8
             # ウィンドウが未表示だとビューポートが極小のことがある。そのまま
             # 割ると極端な倍率になるので下限を置き、表示後に合わせ直す。
-            avail = max(120, self.viewport().width() - margin)
+            # 縦スクロールバーが出ている間は viewport が狭くなる。バーの出入りで
+            # 幅が変わると、倍率が変わってページの高さが変わり、またバーが出入りして、
+            # 1 ページの文書で倍率が止まらず往復していた（CPU を使い続ける）。バーの
+            # 分を常に引いて、出ていても出ていなくても同じ幅で割る
+            full = self.maximumViewportSize().width() - self.verticalScrollBar().sizeHint().width()
+            avail = max(120, full - margin)
             self._fit_page_size = self._doc.page_pixel_size(self._index, zoom=1.0)
             self.set_zoom(avail / (w * self._cols), _keep_fit=True)
 
@@ -2510,6 +2641,14 @@ class PageView(QScrollArea):
             event.accept()
             return
         super().wheelEvent(event)
+
+    def refresh_form_overlays(self) -> None:
+        """入力欄を今のページの形に合わせて作り直す（回転などのあと）。"""
+        if not self._form_mode or not self._doc or not self._doc.is_open:
+            return
+        self._remember_focused_field()
+        self._clear_form_overlays()
+        self._overlay_rebuild_timer.start()
 
     def refresh_page(self, index: int) -> None:
         """1 ページを再描画（回転後などサイズが変わる場合に対応）。"""
@@ -3137,6 +3276,9 @@ class PageView(QScrollArea):
         if self._form_mode:
             self._build_form_overlays()
 
+    def is_facing(self) -> bool:
+        return self._cols == 2
+
     def set_facing(self, on: bool) -> None:
         """見開き表示(2列)のオン/オフ。"""
         cols = 2 if on else 1
@@ -3281,6 +3423,16 @@ class PageView(QScrollArea):
             self.delete_selection()
             return
         key = event.key()
+        # 注釈を選んでいるときの矢印キーは、その注釈を動かす（1px、Shift で 10px）。
+        # マウスだけだと、数 px の微調整が効かず、思った位置に置けなかった
+        if (key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down)
+                and self.has_selection() and self._text_editor is None
+                and not self.selection_is_markup()):
+            step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+            dx = {Qt.Key.Key_Left: -step, Qt.Key.Key_Right: step}.get(key, 0)
+            dy = {Qt.Key.Key_Up: -step, Qt.Key.Key_Down: step}.get(key, 0)
+            self.move_selection(self._sel_index, QPoint(0, 0), QPoint(dx, dy))
+            return
         # ← → でページ送り、↑ ↓ でスクロール
         if key == Qt.Key.Key_Right:
             self.set_page(self._index + 1)

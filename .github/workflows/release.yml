@@ -29,7 +29,8 @@ jobs:
       - name: 依存インストール
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          # pyinstaller も上限を付ける（手元で試したのは 6.21）
+          pip install -r requirements.txt "pyinstaller>=6.11,<7"
 
       - name: バージョンとタグの一致確認
         shell: pwsh
@@ -44,37 +45,22 @@ jobs:
         run: |
           # 1 本でも落ちたらここで止める。pwsh は既定だと途中の python の失敗を
           # 無視し、最後のコマンドの終了コードしか見ない。
-          $PSNativeCommandUseErrorActionPreference = $true
-          python smoke_test.py
-          python updater_test.py
-          python govform_interact_test.py
-          python govform_input_test.py
-          python annot_interact_test.py
-          python annot_list_test.py
-          python folder_lock_test.py
-          python settings_test.py
-          python zoom_test.py
-          python print_test.py
-          python print_paper_test.py
-          python text_select_test.py
-          python gesture_test.py
-          python compress_test.py
-          python compress_gui_test.py
-          python render_cache_test.py
-          python theme_test.py
-          python robust_test.py
-          python undo_test.py
-          python session_test.py
-          python links_test.py
-          python tabs_test.py
-          python print_pages_test.py
-          python compress_cache_test.py
-          python text_edit_test.py
-          python jp_font_test.py
-          python acrobat_parity_test.py
-          python form_logic_test.py
-          python svg_print_test.py
-          python safe_update_test.py
+          # 一覧は手で書かず、*_test.py を全部回す（書き足し忘れて、テストがあるのに
+          # リリースの関門に入っていない、が起きない）。外すものはここに理由つきで書く。
+          $skip = @(
+            "ocr_test.py"   # 手元に入れた Tesseract（Program Files）の言語データが前提
+          )
+          $failed = @()
+          foreach ($t in Get-ChildItem -Filter "*_test.py" | Sort-Object Name) {
+            if ($skip -contains $t.Name) { continue }
+            Write-Host "=== $($t.Name)"
+            python $t.Name
+            if ($LASTEXITCODE -ne 0) { $failed += $t.Name }
+          }
+          if ($failed.Count -gt 0) {
+            Write-Error ("失敗したテスト: " + ($failed -join ", "))
+            exit 1
+          }
 
       - name: ビルド（exe 化）
         run: python build_exe.py

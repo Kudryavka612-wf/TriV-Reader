@@ -172,10 +172,27 @@ def test_real_printer(root: str) -> None:
     w.close()
 
 
+def test_clip_rule() -> None:
+    """偶奇規則（W*）のクリップの穴を守る。読まないと穴まで塗りつぶされ、ロゴなどが崩れる。"""
+    d = fitz.open()
+    pg = d.new_page(width=300, height=300)
+    xref = d.get_new_xref()
+    d.update_object(xref, "<<>>")
+    d.update_stream(xref, b"q 50 50 200 200 re 100 100 100 100 re W* n "
+                          b"1 0 0 rg 0 0 300 300 re f Q")
+    d.xref_set_key(pg.xref, "Contents", f"{xref} 0 R")
+    share = off_share(pg)
+    check("an even-odd clip keeps its hole when printed as vectors",
+          share is not None and share < 0.01,
+          "(fell back to raster)" if share is None else f"({share * 100:.2f}% off)")
+    d.close()
+
+
 def main() -> int:
     app = QApplication(sys.argv[:1])  # noqa: F841
     root = tempfile.mkdtemp(prefix="trv_svgprint_")
     try:
+        test_clip_rule()
         test_fidelity(root)
         test_unsupported(root)
         test_real_printer(root)

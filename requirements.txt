@@ -1,12 +1,16 @@
-# 版は上限も決める。CI（配布 exe を作る所）は下限だけだと毎回いちばん新しい版を
-# 入れるため、試していない版がそのまま配られる。v1.8.0 は PyMuPDF 2.0 が入り、
+# -*- coding: utf-8 -*-
+# (pip は要件ファイルを、この行がないと OS の文字コードで読む。日本語の Windows (cp932) だと
+#  UnicodeDecodeError で入らない。必ず 1 行目に置くこと)
+# 版は上限も決める（全部）。CI（配布 exe を作る所）は下限だけだと毎回いちばん新しい版を
+# 入れるため、試していない版がそのまま配られる。上限は「手元で試した版の次のメジャー」
+# （pikepdf 10.9 / Pillow 12.2 / numpy 2.5 / mini-racer 0.14.1）。v1.8.0 は PyMuPDF 2.0 が入り、
 # 起動時に同梱していない AI レイアウト解析（onnxruntime）を読み込もうとして
 # 起動できなかった。上げるときは手元で試してから上限を動かすこと（1.28 は未確認）。
 PySide6>=6.11,<6.13
 PyMuPDF>=1.27,<1.28
-pikepdf>=10
-Pillow>=10        # 画像処理（傾き補正など）
-numpy>=1.26       # 傾き補正の射影プロファイル計算
+pikepdf>=10,<11
+Pillow>=10,<13    # 画像処理（傾き補正など）
+numpy>=1.26,<3    # 傾き補正の射影プロファイル計算
 # 官公庁フォームの「丸で選択」JS トグル実行用（V8同梱・ビルド不要）。
 # 配布名は "mini-racer"（後継メンテナ bpcreech 版）、import 名は py_mini_racer。
 # 旧配布 "py_mini_racer" は 0.6.0 が最後で、PyInstaller で固めると V8 DLL の
@@ -14,7 +18,7 @@ numpy>=1.26       # 傾き補正の射影プロファイル計算
 # サブフォルダに置く）DLL を見つけられず、凍結ビルドで JS 実行が黙って失敗する。
 # mini-racer 0.7.0 以降は _MEIPASS/py_mini_racer/ を見るため同梱と整合する
 # （GitHub issue bpcreech/PyMiniRacer#78）。凍結ビルドで実機確認したのは 0.14.x。
-mini-racer>=0.14.0
+mini-racer>=0.14.0,<0.15
 
 # OCR は PyMuPDF 内蔵の Tesseract を使うため追加の pip パッケージは不要。
 # 言語データ(*.traineddata)のみ必要で、アプリが自動で

@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import subprocess
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QUrl
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QShortcut,
 )
@@ -39,14 +39,66 @@ from PySide6.QtWidgets import (
 )
 
 
+_WORKERS: set = set()   # 画面を閉じられても、走っている調べは終わるまで捨てない
+_QUIT_HOOKED = False
+
+
+def _stop_all_workers() -> None:
+    """アプリを終わらせるとき、走っている調べを止めて待つ（走ったまま捨てると落ちる）。"""
+    for w in list(_WORKERS):
+        w.stop()
+    for w in list(_WORKERS):
+        w.wait(5000)
+
+
+class _FindWorker(QThread):
+    """フォルダを使っているアプリを調べる（時間がかかるので画面とは別のスレッドで）。"""
+
+    progress = Signal(int, int)
+    result = Signal(object)   # find() の結果（dict）、失敗したら例外
+
+    def __init__(self, folder: str) -> None:
+        super().__init__()
+        self.folder = folder
+        self._stop = False
+        global _QUIT_HOOKED
+        for old in list(_WORKERS):   # 終わったものを片づける（スレッドの外から消す）
+            if old.isFinished():
+                old.wait()
+                _WORKERS.discard(old)
+        _WORKERS.add(self)
+        app = QApplication.instance()
+        if app is not None and not _QUIT_HOOKED:
+            app.aboutToQuit.connect(_stop_all_workers)
+            _QUIT_HOOKED = True
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        from . import lockfinder
+
+        try:
+            out = lockfinder.find(self.folder, progress=self.progress.emit,
+                                  cancelled=lambda: self._stop)
+        except Exception as exc:  # noqa: BLE001
+            out = exc
+        self.result.emit(out)
+
+
 class FolderUsersDialog(QDialog):
-    """フォルダを使っているアプリの一覧。もう一度調べる・別のフォルダを選べる。"""
+    """フォルダを使っているアプリの一覧。もう一度調べる・別のフォルダを選べる。
+
+    調べるのは数秒〜数十秒かかる（ファイルが多いほど）。画面は固めず、進み具合を出し、
+    閉じれば止める。
+    """
 
     def __init__(self, folder: str, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("フォルダを使っているアプリ")
         self.resize(640, 420)
         self.folder = folder
+        self._worker: _FindWorker | None = None
         lay = QVBoxLayout(self)
         self.where = QLabel()
         self.where.setWordWrap(True)
@@ -71,20 +123,59 @@ class FolderUsersDialog(QDialog):
             self.folder = os.path.normpath(folder)
             self.run()
 
+    def _stop_worker(self) -> None:
+        w, self._worker = self._worker, None
+        if w is not None:
+            w.stop()   # 走っている調べは自分で止まる（_WORKERS が終わるまで持つ）
+
+    def running(self) -> bool:
+        return self._worker is not None
+
     def run(self) -> None:
+        self._stop_worker()
+        self.where.setText(f"調べたフォルダ: {self.folder}")
+        self.text.setPlainText("調べています…\nファイルが多いフォルダでは数十秒かかることがあります。"
+                               "閉じれば止まります。")
+        self.again.setEnabled(False)
+        self.other.setEnabled(False)
+        w = self._worker = _FindWorker(self.folder)
+        w.progress.connect(lambda done, total, w=w: self._on_progress(w, done, total))
+        w.result.connect(lambda out, w=w: self._on_result(w, out))
+        w.start()
+
+    def _on_progress(self, w: _FindWorker, done: int, total: int) -> None:
+        if w is self._worker:
+            self.text.setPlainText(
+                f"調べています… ファイル {done} / {total} 個を確認\n"
+                "閉じれば止まります。")
+
+    def _on_result(self, w: _FindWorker, out) -> None:
+        if w is not self._worker:
+            return   # 調べ直した／閉じたあとに終わった古い結果
+        self._worker = None
         from . import lockfinder
 
-        self.where.setText(f"調べたフォルダ: {self.folder}")
-        self.text.setPlainText("調べています…")
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        QApplication.processEvents()
-        try:
-            text = lockfinder.report(lockfinder.find(self.folder))
-        except Exception as exc:  # noqa: BLE001
-            text = f"調べられませんでした: {exc}"
-        finally:
-            QApplication.restoreOverrideCursor()
+        if isinstance(out, Exception):
+            text = f"調べられませんでした: {out}"
+        else:
+            text = lockfinder.report(out)
         self.text.setPlainText(text)
+        self.again.setEnabled(True)
+        self.other.setEnabled(True)
+
+    def wait_until_done(self, timeout_ms: int = 120000) -> bool:
+        """調べが終わるまでイベントを回して待つ（試験用）。終わったら True。"""
+        import time
+
+        end = time.monotonic() + timeout_ms / 1000
+        while self._worker is not None and time.monotonic() < end:
+            QApplication.processEvents()
+            time.sleep(0.01)
+        return self._worker is None
+
+    def done(self, result: int) -> None:
+        self._stop_worker()
+        super().done(result)
 
 
 class DocTabBar(QTabBar):
@@ -560,6 +651,7 @@ class ToolsMixin:
         dlg.show()
         dlg.run()
         dlg.exec()
+        dlg.deleteLater()
 
     def show_in_explorer(self, path: str | None) -> None:
         if not path or not os.path.exists(path):

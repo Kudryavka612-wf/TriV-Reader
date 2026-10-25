@@ -135,6 +135,24 @@ def startup_done() -> None:
 
 
 # --- 知らせる・戻す -----------------------------------------------------
+def spawn_helper(path: str, script: str, env: dict[str, str]) -> None:
+    """入れ替え役の .cmd を書いて、コンソール窓を出さずに起動する。
+
+    cmd は .cmd を UTF-8 ではなく OEM コードページ（日本語の Windows では cp932）で
+    読む。UTF-8 で書いたスクリプトに日本語のパスを埋めると、利用者名やインストール先が
+    日本語のとき文字が化けて、控えも入れ替えも戻しも黙って失敗する。そのため
+    スクリプトは ASCII だけにし（違えばここで例外にして、中途半端に動かさない）、
+    パスは環境変数（Unicode のまま渡る）で受け取る。
+    """
+    with open(path, "w", encoding="ascii") as f:
+        f.write(script)
+    # CREATE_NO_WINDOW / CREATE_NEW_CONSOLE / DETACHED_PROCESS は互いに排他。
+    # 併用すると CreateProcess が WinError 87 になるので、単独で指定する。
+    subprocess.Popen(["cmd", "/c", path], env=dict(os.environ, **env),
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                     close_fds=True)
+
+
 def _message(text: str, flags: int) -> int:
     if _TEST:
         return _IDYES
@@ -203,23 +221,23 @@ def restore_and_restart(target_dir: str | None = None, exe: str | None = None,
     helper = os.path.join(tempfile.gettempdir(), f"trivreader_rollback_{os.getpid()}.cmd")
     keep_dirs = " ".join(f'"{d}"' for d in KEEP_DIRS)
     keep_files = " ".join(f'"{f}"' for f in KEEP_FILES)
-    restart = "" if _TEST else f'start "" "{exe}"\n'
+    restart = "" if _TEST else 'start "" "%TRV_EXE%"\n'
+    # 遅延展開（!変数!）は使わない: パスに ! があると消えてしまう。ループは行ごとに
+    # 読まれるので、%変数% のままで毎回の値になる
     script = f"""@echo off
-setlocal enabledelayedexpansion
 set _wait=0
 :waitloop
-{sysdir}\\tasklist.exe /FI "PID eq {pid}" /FI "IMAGENAME eq {exe_name}" 2>nul | {sysdir}\\find.exe /I "{exe_name}" >nul
+{sysdir}\\tasklist.exe /FI "PID eq {pid}" /FI "IMAGENAME eq %TRV_EXENAME%" 2>nul | {sysdir}\\find.exe /I "%TRV_EXENAME%" >nul
 if errorlevel 1 goto restore
 set /a _wait+=1
-if !_wait! GEQ 60 goto restore
+if %_wait% GEQ 60 goto aborted
 {sysdir}\\ping.exe -n 2 127.0.0.1 >nul
 goto waitloop
 :restore
-{sysdir}\\robocopy.exe "{backup_dir()}" "{target_dir}" /MIR /NFL /NDL /NJH /NJS /NP /R:5 /W:1 /XD {keep_dirs} /XF {keep_files} >nul
-{restart}del "%~f0"
+{sysdir}\\robocopy.exe "%TRV_BACKUP%" "%TRV_APP%" /MIR /NFL /NDL /NJH /NJS /NP /R:5 /W:1 /XD {keep_dirs} /XF {keep_files} >nul
+{restart}:aborted
+del "%~f0"
 """
-    with open(helper, "w", encoding="utf-8") as f:
-        f.write(script)
-    subprocess.Popen(["cmd", "/c", helper],
-                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                     close_fds=True)
+    spawn_helper(helper, script, {"TRV_EXENAME": exe_name, "TRV_EXE": exe,
+                                  "TRV_BACKUP": backup_dir(),
+                                  "TRV_APP": os.path.normpath(target_dir)})

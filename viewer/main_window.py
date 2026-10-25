@@ -199,10 +199,31 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self._update_actions()
         self._restore_settings()
         self._force_quit = False
+        # Windows のシャットダウン／ログオフ中。トレイ常駐のために閉じるのを拒むと、OS が
+        # 終了できず「このアプリが終了を妨げています」になる
+        self._session_ending = False
+        app = QApplication.instance()
+        if app is not None:
+            app.commitDataRequest.connect(self._on_commit_data,
+                                          Qt.ConnectionType.DirectConnection)
         self._tray_notified = False
         self._setup_tray()
         self._build_ribbon()  # Foxit 風リボンを最上部に（従来のバーは隠す）
+        self._register_shortcuts()
         self.tabs.tabBar().apply_theme(self.act_dark.isChecked())
+
+    def _register_shortcuts(self) -> None:
+        """ショートカットを持つアクションを、すべてウィンドウ自身に付ける。
+
+        Qt はアクションのショートカットを、そのアクションを持つウィジェットのどれかが
+        画面に出ているときだけ有効にする。アクションは、画面に出ないメニューバー・
+        隠した旧ツールバーと、リボンの各タブにあるボタンにしか付いていなかったので、
+        開いているリボンのタブ以外（と F11 の全画面）では Ctrl+S / Ctrl+O / Ctrl+P /
+        Ctrl+Z / PgUp などが何も起こさなかった（タブごとに効く・効かないが違った）。
+        """
+        for act in self.findChildren(QAction):
+            if act.shortcuts():
+                self.addAction(act)   # 同じアクションを重ねて付けても 1 回しか発火しない
 
     # --- アクティブタブへのアクセス（プロパティ） ---------------------
     def _active_tab(self) -> "DocTab | None":
@@ -555,8 +576,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         tb.addAction(self.act_undo)
         self.act_redo = QAction("やり直し", self)
         # Ctrl+Y と Ctrl+Shift+Z の両方で効くようにする
-        self.act_redo.setShortcuts([QKeySequence.StandardKey.Redo,
-                                    QKeySequence("Ctrl+Y")])
+        # StandardKey.Redo を渡すと Ctrl+Y 1 つに畳まれ、下の Ctrl+Y と重なって
+        # 「どちらとも取れる」扱いになり、Ctrl+Y も Ctrl+Shift+Z も効かなかった
+        self.act_redo.setShortcuts([QKeySequence("Ctrl+Y"),
+                                    QKeySequence("Ctrl+Shift+Z")])
         self.act_redo.setToolTip("やり直し（Ctrl+Y）")
         tb.addAction(self.act_redo)
 
@@ -1321,7 +1344,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.act_export_text.triggered.connect(lambda: self._export_text(False))
         self.act_export_html.triggered.connect(lambda: self._export_text(True))
         # ズーム / 印刷
-        self.zoom_slider.sliderMoved.connect(
+        # sliderMoved だと、ハンドルのドラッグ以外（矢印キー・溝のクリック・ホイール）では
+        # スライダーの値だけ動いて、ページは拡大縮小されなかった。プログラムから値を
+        # 合わせるときは signals を止めているので、valueChanged は利用者の操作だけ
+        self.zoom_slider.valueChanged.connect(
             lambda v: self.page_view.set_zoom(v / 100.0)
         )
         self.zoom_combo.activated.connect(self._on_zoom_preset)
@@ -1427,6 +1453,9 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         pv.apply_theme(dark)
         org.apply_theme(dark)
         self._sync_view_style(pv)   # ツールバーの状態（ツール・色など）を引き継ぐ
+        # 見開きのボタンが入っているなら、新しいタブも見開きで開く（起動時の既定が
+        # 「見開き」でも、最初の PDF が 1 ページ表示で開き、ボタンだけ押された表示だった）
+        pv.set_facing(self.act_facing.isChecked())
         return tab
 
     # --- 操作 -----------------------------------------------------------
@@ -1694,6 +1723,11 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.act_organize.blockSignals(True)
         self.act_organize.setChecked(tab.currentWidget() is tab.organizer)
         self.act_organize.blockSignals(False)
+        # 見開きトグルをこのタブの状態に同期（タブごとに持つ表示なので、切り替えた
+        # 先のタブとボタンの表示がずれていた）
+        self.act_facing.blockSignals(True)
+        self.act_facing.setChecked(tab.page_view.is_facing())
+        self.act_facing.blockSignals(False)
         # フォーム入力トグルをこのタブの状態に同期
         self.act_form.blockSignals(True)
         self.act_form.setChecked(tab.page_view.form_mode())
@@ -1764,8 +1798,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         index = self.page_view.index
         self.doc.rotate_page(index, delta)
         self.page_view.refresh_page(index)
+        self.page_view.refresh_form_overlays()   # 入力欄が回転前の位置に残っていた
         self.thumbnails.refresh_page(self.doc, index)
         self._update_title()
+        self._update_undo_actions()   # 戻せるのにボタンが灰色のままだった
 
     # --- 注釈 ----------------------------------------------------------
     def _on_tool_changed(self, action) -> None:
@@ -1912,6 +1948,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         if n:
             self.page_view.refresh_page(index)
             self._update_title()
+            self._update_undo_actions()   # 戻せるのにボタンが灰色のままだった
+            self._refresh_annot_list()    # 一覧に消えた注釈が残っていた
             self.statusBar().showMessage(f"{n} 件の注釈を消去しました", 3000)
         else:
             self.statusBar().showMessage("このページに注釈はありません", 3000)
@@ -1990,7 +2028,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             return
         ret = QMessageBox.question(
             self, "墨消しの適用",
-            "登録済みの墨消し範囲の文字・画像を完全に削除します。元に戻せません。続行しますか？",
+            "登録済みの墨消し範囲の文字・画像・入力欄の値を完全に削除します。続行しますか？（Ctrl+Z で直後なら戻せますが、保存して閉じると元には戻せません）",
         )
         if ret != QMessageBox.StandardButton.Yes:
             return
@@ -2023,7 +2061,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             for i in range(self.doc.page_count):
                 rect = self.doc.auto_crop_rect(i)
                 if rect:
-                    self.doc.set_crop(i, rect)
+                    try:
+                        self.doc.set_crop(i, rect)
+                    except ValueError:
+                        continue   # 範囲が使えないページは、そのまま
                     n += 1
         self._reload(self.page_view.index)
         self.statusBar().showMessage(f"{n} ページの余白をトリミングしました", 3000)
@@ -2053,8 +2094,12 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         if not ok:
             return
         cells = [c.strip() for c in (text.split(",") + ["", "", ""])[:3]]
-        self.doc.add_header_footer(cells[0], cells[1], cells[2],
-                                   top=(pos == "ヘッダー(上)"))
+        try:
+            self.doc.add_header_footer(cells[0], cells[1], cells[2],
+                                       top=(pos == "ヘッダー(上)"))
+        except ValueError as exc:   # 書式の誤り。文書は変えていない
+            QMessageBox.warning(self, "ヘッダー/フッター", str(exc))
+            return
         self._reload(self.page_view.index)
         self.statusBar().showMessage("ヘッダー/フッターを追加しました", 3000)
 
@@ -2100,7 +2145,11 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             return
         dlg = TocEditDialog(self.doc.get_toc(), self.doc.page_count, self)
         if dlg.exec() == TocEditDialog.DialogCode.Accepted:
-            self.doc.set_toc(dlg.result_toc())
+            try:
+                self.doc.set_toc(dlg.result_toc())
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(self, "目次", f"目次を更新できませんでした:\n{exc}")
+                return
             self.toc_dock.load(self.doc.get_toc())
             self._update_title()
             self.statusBar().showMessage("目次を更新しました", 3000)
@@ -2434,10 +2483,17 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
     # --- 設定ダイアログ -------------------------------------------------
     def open_settings(self) -> None:
         """設定ダイアログ（全般/表示/注釈/保存/更新/詳細）を開く。"""
+        # ダーク・見開き・パネルの表示などはリボンで切り替えられ、保存は終了時だけだった。
+        # ダイアログは保存値から作るので、開く前に今の状態を書いておかないと、別の項目を
+        # 変えて OK しただけで、リボンで切り替えた画面が古い値に巻き戻っていた
+        self._save_settings(session=False)
         prefs.SettingsDialog(self).exec()
 
-    def apply_preferences(self) -> None:
+    def apply_preferences(self, annot_changed: bool = True) -> None:
         """設定の内容を、今開いているウィンドウへ反映する。
+
+        annot_changed が False なら、注釈の既定スタイル（色・太さなど）は触らない
+        （リボンで選んでいる作業中のスタイルを、関係のない設定の OK で戻さないため）。
 
         「次回起動から効く」項目を作らないよう、変えたその場で見た目・挙動が
         変わるところまでやる。終了時に _save_settings が現在の状態を書き戻す
@@ -2462,7 +2518,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             if isinstance(t, DocTab):
                 t.page_view.set_gesture_enabled(on)
         self._spare_view.set_gesture_enabled(on)
-        self._apply_annot_defaults()
+        if annot_changed:
+            self._apply_annot_defaults()
         self._trim_recent()
         self._setup_autosave()
         from . import form_history
@@ -2610,6 +2667,33 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
     def _last_dir(self) -> str:
         return self.settings.value("last_dir", "", str)
 
+    def _export_dir(self) -> str:
+        """書き出しの保存先ダイアログが最初に開くフォルダ。
+
+        開いているファイルのあるフォルダ、なければ最後に使ったフォルダ。名前だけ渡すと、
+        プロセスの作業フォルダ（このアプリは利用者のフォルダを掴まないよう、隠れた
+        データフォルダ %LOCALAPPDATA%/trivreader に置いている）が開いてしまう。
+        """
+        path = self.doc.path if self.doc.is_open else None
+        if path and os.path.isdir(os.path.dirname(path)):
+            return os.path.dirname(path)
+        return self._last_dir() or os.path.expanduser("~")
+
+    def _confirm_overwrite(self, paths: list[str]) -> bool:
+        """書き出し先に同じ名前のファイルがあれば、上書きしてよいかを聞く。"""
+        clash = [p for p in paths if os.path.exists(p)]
+        if not clash:
+            return True
+        names = "、".join(os.path.basename(p) for p in clash[:3])
+        more = f" ほか {len(clash) - 3} 個" if len(clash) > 3 else ""
+        ret = QMessageBox.question(
+            self, "上書きの確認",
+            f"出力先に同じ名前のファイルが {len(clash)} 個あります。\n{names}{more}\n\n"
+            "上書きしますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        return ret == QMessageBox.StandardButton.Yes
+
     def _add_recent(self, path: str) -> None:
         self.settings.setValue("last_dir", os.path.dirname(path))
         recent = self.settings.value("recent", [], list) or []
@@ -2677,8 +2761,9 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.act_telemetry_toggle.blockSignals(False)
         self._rebuild_recent_menu()
 
-    def _save_settings(self) -> None:
-        self._save_session()
+    def _save_settings(self, session: bool = True) -> None:
+        if session:
+            self._save_session()
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("dark", self.act_dark.isChecked())
         self.settings.setValue("compact", self.act_compact.isChecked())
@@ -2802,6 +2887,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.page_view.reload(self.page_view.index)
         self.thumbnails.load(self.doc)
         self._update_title()
+        self._update_undo_actions()   # 戻せるのにボタンが灰色のままだった
         self.statusBar().showMessage("ページ番号を追加しました", 3000)
 
 
@@ -2863,8 +2949,16 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         """ページ構成変更後に全ビュー（サイドバー・ビューワー・整理画面）を再構築。"""
         self.thumbnails.load(self.doc)
         self.page_view.reload(target)
-        self.organizer.load(self.doc)
+        tab = self._active_tab()
+        if tab is not None and tab.currentWidget() is tab.organizer:
+            # 隠れている整理画面は作り直さない（開くときに作る）。毎回全ページの
+            # サムネイルを同期で描くと、300 ページのスキャンで 1 操作 10 秒ほど固まる
+            self.organizer.load(self.doc)
         self.thumbnails.select_page(self.page_view.index)
+        # ページの数・並びが変わると、しおりと注釈一覧のページ番号が古くなり、押すと
+        # 別のページへ飛ぶ（消したページを指して壊れていることもある）
+        self.toc_dock.load(self.doc.get_toc() if self.doc.is_open else [])
+        self._refresh_annot_list()
         self._update_status()
         self._update_title()
         self._update_undo_actions()   # ページ操作も Ctrl+Z で戻せる
@@ -2999,7 +3093,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             return
         indices = [int(i) for i in indices]
         out, _ = QFileDialog.getSaveFileName(
-            self, "抽出結果を保存", "extracted.pdf", "PDF ファイル (*.pdf)"
+            self, "抽出結果を保存", os.path.join(self._export_dir(), "extracted.pdf"),
+            "PDF ファイル (*.pdf)"
         )
         if not out:
             return
@@ -3020,10 +3115,13 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         )
         if not ok:
             return
-        out_dir = QFileDialog.getExistingDirectory(self, "出力先フォルダを選択")
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "出力先フォルダを選択", self._export_dir())
         if not out_dir:
             return
         stem = os.path.splitext(os.path.basename(self.doc.path or "split"))[0]
+        if not self._confirm_overwrite(self.doc.split_output_names(n, out_dir, stem)):
+            return
         try:
             outputs = self.doc.split_every(n, out_dir, stem)
         except Exception as exc:  # noqa: BLE001
@@ -3213,10 +3311,15 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self._update_undo_actions()
 
     # --- 終了確認 -------------------------------------------------------
+    def _on_commit_data(self, _manager=None) -> None:
+        """OS がシャットダウン／ログオフを始めた（closeEvent より先に呼ばれる）。"""
+        self._session_ending = True
+
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        forced = self._force_quit or self._session_ending
         # 通常の×でタブがあるときは「現在のタブ / 全て / キャンセル」を尋ねる。
         # （トレイの「終了」からの呼び出し _force_quit ではダイアログを出さない）
-        if (not self._force_quit and self.tabs.count() > 0
+        if (not forced and self.tabs.count() > 0
                 and prefs.value(self.settings, "confirm_close")):
             box = QMessageBox(self)
             box.setWindowTitle("ウィンドウを閉じる")
@@ -3241,6 +3344,9 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
                 return
             # b_all → このまま全タブを閉じる処理へ進む
 
+        # 開いているファイルは、タブを閉じる前に憶えておく（閉じたあとに憶えると、
+        # 何も開いていないことになり、前回のファイルを開き直す設定が何も復元しない）
+        self._save_session()
         # 全タブを閉じる（各タブの未保存は _close_tab が確認。中断されたら閉じない）
         while self.tabs.count() > 0:
             before = self.tabs.count()
@@ -3250,13 +3356,21 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
                 event.ignore()
                 return
 
+        # 全画面のまま保存すると、次回が全画面で始まり、隠したパネルも「非表示」で
+        # 保存される。先に全画面を終える
+        if self.act_fullscreen.isChecked():
+            self.act_fullscreen.setChecked(False)
+
         # トレイ常駐が有効で通常の×なら、終了せずトレイへ隠す（通知は出さない）
-        if not self._force_quit and self._tray_resident_enabled():
+        if not forced and self._tray_resident_enabled():
+            # 設定は終了時にしか保存されないので、常駐のまま Windows を再起動すると
+            # ダークモードやウィンドウ位置が失われていた。隠すときにも保存する
+            self._save_settings(session=False)
             event.ignore()
             self.hide()
             return
 
-        self._save_settings()
+        self._save_settings(session=False)
         if getattr(self, "tray", None) is not None:
             self.tray.hide()
         event.accept()

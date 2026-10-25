@@ -183,12 +183,15 @@ def trial_run(src_dir: str, timeout: float = 180.0, poll=None,
 
 def apply_and_restart(zip_path: str, extracted: str | None = None,
                       app_dir: str | None = None, exe_path: str | None = None,
-                      wait_pid: int | None = None, restart: bool = True) -> None:
-    """新バージョンを展開し、終了後に入れ替えるヘルパーを起動してアプリを終了させる。
+                      wait_pid: int | None = None, restart: bool = True,
+                      max_wait: int = 60) -> None:
+    """新バージョンを展開し、終了後に入れ替えるヘルパーを起動する。
 
     入れ替える前に、今の版を rollback.backup_dir() へ控える（起動できない版が
     入っても戻せるように）。extracted は展開済みのフォルダ（trial_run で試した物）。
-    呼び出し側は本関数の後に QApplication.quit() すること。
+    呼び出し側は、アプリが本当に終わると決まってから（未保存の確認を済ませ、
+    トレイに隠れるだけにせず）これを呼ぶこと。max_wait 秒たってもアプリが終わら
+    ないときは、動いたままの版を上書きして壊さないよう、何もせずに諦める。
     """
     src_dir = extracted or _extract(zip_path)
     app_dir = app_dir or storage.base_dir()
@@ -229,48 +232,42 @@ def apply_and_restart(zip_path: str, extracted: str | None = None,
     new_exe = os.path.join(src_dir, exe_name)
     expected_size = os.path.getsize(new_exe) if os.path.exists(new_exe) else -1
     dest_exe = os.path.join(app_dir, exe_name)
-    relaunch = f'start "" "{exe_path}"' if restart else "rem 起動し直さない（試験）"
+    relaunch = 'start "" "%TRV_EXE%"' if restart else "rem no relaunch (test)"
+    # パスはスクリプトに埋めず環境変数で渡す（rollback.spawn_helper を参照: 日本語の
+    # パスが cmd で化ける）。遅延展開（!変数!）も使わない: パスに ! があると消える。
+    # ループは行ごとに読まれるので、%変数% のままで毎回の値になる
     script = f"""@echo off
-setlocal enabledelayedexpansion
 set _wait=0
 :waitloop
-{sysdir}\\tasklist.exe /FI "PID eq {pid}" /FI "IMAGENAME eq {exe_name}" 2>nul | {sysdir}\\find.exe /I "{exe_name}" >nul
+{sysdir}\\tasklist.exe /FI "PID eq {pid}" /FI "IMAGENAME eq %TRV_EXENAME%" 2>nul | {sysdir}\\find.exe /I "%TRV_EXENAME%" >nul
 if errorlevel 1 goto docopy
 set /a _wait+=1
-if !_wait! GEQ 60 goto docopy
+if %_wait% GEQ {max_wait} goto aborted
 {sysdir}\\ping.exe -n 2 127.0.0.1 >nul
 goto waitloop
 :docopy
-del "{rollback.info_path()}" 2>nul
-{sysdir}\\robocopy.exe "{app_dir}" "{backup}" /MIR /NFL /NDL /NJH /NJS /NP /R:2 /W:1 /XD {keep_dirs} /XF {keep_files} >nul
+del "%TRV_INFO%" 2>nul
+{sysdir}\\robocopy.exe "%TRV_APP%" "%TRV_BACKUP%" /MIR /NFL /NDL /NJH /NJS /NP /R:2 /W:1 /XD {keep_dirs} /XF {keep_files} >nul
 if errorlevel 8 goto backup_done
-copy /Y "{info_tmp}" "{rollback.info_path()}" >nul
+copy /Y "%TRV_INFO_TMP%" "%TRV_INFO%" >nul
 :backup_done
 set _copytry=0
 :copyloop
-{sysdir}\\robocopy.exe "{src_dir}" "{app_dir}" /E /NFL /NDL /NJH /NJS /NP /R:5 /W:1 /XD "TriVReader_data" /XF "portable.ini" "lite.ini" "TriVReader.ini" >nul
-for %%A in ("{dest_exe}") do set _sz=%%~zA
-if "!_sz!"=="{expected_size}" goto docopy_done
+{sysdir}\\robocopy.exe "%TRV_SRC%" "%TRV_APP%" /E /NFL /NDL /NJH /NJS /NP /R:5 /W:1 /XD "TriVReader_data" /XF "portable.ini" "lite.ini" "TriVReader.ini" >nul
+set _sz=
+for %%A in ("%TRV_DEST_EXE%") do set _sz=%%~zA
+if "%_sz%"=="{expected_size}" goto docopy_done
 set /a _copytry+=1
-if !_copytry! GEQ 5 goto docopy_done
+if %_copytry% GEQ 5 goto docopy_done
 {sysdir}\\ping.exe -n 3 127.0.0.1 >nul
 goto copyloop
 :docopy_done
 {relaunch}
+:aborted
 del "%~f0"
 """
-    with open(helper, "w", encoding="utf-8") as f:
-        f.write(script)
-
-    import subprocess
-    # コンソール窓を出さずに起動する（更新中に黒いコマンドプロンプトを見せない）。
-    # CREATE_NO_WINDOW は「コンソールアプリを窓なしで実行」するフラグで、親（GUI）
-    # 終了後もこの子プロセスは生存し、待機→入れ替え→再起動を続ける。
-    # 注意: CREATE_NO_WINDOW / CREATE_NEW_CONSOLE / DETACHED_PROCESS はいずれも
-    # コンソール生成の指定で相互排他。併用すると CreateProcess が WinError 87
-    # （パラメーターが間違っています）になるため、単独で指定する。
-    subprocess.Popen(
-        ["cmd", "/c", helper],
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        close_fds=True,
-    )
+    rollback.spawn_helper(helper, script, {
+        "TRV_EXENAME": exe_name, "TRV_EXE": exe_path, "TRV_APP": os.path.normpath(app_dir),
+        "TRV_SRC": os.path.normpath(src_dir), "TRV_BACKUP": backup,
+        "TRV_INFO": rollback.info_path(), "TRV_INFO_TMP": info_tmp,
+        "TRV_DEST_EXE": dest_exe})

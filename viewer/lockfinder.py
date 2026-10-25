@@ -141,17 +141,36 @@ def _rm_query(files: list[str]) -> dict[int, str]:
         rm.RmEndSession(session)
 
 
-def file_users(files: list[str], per_file_limit: int = 400) -> dict[int, dict]:
-    """ファイルを開いているプロセス → {"app": 表示名, "files": [開いているファイル]}。"""
+CHUNK = 50   # Restart Manager に一度に聞くファイルの数
+
+
+def file_users(files: list[str], progress=None, cancelled=None) -> dict[int, dict]:
+    """ファイルを開いているプロセス → {"app": 表示名, "files": [開いているファイル]}。
+
+    Restart Manager はファイル 1 つにつき十数ミリ秒かかる（フォルダが大きいと数十秒）。
+    一度に聞くのは CHUNK 個ずつにして、誰かが開いている塊の中だけを 1 つずつ聞き直し、
+    どのファイルかを突き止める。progress(済んだ数, 全部の数)、cancelled() が真なら途中で止める。
+    """
     found: dict[int, dict] = {}
-    for i in range(0, len(files), 500):   # 一度に渡しすぎない
-        for pid, app in _rm_query(files[i:i + 500]).items():
+    total = len(files)
+    for i in range(0, total, CHUNK):
+        if cancelled and cancelled():
+            break
+        chunk = files[i:i + CHUNK]
+        holders = _rm_query(chunk)
+        for pid, app in holders.items():
             found.setdefault(pid, {"app": app, "files": []})
-    if found and len(files) <= per_file_limit:
-        # どのファイルかも分かるよう、1 つずつ聞き直す（数が多いときは省く）
-        for path in files:
-            for pid in _rm_query([path]):
-                found.setdefault(pid, {"app": "", "files": []})["files"].append(path)
+        if holders and len(chunk) == 1:
+            for pid in holders:
+                found[pid]["files"].append(chunk[0])
+        elif holders:
+            for path in chunk:
+                if cancelled and cancelled():
+                    break
+                for pid in _rm_query([path]):
+                    found.setdefault(pid, {"app": "", "files": []})["files"].append(path)
+        if progress:
+            progress(min(i + CHUNK, total), total)
     return found
 
 
@@ -239,12 +258,17 @@ def cwd_users(folder: str, procs: dict[int, str] | None = None) -> dict[int, str
     return out
 
 
-def find(folder: str) -> dict:
-    """まとめて調べる。結果は report() で文章にできる。"""
+def find(folder: str, progress=None, cancelled=None) -> dict:
+    """まとめて調べる。結果は report() で文章にできる。
+
+    時間がかかる（フォルダの中のファイルが多いと数十秒）ので、画面から呼ぶときは
+    別スレッドで動かす。progress(済んだ数, 全部の数)、cancelled() が真なら止めて、
+    それまでの結果に "cancelled": True を付けて返す。
+    """
     files, truncated = list_files(folder)
     procs = processes()
-    users = file_users(files) if files else {}
-    cwds = cwd_users(folder, procs)
+    cwds = cwd_users(folder, procs)   # 速い（数十ミリ秒）
+    users = file_users(files, progress, cancelled) if files else {}
     found = []
     for pid in sorted(set(users) | set(cwds)):
         exe = procs.get(pid, "")
@@ -253,7 +277,7 @@ def find(folder: str) -> dict:
                       "files": (users.get(pid) or {}).get("files", []),
                       "cwd": cwds.get(pid)})
     return {"folder": folder, "found": found, "file_count": len(files),
-            "truncated": truncated}
+            "truncated": truncated, "cancelled": bool(cancelled and cancelled())}
 
 
 def report(result: dict) -> str:

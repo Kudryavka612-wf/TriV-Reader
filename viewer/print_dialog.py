@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from .mw_print import paper_for_page, place_on_paper, select_pages
+from .mw_print import paper_for_page, place_on_paper, restore_paper, select_pages, set_paper
 from .util import parse_ranges
 
 # プリンターの問い合わせ（QPrinter を作る・用紙一覧・両面）はドライバー次第で
@@ -593,11 +593,13 @@ class PrintDialog(QDialog):
         choice = self.paper_combo.currentData()
         try:
             if isinstance(choice, QPageSize):
-                pr.setPageSize(choice)
+                set_paper(pr, choice)
             elif choice == "auto":
                 size = paper_for_page(nat_w, nat_h)
                 if size is not None:
-                    pr.setPageSize(size)
+                    set_paper(pr, size)
+            else:
+                restore_paper(pr)   # 「プリンターの既定」: 前に変えた用紙を残さない
             landscape = (nat_w > nat_h if choice == "auto"
                          else self.rb_landscape.isChecked())
             pr.setPageOrientation(
