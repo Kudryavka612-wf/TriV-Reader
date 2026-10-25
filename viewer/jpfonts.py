@@ -195,6 +195,10 @@ def update_widget(widget) -> None:
     except Exception:  # noqa: BLE001
         pass
     widget.update()
+    if widget.field_value in ("", None) and widget.field_type in (
+            fitz.PDF_WIDGET_TYPE_TEXT, fitz.PDF_WIDGET_TYPE_COMBOBOX,
+            fitz.PDF_WIDGET_TYPE_LISTBOX):
+        _clear_value(doc, xref)
     try:
         if da[0] == "string":
             doc.xref_set_key(xref, "DA", fitz.get_pdf_str(da[1]))
@@ -206,6 +210,27 @@ def update_widget(widget) -> None:
     from . import field_ap   # 循環 import を避けてここで
     if not field_ap.write(widget, serif=serif):
         japanize_ap(doc, xref, serif=serif)
+
+
+def _clear_value(doc: "fitz.Document", xref: int) -> None:
+    """欄の値を空にする。PyMuPDF は空の値を書かない（消した文字が残っていた）。
+
+    値（/V）はフィールド＝名前（/T）のある辞書が持つ。名前の無いウィジェットは
+    親のフィールドに書く。
+    """
+    target = xref
+    try:
+        for _ in range(8):
+            if doc.xref_get_key(target, "T")[0] == "string":
+                break
+            parent = doc.xref_get_key(target, "Parent")
+            if parent[0] != "xref":
+                target = xref
+                break
+            target = int(parent[1].split()[0])
+        doc.xref_set_key(target, "V", "()")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def jp_font_xref(doc: "fitz.Document", serif: bool) -> int:

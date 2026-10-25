@@ -53,9 +53,10 @@ def make_window(app: QApplication, ini: str) -> MainWindow:
 def test_dialog_opens(app: QApplication, w: MainWindow) -> SettingsDialog:
     dlg = SettingsDialog(w)
     app.processEvents()
-    check(dlg.tabs.count() == 6, f"設定ダイアログに6タブある（{dlg.tabs.count()}）")
+    check(dlg.tabs.count() == 7, f"設定ダイアログに7タブある（{dlg.tabs.count()}）")
     labels = [dlg.tabs.tabText(i) for i in range(dlg.tabs.count())]
-    check(labels == ["全般", "表示", "注釈", "保存", "更新", "詳細"], f"タブ構成 {labels}")
+    check(labels == ["全般", "表示", "注釈", "保存", "フォーム", "更新", "詳細"],
+          f"タブ構成 {labels}")
     return dlg
 
 
@@ -89,8 +90,13 @@ def test_roundtrip(app: QApplication, w: MainWindow) -> None:
     dlg.cb_backup.setChecked(True)
     dlg.sp_autosave.setValue(2)
     dlg.cmb_ocr.setCurrentIndex(dlg.cmb_ocr.findData("eng"))
+    dlg.cb_autocomplete.setChecked(False)
     dlg.apply()
     app.processEvents()
+    from viewer import form_history
+    check(prefs.value(w.settings, "form/autocomplete") is False
+          and not form_history.enabled(), "フォームの入力候補を止める設定が即時反映される")
+    form_history.set_enabled(True)
 
     s = w.settings
     check(prefs.value(s, "dark") is True, "テーマ設定が保存される")

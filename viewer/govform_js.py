@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 
 import fitz
 
@@ -33,6 +34,9 @@ ALLOWED_HELPERS = (
     "StateNameSelect",    # 都道府県コンボ選択で枝ラベルを表示/非表示
     "DropDownSelect",     # コンボ選択値を相棒の _PRINT 欄へ転写（値書き込み）
 )
+# ALLOWED_HELPERS のほかに、呼ばれる関数ごと走らせて対応しているもの
+# （wants_full_run。入力欄の有効/無効の切り替え）
+FULL_RUN_HELPERS = frozenset({"SetEnable"})
 
 # ウィジェットのスクリプトが「単純な no-arg-besides-event の関数呼び出し」
 # であることを確認するための形状チェック（それ以外は何もしない）。
@@ -43,6 +47,7 @@ SIMPLE_CALL_RE = re.compile(r"^(\w+)\(event\)$")
 FRM_SUFFIX_RE = re.compile(r"^(.*)_(01|ON|OFF)$")
 
 _JS_EXEC_TIMEOUT_MS = 2000
+_DEBUG = bool(__import__("os").environ.get("TRIVREADER_JS_DEBUG"))
 
 # display の意味は PyMuPDF の field_display と同じ整数（Adobe の display.* も同様）。
 DISPLAY_VISIBLE = 0
@@ -102,6 +107,99 @@ def _decode_js_stream(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+# --- クリックのたびに全部を読み直さないための表 ---------------------------
+# 〇欄を 1 回押すたびに、ページの全欄（勤務状況のページは 150 個）を PyMuPDF の
+# Widget として 3 回作り直し、数百 KB の JS をつなげて正規表現で探していた
+# （1 回 0.4 秒。31 日分の勤務表では待たされ続けた）。欄の名前・矩形・スクリプト
+# は押しても変わらないので、ページごとに 1 回だけ読む。表示状態（/F）は変わる
+# ので、その都度読む。
+_COMBINED: dict[int, tuple] = {}
+
+
+def combined_source(doc_scripts: dict[str, str]) -> str:
+    """文書の JS をつなげたもの（同じ doc_scripts には同じ文字列を返す）。"""
+    key = id(doc_scripts)
+    hit = _COMBINED.get(key)
+    if hit is None or hit[0] is not doc_scripts:
+        hit = (doc_scripts, "\n".join(doc_scripts.values()) if doc_scripts else "", {})
+        while len(_COMBINED) >= 4:   # タブで開いている分だけ。古いものから捨てる
+            _COMBINED.pop(next(iter(_COMBINED)))
+        _COMBINED[key] = hit
+    return hit[1]
+
+
+def function_bodies(doc_scripts: dict[str, str]) -> dict[str, str]:
+    """_all_function_bodies の結果を憶えておく版（数百 KB の JS を 1 回だけ読む）。"""
+    combined = combined_source(doc_scripts)
+    cache = _COMBINED[id(doc_scripts)][2]
+    if "__bodies__" not in cache:
+        cache["__bodies__"] = _all_function_bodies(combined) if combined else {}
+    return cache["__bodies__"]
+
+
+def function_source(doc_scripts: dict[str, str], name: str) -> str | None:
+    """_find_function_source の結果を憶えておく版。"""
+    combined = combined_source(doc_scripts)
+    cache = _COMBINED[id(doc_scripts)][2]
+    if name not in cache:
+        cache[name] = _find_function_source(combined, name)
+    return cache[name]
+
+
+def page_widgets(doc: "fitz.Document", page_index: int) -> list[tuple]:
+    """ページの欄の (xref, 名前, 矩形, クリック時のスクリプト) の一覧。
+
+    ページの並べ替え・削除で中身が変わったら作り直す（ページの xref で確かめる）。
+    """
+    try:
+        table = doc._trv_widget_table
+    except AttributeError:
+        table = {}
+        try:
+            doc._trv_widget_table = table
+        except AttributeError:
+            pass
+    key = doc.page_xref(page_index)
+    hit = table.get(page_index)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    from . import fastwidgets
+    rows = [(w.xref, w.field_name or "", fitz.Rect(w.rect), (w.script or "").strip())
+            for w in fastwidgets.widgets(doc.load_page(page_index))]
+    table[page_index] = (key, rows)
+    return rows
+
+
+def remember_page_widgets(doc: "fitz.Document", page_index: int, rows: list) -> None:
+    """page_widgets の表を、すでに欄を読んだ呼び出し側から入れておく（二度読みしない）。"""
+    try:
+        table = doc._trv_widget_table
+    except AttributeError:
+        table = {}
+        try:
+            doc._trv_widget_table = table
+        except AttributeError:
+            return
+    table[page_index] = (doc.page_xref(page_index), rows)
+
+
+def widget_display(doc: "fitz.Document", xref: int) -> int:
+    """欄の今の表示状態（Acrobat の display。0=表示 1=非表示 2=画面だけ 3=印刷だけ）。
+
+    PyMuPDF の field_display と同じ規則で /F から求める（Widget を作らずに済む）。
+    """
+    try:
+        f = doc.xref_get_key(xref, "F")
+        flags = int(f[1]) if f[0] == "int" else 0
+    except Exception:  # noqa: BLE001
+        flags = 0
+    if flags & 2:                      # Hidden
+        return DISPLAY_HIDDEN
+    if flags & 4:                      # Print
+        return DISPLAY_HIDDEN_NOVIEW if flags & 32 else DISPLAY_VISIBLE
+    return DISPLAY_HIDDEN if flags & 32 else DISPLAY_NOVIEW
+
+
 def is_eligible(doc_scripts: dict[str, str]) -> bool:
     """この文書が「安全に実行できると分かっている」ヘルパーを持つか。
 
@@ -111,11 +209,13 @@ def is_eligible(doc_scripts: dict[str, str]) -> bool:
     """
     if not doc_scripts:
         return False
-    combined = "\n".join(doc_scripts.values())
-    return any(
-        re.search(r"function\s+" + re.escape(name) + r"\s*\(", combined)
-        for name in ALLOWED_HELPERS
-    )
+    combined = combined_source(doc_scripts)
+    cache = _COMBINED[id(doc_scripts)][2]
+    if "__eligible__" not in cache:
+        cache["__eligible__"] = any(
+            re.search(r"function\s+" + re.escape(name) + r"\s*\(", combined)
+            for name in ALLOWED_HELPERS)
+    return cache["__eligible__"]
 
 
 def _find_function_source(combined: str, name: str) -> str | None:
@@ -154,7 +254,7 @@ _CALL_RE = re.compile(r"([A-Za-z_]\w*)\s*\(")
 KNOWN_UNSUPPORTED_HELPERS = frozenset({
     "ShowToolTip", "HideToolTip",                       # 装飾（ツールチップ）
     "AlertError", "AlertError2", "AlertSuccess", "AlertSuccess2",  # 検証の通知
-    "SetRedBorder", "SetEnable",                        # 検証（赤枠・活性制御）
+    "SetRedBorder",                                     # 検証（赤枠）
     "SetDateComb",                                      # 日付の範囲制約
     "FormatYearMonthDay", "FormatSingleByteNumber",     # 書式整形
 })
@@ -165,10 +265,12 @@ def _widget_action_entries(doc: "fitz.Document") -> set[str]:
     entries: set[str] = set()
     try:
         for pno in range(doc.page_count):
-            for w in (doc.load_page(pno).widgets() or []):
+            for xref, atype, _id in doc.load_page(pno).annot_xrefs():
+                if atype != fitz.PDF_ANNOT_WIDGET:
+                    continue
                 for key in _INTERACTION_ACTION_KEYS:
                     try:
-                        js = doc.xref_get_key(w.xref, key + "/JS")
+                        js = doc.xref_get_key(xref, key + "/JS")
                     except Exception:  # noqa: BLE001
                         continue
                     if js and js[0] == "string":
@@ -190,8 +292,7 @@ def unsupported_helpers(doc: "fitz.Document",
     """
     if not doc_scripts:
         return []
-    combined = "\n".join(doc_scripts.values())
-    fns = _all_function_bodies(combined)
+    fns = function_bodies(doc_scripts)
     entries = _widget_action_entries(doc)
 
     # 入口から推移的に呼ぶ関数名を辿る（3段まで＝実フォームには十分）
@@ -205,7 +306,7 @@ def unsupported_helpers(doc: "fitz.Document",
 
     unsupported = set()
     for name in reached:
-        if name in ALLOWED_HELPERS:
+        if name in ALLOWED_HELPERS or name in FULL_RUN_HELPERS:
             continue                 # 対応済み
         if name in KNOWN_UNSUPPORTED_HELPERS:
             continue                 # 方針として対象外（既知）
@@ -242,7 +343,7 @@ def build_diagnostic(doc: "fitz.Document", doc_scripts: dict[str, str],
     含めるのはフォーム由来のスクリプト定義（テンプレート側のコード）のみで、
     ユーザーが入力した値は含めない。
     """
-    fns = _all_function_bodies("\n".join(doc_scripts.values()))
+    fns = function_bodies(doc_scripts)
     lines = ["# TriV-Reader 未対応フォーム機能レポート", ""]
     for k, v in header.items():
         lines.append(f"{k}: {v}")
@@ -283,7 +384,7 @@ class FieldBridge:
         return cls(
             name=w.field_name,
             display=int(w.field_display),
-            value=w.field_value,
+            value=combo_export(w, w.field_value),
             readonly=bool(flags & readonly_bit),
         )
 
@@ -295,6 +396,213 @@ class FieldBridge:
                _js_str(self.valueAsString), "true" if self.readonly else "false"),
             timeout=_JS_EXEC_TIMEOUT_MS,
         )
+
+
+@dataclass
+class FieldEffects:
+    """フォームの JS を走らせた結果のうち、画面の入力欄にも反映が要るもの。"""
+    readonly: dict = field(default_factory=dict)   # 欄の名前 → 書き換え禁止か
+    values: dict = field(default_factory=dict)     # 欄の名前 → 新しい値
+    tips: list = field(default_factory=list)       # フォームが出す吹き出しの文
+    alerts: list = field(default_factory=list)     # フォームが出す警告（app.alert）
+
+
+# 入力欄の有効/無効や値を切り替えるラッパー（例: 公金受取口座の「2」を選ぶと
+# 口座欄が入力できるようになる）。こうしたものはラッパーから呼ばれる関数だけ
+# （推移的に）を V8 に注入して走らせる。V8 の中には偽の getField 環境しか
+# 無いので、PDF・PC には触れられない（結果は Python 側で読み取って反映する）。
+_FULL_RUN_RE = re.compile(r"\.(?:readonly|value|display)\s*=(?!=)|\bSetEnable\s*\(")
+# 画面の部品を作る・消す関数は走らせず、出す文だけを受け取る
+_UI_STUBS = ("ShowToolTip", "HideToolTip")
+
+
+# f(...) のほか f.apply(...) / f.call(...) も呼び出しとして拾う
+_CALLEE_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:\.\s*(?:apply|call)\s*)?\(")
+
+
+def _callee_closure(fns: dict[str, str], entry: str, depth: int = 6) -> list[str]:
+    """entry から呼ばれる（文書で定義された）関数名を、呼ばれる順に近い形で集める。"""
+    seen = [entry]
+    frontier = [entry]
+    for _ in range(depth):
+        nxt = []
+        for name in frontier:
+            for callee in _CALLEE_RE.findall(fns.get(name, "")):
+                if callee in fns and callee not in seen:
+                    seen.append(callee)
+                    nxt.append(callee)
+        if not nxt:
+            break
+        frontier = nxt
+    return seen
+
+
+def wants_full_run(doc_scripts: dict[str, str], entry_script: str) -> bool:
+    """このアクションは入力欄の有効/無効・値を変えるか（＝V8 で丸ごと走らせるか）。
+
+    既知のヘルパー（ALLOWED_HELPERS）だけで済むものは Python で再現するので対象外。
+    """
+    m = SIMPLE_CALL_RE.match((entry_script or "").strip())
+    if not m or not doc_scripts:
+        return False
+    fns = function_bodies(doc_scripts)
+    if m.group(1) not in fns or m.group(1) in ALLOWED_HELPERS:
+        return False
+    return any(_FULL_RUN_RE.search(fns[n])
+               for n in _callee_closure(fns, m.group(1))
+               if n not in ALLOWED_HELPERS and n not in _UI_STUBS)
+
+
+def widget_action_js(doc: "fitz.Document", xref: int, key: str) -> str:
+    """ウィジェットの /AA/<key>/JS（Bl=フォーカスを外したとき 等）。無ければ空文字。"""
+    try:
+        js = doc.xref_get_key(xref, "AA/" + key + "/JS")
+        if js and js[0] == "string":
+            return js[1]
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def widget_readonly(doc: "fitz.Document", xref: int) -> bool:
+    """欄が書き換え禁止（/Ff の 1 ビット。親のフィールドから受け継ぐ）か。"""
+    for _ in range(8):
+        try:
+            ff = doc.xref_get_key(xref, "Ff")
+            if ff[0] == "int":
+                return bool(int(ff[1]) & 1)
+            parent = doc.xref_get_key(xref, "Parent")
+        except Exception:  # noqa: BLE001
+            return False
+        if parent[0] != "xref":
+            return False
+        xref = int(parent[1].split()[0])
+    return False
+
+
+def _apply_readonly(doc: "fitz.Document", xref: int, readonly: bool) -> bool:
+    """書き換え禁止を /Ff に書く（/Ff を持つのはフィールド＝/T のある辞書）。"""
+    target = xref
+    try:
+        for _ in range(8):
+            if doc.xref_get_key(target, "T")[0] == "string":
+                break
+            parent = doc.xref_get_key(target, "Parent")
+            if parent[0] != "xref":
+                target = xref
+                break
+            target = int(parent[1].split()[0])
+        cur = doc.xref_get_key(target, "Ff")
+        flags = int(cur[1]) if cur[0] == "int" else 0
+        new = (flags | 1) if readonly else (flags & ~1)
+        if new == flags:
+            return False
+        doc.xref_set_key(target, "Ff", str(new))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# --- 配られたときの状態（フォームをクリア）--------------------------------
+# 官公庁フォームは、〇の選択（_ON/_OFF の表示）や入力できる欄の切り替えの
+# 初期状態を、初期化の関数（INIT_…）に「欄ごとの display / readonly の代入」
+# として持っている（6010 では 468 欄すべてが配布時の PDF と一致）。
+_DISPLAY_NAMES = {"visible": DISPLAY_VISIBLE, "hidden": DISPLAY_HIDDEN,
+                  "noPrint": DISPLAY_NOVIEW, "noView": DISPLAY_HIDDEN_NOVIEW}
+_INIT_DISPLAY_RE = re.compile(
+    r'getField\(\s*"([^"]+)"\s*\)\s*\.display\s*=\s*display\.(\w+)')
+_INIT_READONLY_RE = re.compile(
+    r'getField\(\s*"([^"]+)"\s*\)\s*\.readonly\s*=\s*(true|false)\b')
+
+
+def initial_field_states(doc_scripts: dict[str, str]) -> dict[str, list]:
+    """欄の名前 → [配布時の display（無ければ None）, 書き換え禁止か（同）]。"""
+    out: dict[str, list] = {}
+    if not doc_scripts:
+        return out
+    for name, body in function_bodies(doc_scripts).items():
+        if not name.upper().startswith("INIT"):
+            continue
+        for m in _INIT_DISPLAY_RE.finditer(body):
+            if m.group(2) in _DISPLAY_NAMES:
+                out.setdefault(m.group(1), [None, None])[0] = _DISPLAY_NAMES[m.group(2)]
+        for m in _INIT_READONLY_RE.finditer(body):
+            out.setdefault(m.group(1), [None, None])[1] = m.group(2) == "true"
+    return out
+
+
+def apply_display_flags(doc: "fitz.Document", xref: int, display: int) -> bool:
+    """display（0..3）を /F に書く（Hidden・Print・NoView の 3 ビットとも）。"""
+    try:
+        cur = doc.xref_get_key(xref, "F")
+        flags = int(cur[1]) if cur[0] == "int" else 0
+    except Exception:  # noqa: BLE001
+        return False
+    new = flags & ~(_HIDDEN_BIT | 32)
+    if display == DISPLAY_HIDDEN:
+        new |= _HIDDEN_BIT
+    elif display == DISPLAY_NOVIEW:          # 画面だけ（印刷しない）
+        new &= ~4
+    elif display == DISPLAY_HIDDEN_NOVIEW:   # 印刷だけ
+        new |= 4 | 32
+    else:
+        new |= 4
+    if new == flags:
+        return False
+    doc.xref_set_key(xref, "F", str(new))
+    return True
+
+
+def apply_readonly(doc: "fitz.Document", xref: int, readonly: bool) -> bool:
+    return _apply_readonly(doc, xref, readonly)
+
+
+def run_blur(doc: "fitz.Document", page_index: int, widget_xref: int,
+             doc_scripts: dict[str, str], effects: "FieldEffects | None" = None) -> bool:
+    """フォーカスを外したときのアクション（/AA/Bl）を、入力欄の有効/無効を変える
+    ものに限って走らせる（例: 口座情報があるのに空欄を選んだら「2」に戻す）。"""
+    try:
+        entry_script = widget_action_js(doc, widget_xref, "Bl")
+        if not wants_full_run(doc_scripts, entry_script):
+            return False
+        return _run_action_impl(doc, page_index, widget_xref, doc_scripts,
+                                entry_script, change_value=None,
+                                full=True, effects=effects)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _choice_pairs(w) -> list[tuple[str, str]]:
+    """選択欄の (選択肢の値, 表示) の一覧。"""
+    pairs = []
+    for c in (getattr(w, "choice_values", None) or []):
+        if isinstance(c, (list, tuple)):
+            pairs.append((str(c[0]), str(c[1] if len(c) > 1 else c[0])))
+        else:
+            pairs.append((str(c), str(c)))
+    return pairs
+
+
+def combo_export(w, value):
+    """選択欄の値（TriV-Reader は表示の文字で持つ）を、フォームの JS が見る
+    選択肢の値に直す（例: 表示「北海道」→ 値「 　北海」。道は別のラベル）。"""
+    if w.field_type not in (fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX):
+        return value
+    text = "" if value is None else str(value)
+    for export, face in _choice_pairs(w):
+        if face == text or export == text:
+            return export
+    return value
+
+
+def combo_display(w, value: str) -> str:
+    """combo_export の逆（JS が選択欄に入れた値を、表示の文字に直す）。"""
+    if w.field_type not in (fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX):
+        return value
+    for export, face in _choice_pairs(w):
+        if export == value:
+            return face
+    return value
 
 
 def widget_keystroke_js(doc: "fitz.Document", xref: int) -> str:
@@ -339,7 +647,7 @@ def _native_group_button_click(doc: "fitz.Document", page_index: int,
     はまらず処理していない場合は None（呼び出し側は V8 実行へフォールバック）。
     """
     # 文書が GroupButtonClick を実際に定義していること（安全確認）
-    if _find_function_source(combined, "GroupButtonClick") is None:
+    if not re.search(r"function\s+GroupButtonClick\s*\(", combined):
         return None
     m = _GROUP_BUTTON_CALL_RE.search(entry_source or "")
     if not m:
@@ -357,10 +665,8 @@ def _native_group_button_click(doc: "fitz.Document", page_index: int,
         return None
 
     # フィールド名 → xref（このページ内）
-    name_to_xref: dict[str, int] = {}
-    for w in (doc.load_page(page_index).widgets() or []):
-        if w.field_name:
-            name_to_xref[w.field_name] = w.xref
+    name_to_xref = {name: xref for xref, name, _r, _s in page_widgets(doc, page_index)
+                    if name}
 
     # JS の GroupButtonClick と同じ規則で、各欄の目標表示を決める
     #  ・クリックした _OFF の base → その base を選択（_ON 表示 / _OFF 非表示）
@@ -392,7 +698,7 @@ def _native_kinmu_button_click(doc: "fitz.Document", page_index: int,
     はまらず処理していない場合は None（呼び出し側は V8 実行へフォールバック）。
     """
     # 文書が KinmuButtonClick を実際に定義していること（安全確認）
-    if _find_function_source(combined, "KinmuButtonClick") is None:
+    if not re.search(r"function\s+KinmuButtonClick\s*\(", combined):
         return None
     m = _KINMU_BUTTON_CALL_RE.search(entry_source or "")
     if not m:
@@ -410,10 +716,8 @@ def _native_kinmu_button_click(doc: "fitz.Document", page_index: int,
     else:
         return None  # 想定外（_02.._04 等）は V8 に委ねる
 
-    name_to_xref: dict[str, int] = {}
-    for w in (doc.load_page(page_index).widgets() or []):
-        if w.field_name:
-            name_to_xref[w.field_name] = w.xref
+    name_to_xref = {name: xref for xref, name, _r, _s in page_widgets(doc, page_index)
+                    if name}
 
     changed = False
     targets = ((on_name, DISPLAY_VISIBLE if select else DISPLAY_HIDDEN),
@@ -444,11 +748,10 @@ def run_click(doc: "fitz.Document", page_index: int, widget_xref: int,
     try:
         clicked_script = None
         clicked_name = ""
-        page = doc.load_page(page_index)
-        for w in (page.widgets() or []):
-            if w.xref == widget_xref:
-                clicked_script = w.script or ""
-                clicked_name = w.field_name or ""
+        for xref, name, _rect, script in page_widgets(doc, page_index):
+            if xref == widget_xref:
+                clicked_script = script
+                clicked_name = name
                 break
         if clicked_script is None:
             return False
@@ -456,8 +759,8 @@ def run_click(doc: "fitz.Document", page_index: int, widget_xref: int,
             return False
         m = SIMPLE_CALL_RE.match(clicked_script.strip())
         if m:
-            combined = "\n".join(doc_scripts.values())
-            entry_source = _find_function_source(combined, m.group(1))
+            combined = combined_source(doc_scripts)
+            entry_source = function_source(doc_scripts, m.group(1))
             if entry_source is not None:
                 for handler in _NATIVE_CLICK_HANDLERS:
                     native = handler(doc, page_index, clicked_name,
@@ -471,7 +774,8 @@ def run_click(doc: "fitz.Document", page_index: int, widget_xref: int,
 
 
 def run_keystroke(doc: "fitz.Document", page_index: int, widget_xref: int,
-                  doc_scripts: dict[str, str], change_value: str) -> bool:
+                  doc_scripts: dict[str, str], change_value: str,
+                  effects: "FieldEffects | None" = None) -> bool:
     """コンボ選択時の Keystroke(/AA/K)を実行し、値/表示の変化を PDF へ反映する。
 
     change_value は選択されたエクスポート値（event.changeEx 相当）。
@@ -482,6 +786,15 @@ def run_keystroke(doc: "fitz.Document", page_index: int, widget_xref: int,
         entry_script = widget_keystroke_js(doc, widget_xref)
         if not entry_script:
             return False
+        if wants_full_run(doc_scripts, entry_script):
+            # 入力欄の有効/無効まで変えるもの。V8 が使えなければ（凍結版の
+            # 同梱漏れ等）下の分かる範囲だけの再現に回る
+            try:
+                return _run_action_impl(doc, page_index, widget_xref, doc_scripts,
+                                        entry_script, change_value=change_value,
+                                        full=True, effects=effects)
+            except ImportError:
+                pass
         native = _native_keystroke(doc, page_index, widget_xref, doc_scripts,
                                    entry_script, change_value)
         if native is not None:
@@ -521,9 +834,14 @@ def _parse_state_lists(state_src: str) -> dict[str, list[str]]:
 def _native_dropdown_select(doc: "fitz.Document", page_index: int,
                             target_name: str, change_value: str) -> bool:
     """DropDownSelect: 選択エクスポート値を <target>_PRINT 欄へ転写する。"""
+    from . import fastwidgets
     print_name = target_name + "_PRINT"
-    for w in (doc.load_page(page_index).widgets() or []):
-        if w.field_name == print_name:
+    for xref, name, _rect, _script in page_widgets(doc, page_index):
+        if name == print_name:
+            page = doc.load_page(page_index)   # Widget はページを弱参照で持つ
+            w = fastwidgets.widget(page, xref)
+            if w is None:
+                return False
             return _apply_value(w, "" if change_value is None else str(change_value))
     return False
 
@@ -535,10 +853,8 @@ def _native_state_name_select(doc: "fitz.Document", page_index: int,
     都道府県の分類に一致する1枚だけを表示する（JS と同じ規則）。"""
     to_btn, dou_btn, fu_btn, ken_btn = btns
     lists = _parse_state_lists(state_src)
-    name_to_xref: dict[str, int] = {}
-    for w in (doc.load_page(page_index).widgets() or []):
-        if w.field_name:
-            name_to_xref[w.field_name] = w.xref
+    name_to_xref = {name: xref for xref, name, _r, _s in page_widgets(doc, page_index)
+                    if name}
 
     changed = False
     # まず4枝すべて非表示
@@ -587,25 +903,24 @@ def _native_keystroke(doc: "fitz.Document", page_index: int, widget_xref: int,
     if not m:
         return None
     entry_name = m.group(1)
-    combined = "\n".join(doc_scripts.values())
 
     # entry がヘルパーそのものか、それを呼ぶラッパーかを解決して本体を得る
-    entry_source = _find_function_source(combined, entry_name)
+    entry_source = function_source(doc_scripts, entry_name)
     if entry_source is None:
         return None
 
     has_dropdown = (_DROPDOWN_CALL_RE.search(entry_source) is not None
-                    and _find_function_source(combined, "DropDownSelect") is not None)
+                    and function_source(doc_scripts, "DropDownSelect") is not None)
     sm = _STATENAME_CALL_RE.search(entry_source)
     has_state = (sm is not None
-                 and _find_function_source(combined, "StateNameSelect") is not None)
+                 and function_source(doc_scripts, "StateNameSelect") is not None)
     if not (has_dropdown or has_state):
         return None  # 既知の2ヘルパー以外を呼ぶなら V8 に委ねる
 
     target_name = None
-    for w in (doc.load_page(page_index).widgets() or []):
-        if w.xref == widget_xref:
-            target_name = w.field_name
+    for xref, name, _rect, _script in page_widgets(doc, page_index):
+        if xref == widget_xref:
+            target_name = name
             break
     if not target_name:
         return None
@@ -615,7 +930,7 @@ def _native_keystroke(doc: "fitz.Document", page_index: int, widget_xref: int,
             doc, page_index, target_name, change_value):
         changed = True
     if has_state:
-        state_src = _find_function_source(combined, "StateNameSelect") or ""
+        state_src = function_source(doc_scripts, "StateNameSelect") or ""
         if _native_state_name_select(
                 doc, page_index, state_src, sm.groups(), change_value):
             changed = True
@@ -624,14 +939,16 @@ def _native_keystroke(doc: "fitz.Document", page_index: int, widget_xref: int,
 
 def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
                      doc_scripts: dict[str, str], entry_script: str,
-                     change_value) -> bool:
+                     change_value, full: bool = False,
+                     effects: "FieldEffects | None" = None) -> bool:
     from py_mini_racer import MiniRacer  # 使う時だけ import（起動時コストを避ける）
 
     if not is_eligible(doc_scripts):
         return False
 
+    from . import fastwidgets
     page = doc.load_page(page_index)
-    widgets = list(page.widgets() or [])
+    widgets = fastwidgets.widgets(page)
     target = next((w for w in widgets if w.xref == widget_xref), None)
     if target is None:
         return False
@@ -643,10 +960,9 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
         return False
     entry_name = m.group(1)
 
-    combined = "\n".join(doc_scripts.values())
     helper_sources = []
     for name in ALLOWED_HELPERS:
-        src = _find_function_source(combined, name)
+        src = function_source(doc_scripts, name)
         if src:
             helper_sources.append(src)
     if not helper_sources:
@@ -657,9 +973,16 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
     # 場合が実ファイルで両方観測されている。ラッパーなら定義も追加で注入する。
     entry_source = None
     if entry_name not in ALLOWED_HELPERS:
-        entry_source = _find_function_source(combined, entry_name)
+        entry_source = function_source(doc_scripts, entry_name)
         if entry_source is None:
             return False
+    # 入力欄の有効/無効を変えるラッパーは、そこから呼ばれる関数も注入する
+    # （チェック関数・メッセージ文・SetEnable 等。文書 JS 全体ではない）
+    extra_sources = []
+    if full and entry_source:
+        fns = function_bodies(doc_scripts)
+        extra_sources = [fns[n] for n in _callee_closure(fns, entry_name)[1:]
+                         if n not in ALLOWED_HELPERS and n not in _UI_STUBS]
 
     # --- 各ウィジェットの現在状態を Python 側に集約（getField 用）------
     before_display: dict[str, int] = {}
@@ -692,7 +1015,10 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
                 readonly: readonly,
                 required: false,
                 strokeColor: null,
-                setFocus: function(){}
+                setFocus: function(){},
+                setAction: function(){},
+                isBoxChecked: function(){ return false; },
+                checkThisBox: function(){}
             };
         }
         function getField(name){
@@ -706,10 +1032,32 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
     )
     for bridge in bridges:
         bridge.register_js(ctx)
+    if full:
+        # 吹き出し・警告は出さずに文だけ受け取る（画面には TriV-Reader が出す）
+        ctx.eval(
+            """
+            var __tips = [], __alerts = [];
+            app.alert = function(m){
+                __alerts.push(String(m && m.cMsg !== undefined ? m.cMsg : m)); };
+            function ShowToolTip(name, msg){ __tips.push(String(msg)); }
+            function HideToolTip(){}
+            var color = {transparent: ["T"], black: ["G", 0], white: ["G", 1],
+                         red: ["RGB", 1, 0, 0], green: ["RGB", 0, 1, 0],
+                         blue: ["RGB", 0, 0, 1], gray: ["G", 0.5],
+                         ltGray: ["G", 0.75], dkGray: ["G", 0.25]};
+            var pageNum = %d;
+            """ % page_index,
+            timeout=_JS_EXEC_TIMEOUT_MS,
+        )
 
     # 許可されたヘルパーだけを注入する（文書 JS 全体は絶対に注入しない）
     for src in helper_sources:
         ctx.eval(src, timeout=_JS_EXEC_TIMEOUT_MS)
+    for src in extra_sources:
+        try:
+            ctx.eval(src, timeout=_JS_EXEC_TIMEOUT_MS)
+        except Exception:  # noqa: BLE001  V8 が読めない書き方の関数は飛ばす
+            pass
     if entry_source:
         ctx.eval(entry_source, timeout=_JS_EXEC_TIMEOUT_MS)
 
@@ -719,10 +1067,12 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
     # この条件下でのみ動くため）。
     ctx.eval(
         """
+        var __error = null;
         function __run_action(eventTargetName, changeEx, isKeystroke){
-            var event = {target: {name: eventTargetName}};
+            // Acrobat と同じく event.target は欄そのもの（valueAsString 等が読める）
+            var event = {target: getField(eventTargetName)};
             if (isKeystroke) { event.willCommit = false; event.changeEx = changeEx; }
-            try { %s(event); } catch (e) { /* 対象外の処理は無視 */ }
+            try { %s(event); } catch (e) { __error = String(e); /* 対象外の処理は無視 */ }
         }
         """ % entry_name,
         timeout=_JS_EXEC_TIMEOUT_MS,
@@ -736,32 +1086,52 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
         timeout=_JS_EXEC_TIMEOUT_MS,
     )
 
-    # --- 変化した display / value を PDF に反映する ----------------------
+    # --- 変化した display / value（/ readonly）を PDF に反映する ----------
+    # 欄ごとに問い合わせると欄の数だけ V8 を往復するので、1 回で読む
+    try:
+        after = json.loads(ctx.eval(
+            "JSON.stringify(Object.keys(__fields).map(function(k){"
+            " var f = __fields[k]; return [k, f.display,"
+            " String(f.valueAsString), !!f.readonly]; }))",
+            timeout=_JS_EXEC_TIMEOUT_MS))
+    except Exception:  # noqa: BLE001
+        return False
+    state = {row[0]: row[1:] for row in after}
+    if _DEBUG:
+        print("govform_js:", entry_name, "error:", ctx.eval("__error"))
+    before_ro = {b.name: b.readonly for b in bridges}
     changed = False
     for w in widgets:
         name = w.field_name
-        if not name or name not in before_display:
+        if not name or name not in before_display or name not in state:
             continue
+        new_disp, new_val, new_ro = state[name]
         try:
-            new_disp = ctx.eval(
-                "__fields[%s] ? __fields[%s].display : -1"
-                % (_js_str(name), _js_str(name)),
-                timeout=_JS_EXEC_TIMEOUT_MS,
-            )
-            new_val = ctx.eval(
-                "__fields[%s] ? String(__fields[%s].valueAsString) : null"
-                % (_js_str(name), _js_str(name)),
-                timeout=_JS_EXEC_TIMEOUT_MS,
-            )
-        except Exception:  # noqa: BLE001
-            continue
-        if new_disp is not None and int(new_disp) >= 0 \
-                and int(new_disp) != before_display[name]:
-            if _apply_display(doc, w.xref, int(new_disp)):
+            new_disp = int(new_disp)
+        except (TypeError, ValueError):
+            new_disp = -1
+        if new_disp >= 0 and new_disp != before_display[name]:
+            if _apply_display(doc, w.xref, new_disp):
                 changed = True
         if new_val is not None and str(new_val) != before_value.get(name, ""):
-            if _apply_value(w, str(new_val)):
+            shown = combo_display(w, str(new_val))
+            if _apply_value(w, shown):
                 changed = True
+                if effects is not None:
+                    effects.values[name] = shown
+        if full and bool(new_ro) != before_ro.get(name, False):
+            if _apply_readonly(doc, w.xref, bool(new_ro)):
+                changed = True
+            if effects is not None:
+                effects.readonly[name] = bool(new_ro)
+    if full and effects is not None:
+        try:
+            effects.tips += [t for t in json.loads(ctx.eval(
+                "JSON.stringify(__tips)", timeout=_JS_EXEC_TIMEOUT_MS)) if t]
+            effects.alerts += [a for a in json.loads(ctx.eval(
+                "JSON.stringify(__alerts)", timeout=_JS_EXEC_TIMEOUT_MS)) if a]
+        except Exception:  # noqa: BLE001
+            pass
     return changed
 
 
@@ -827,6 +1197,28 @@ def _action_js(doc: "fitz.Document", xref: int, key: str) -> str:
     return ""
 
 
+# 官公庁フォームのラッパーは冒頭で項目名を持つ（fieldName = "氏名"; や
+# // fieldName: "公金受取口座希望"; の形）
+_FIELD_LABEL_RE = re.compile(r'fieldName\s*[:=]\s*"([^"]+)"')
+
+
+def _field_name(doc: "fitz.Document", xref: int) -> str:
+    """欄の完全な名前（親の /T を "." でつなぐ。PyMuPDF の field_name と同じ）。"""
+    parts: list[str] = []
+    for _ in range(8):
+        try:
+            t = doc.xref_get_key(xref, "T")
+            if t[0] == "string" and t[1]:
+                parts.insert(0, t[1])
+            parent = doc.xref_get_key(xref, "Parent")
+        except Exception:  # noqa: BLE001
+            break
+        if parent[0] != "xref":
+            break
+        xref = int(parent[1].split()[0])
+    return ".".join(parts)
+
+
 def _wrapper_body(bodies: dict[str, str], js: str) -> str:
     """「Name(event)」だけのアクションなら、その関数の中身。それ以外は js そのもの。"""
     m = SIMPLE_CALL_RE.match((js or "").strip().rstrip(";").strip())
@@ -836,28 +1228,41 @@ def _wrapper_body(bodies: dict[str, str], js: str) -> str:
 
 
 def field_input_rules(doc: "fitz.Document", doc_scripts: dict[str, str]) -> dict:
-    """欄の名前 → {"digits", "large_kana", "hint", "focus_to"}。
+    """欄の名前 → {"digits", "large_kana", "hint", "focus_to", "label"}。
 
     digits=数字だけ（FormatSingleByteNumber）、large_kana=小さいカナを大きく
     （ReplaceChisaiKana）、hint=入力の注意（ShowToolTip の文言）、
-    focus_to=フォーカスを別の欄へ渡すだけの見せかけの欄（_PRINT 等）なら渡す先。
+    focus_to=フォーカスを別の欄へ渡すだけの見せかけの欄（_PRINT 等）なら渡す先、
+    label=項目名（ラッパーの fieldName。「氏名」「個人番号（マイナンバー）１」等。
+    入力候補で同じ項目をまとめ、覚えてはいけない欄を見分けるのに使う）。
     """
-    combined = "\n".join(doc_scripts.values()) if doc_scripts else ""
-    bodies = _all_function_bodies(combined) if combined else {}
+    bodies = function_bodies(doc_scripts) if doc_scripts else {}
     rules: dict = {}
-    for page in doc:
-        for w in page.widgets() or []:
-            name = w.field_name or ""
+    # PyMuPDF の Widget を作ると 1 欄ごとに数十回の問い合わせになり、270 欄で
+    # 0.3 秒以上かかる（開いてから入力できるまでが遅かった）。xref と名前だけを
+    # 直接読む。
+    for pno in range(doc.page_count):
+        for xref, atype, _id in doc.load_page(pno).annot_xrefs():
+            if atype != fitz.PDF_ANNOT_WIDGET:
+                continue
+            name = _field_name(doc, xref)
             if not name or name in rules:
                 continue
-            keystroke = _wrapper_body(bodies, _action_js(doc, w.xref, "K"))
-            focus = _wrapper_body(bodies, _action_js(doc, w.xref, "Fo"))
+            keystroke = _wrapper_body(bodies, _action_js(doc, xref, "K"))
+            focus = _wrapper_body(bodies, _action_js(doc, xref, "Fo"))
             rule = {
                 "digits": "FormatSingleByteNumber" in keystroke,
                 "large_kana": "ReplaceChisaiKana" in keystroke,
                 "hint": None,
                 "focus_to": None,
+                "label": None,
             }
+            for body in (keystroke, focus,
+                         _wrapper_body(bodies, _action_js(doc, xref, "Bl"))):
+                m = _FIELD_LABEL_RE.search(body)
+                if m:
+                    rule["label"] = m.group(1)
+                    break
             m = _SHOW_TIP_RE.search(focus)
             if m:
                 rule["hint"] = m.group(1).replace("\\n", "\n").replace('\\"', '"')

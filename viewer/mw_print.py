@@ -128,8 +128,9 @@ class PrintMixin:
             "long": QPrinter.DuplexMode.DuplexLongSide,
             "short": QPrinter.DuplexMode.DuplexShortSide,
         }.get(opt.get("duplex", "none"), QPrinter.DuplexMode.DuplexNone))
-        if opt.get("grayscale"):
-            printer.setColorMode(QPrinter.ColorMode.GrayScale)
+        # 必ず指定する（プリンターは使い回すので、前回の白黒が残らないように）
+        printer.setColorMode(QPrinter.ColorMode.GrayScale if opt.get("grayscale")
+                             else QPrinter.ColorMode.Color)
         # 用紙。"auto"（PDF のページサイズに合わせる）はページごとに指定する。
         paper = opt.get("paper")
         if isinstance(paper, QPageSize):
@@ -256,7 +257,9 @@ class PrintMixin:
 
         quality = opt.get("quality", "vector")
         vector = quality == "vector"
-        max_dpi = 0 if vector else (int(quality) or 0)
+        # ベクターで描けないページ（ハイライトの透けなど）を画像にするときは
+        # 300dpi で足りる（プリンターの 600dpi で作ると 4 倍のデータを送る）
+        max_dpi = 300 if vector else (int(quality) or 0)
         grayscale = opt["grayscale"]
         auto_rotate = fit_only or opt["orientation"] == "auto"
 
@@ -321,22 +324,19 @@ class PrintMixin:
         """
         try:
             from PySide6.QtCore import QRectF
-            from PySide6.QtSvg import QSvgRenderer
+
+            from .svg_print import draw_svg
 
             svg = source.page_svg(index)
             if not svg_is_safe(svg):
-                return False
-            renderer = QSvgRenderer(svg.encode("utf-8"))
-            if not renderer.isValid():
                 return False
             if rotate:
                 painter.save()
                 painter.translate(x + w / 2, y + h / 2)
                 painter.rotate(90)
-                renderer.render(painter, QRectF(-h / 2, -w / 2, h, w))
+                ok = draw_svg(painter, svg, QRectF(-h / 2, -w / 2, h, w))
                 painter.restore()
-            else:
-                renderer.render(painter, QRectF(x, y, w, h))
-            return True
+                return ok
+            return draw_svg(painter, svg, QRectF(x, y, w, h))
         except Exception:  # noqa: BLE001
             return False

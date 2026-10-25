@@ -104,6 +104,18 @@ class DocTab(QStackedWidget):
         self.addWidget(self.organizer)   # index 1
 
 
+def _warm_up_v8() -> None:
+    """フォームの JS 用の V8 を裏で読み込んでおく（初めての選択で 0.2 秒待たせない）。"""
+    import threading
+
+    def load():
+        try:
+            import py_mini_racer  # noqa: F401
+        except Exception:  # noqa: BLE001  無ければ分かる範囲だけで動く
+            pass
+    threading.Thread(target=load, name="trv-v8-warmup", daemon=True).start()
+
+
 class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -295,6 +307,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.act_form.setCheckable(True)
         self.act_form.setToolTip("入力欄付きPDFの各欄に文字を入力できるようにする")
         tb.addAction(self.act_form)
+        self.act_clear_form = QAction("フォームをクリア", self)
+        self.act_clear_form.setToolTip(
+            "入力した内容をすべて消して、配られたときの状態に戻す（Ctrl+Z で戻せます）")
+        tb.addAction(self.act_clear_form)
         tb.addSeparator()
 
         self.act_delete = QAction("ページ削除", self)
@@ -660,6 +676,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         m_pages = mb.addMenu("ページ(&P)")
         m_pages.addAction(self.act_organize)
         m_pages.addAction(self.act_form)
+        m_pages.addAction(self.act_clear_form)
         m_pages.addSeparator()
         m_pages.addAction(self.act_delete)
         m_pages.addAction(self.act_merge)
@@ -884,6 +901,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         g = r.add_group(p, "モード")
         g.add_action(self.act_organize, big=True)
         g.add_action(self.act_form, big=True)
+        g.add_stack([self.act_clear_form])
         g = r.add_group(p, "ページ操作")
         g.add_stack([self.act_delete, self.act_merge, self.act_extract,
                      self.act_split, self.act_blank_page, self.act_duplicate_page])
@@ -1232,6 +1250,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.act_split.triggered.connect(self.split_pdf)
         self.act_organize.toggled.connect(self._toggle_organize)
         self.act_form.toggled.connect(self._toggle_form)
+        self.act_clear_form.triggered.connect(self._clear_form)
         self.act_to_images.triggered.connect(self.export_images_dialog)
         self.act_from_images.triggered.connect(self.images_to_pdf_dialog)
         self.act_add_images.triggered.connect(self.add_images_as_pages)
@@ -1496,7 +1515,12 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             def _finish_form_setup(d=doc, t=tab):
                 if t.doc is d and d.is_open:
                     t.page_view.set_form_mode(True)
-                    self._check_unsupported_govform(d)
+                    if d.is_govform_js_eligible():
+                        _warm_up_v8()
+                    # 未対応の入力補助の知らせは入力には関係ないので、欄が
+                    # 使えるようになってから（入力を待たせない）
+                    QTimer.singleShot(
+                        800, lambda: d.is_open and self._check_unsupported_govform(d))
             QTimer.singleShot(0, _finish_form_setup)
 
     def _offer_resume(self, tab, page: int) -> None:
@@ -2440,6 +2464,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self._apply_annot_defaults()
         self._trim_recent()
         self._setup_autosave()
+        from . import form_history
+        form_history.set_enabled(prefs.value(s, "form/autocomplete"))
 
     def _apply_annot_defaults(self) -> None:
         """注釈の既定スタイル（作成者・色・太さ・不透明度・文字サイズ）を反映。"""
@@ -2637,6 +2663,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             self.act_facing.setChecked(True)
         self._apply_annot_defaults()
         self._setup_autosave()
+        from . import form_history
+        form_history.set_enabled(prefs.value(self.settings, "form/autocomplete"))
         # 匿名レポート送信トグル: 送信先URL未設定なら意味がないので隠す。
         # 設定済みなら現在の同意状態を反映する。
         from . import telemetry
@@ -2800,6 +2828,24 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         if on:
             self.statusBar().showMessage(
                 "フォーム入力モード: 黄色い欄をクリックして入力できます", 4000)
+
+    def _clear_form(self) -> None:
+        if not self.doc.is_open or not self.doc.is_form():
+            return
+        ans = QMessageBox.question(
+            self, "フォームをクリア",
+            "入力した内容をすべて消して、配られたときの状態に戻します。\n"
+            "（あとから「元に戻す」(Ctrl+Z) で戻せます）",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if ans != QMessageBox.StandardButton.Ok:
+            return
+        self.page_view.finish_text_edit()
+        n = self.doc.clear_form()
+        self._reload(self.page_view.index)
+        self.statusBar().showMessage(
+            f"フォームをクリアしました（{n} 欄）。Ctrl+Z で戻せます" if n
+            else "消す入力はありませんでした", 5000)
 
     def _on_form_changed(self) -> None:
         """フォーム欄の値が変わったら未保存状態を反映。"""
@@ -3151,6 +3197,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         # フォーム入力は「入力欄付きPDF」を開いているときだけ有効
         is_form = has and self.doc.is_form()
         self.act_form.setEnabled(is_form)
+        self.act_clear_form.setEnabled(is_form)
         if not is_form and self.act_form.isChecked():
             self.act_form.blockSignals(True)
             self.act_form.setChecked(False)

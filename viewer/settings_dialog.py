@@ -74,6 +74,8 @@ DEFAULTS: dict[str, object] = {
     "update_url": "",
     # --- 詳細 ---
     "ocr/lang": "jpn+eng",
+    # --- フォーム ---
+    "form/autocomplete": True,         # 以前に入れた内容を候補に出す
 }
 
 # マウスジェスチャーに割り当てられる操作（設定値 → 表示名）。
@@ -166,6 +168,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._build_view(), "表示")
         self.tabs.addTab(self._build_annot(), "注釈")
         self.tabs.addTab(self._build_save(), "保存")
+        self.tabs.addTab(self._build_form(), "フォーム")
         self.tabs.addTab(self._build_update(), "更新")
         self.tabs.addTab(self._build_advanced(), "詳細")
 
@@ -342,6 +345,22 @@ class SettingsDialog(QDialog):
             "　（元に戻せるよう、最初の1回は必ず .bak を残します）"))
         return w
 
+    def _build_form(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        self.cb_autocomplete = QCheckBox("以前に入力した内容を候補に出す")
+        self.cb_autocomplete.setToolTip(
+            "氏名・住所・電話番号など、前に入れた内容を入力中に候補として出します")
+        form.addRow("入力候補", self.cb_autocomplete)
+        form.addRow("", QLabel(
+            "※ マイナンバー・口座番号・パスワード・暗証番号などの欄と、\n"
+            "　12 桁・16 桁の番号は覚えません"))
+        self.lbl_history = QLabel()
+        btn = QPushButton("入力候補の履歴を消去")
+        btn.clicked.connect(self._clear_form_history)
+        form.addRow("", self._left(btn, self.lbl_history))
+        return w
+
     def _build_update(self) -> QWidget:
         w = QWidget()
         form = QFormLayout(w)
@@ -425,6 +444,10 @@ class SettingsDialog(QDialog):
         idx = self.cmb_ocr.findData(value(s, "ocr/lang"))
         self.cmb_ocr.setCurrentIndex(max(0, idx))
 
+        self.cb_autocomplete.setChecked(value(s, "form/autocomplete"))
+        from . import form_history
+        self.lbl_history.setText(f"（{form_history.history().count()} 件）")
+
     def _store(self) -> None:
         s = self.settings
         s.setValue("startup/restore_session", self.cb_restore.isChecked())
@@ -462,6 +485,7 @@ class SettingsDialog(QDialog):
             telemetry.set_consent(s, self.cb_telemetry.isChecked())
 
         s.setValue("ocr/lang", self.cmb_ocr.currentData())
+        s.setValue("form/autocomplete", self.cb_autocomplete.isChecked())
 
     def apply(self) -> None:
         self._store()
@@ -506,6 +530,12 @@ class SettingsDialog(QDialog):
         self.settings.setValue("recent", [])
         self.window._rebuild_recent_menu()
         QMessageBox.information(self, "履歴", "最近使ったファイルの履歴を消去しました。")
+
+    def _clear_form_history(self) -> None:
+        from . import form_history
+        form_history.history().clear()
+        self.lbl_history.setText("（0 件）")
+        QMessageBox.information(self, "入力候補", "フォームの入力候補の履歴を消去しました。")
 
     def _check_update_now(self) -> None:
         self._store()

@@ -13,7 +13,7 @@ from contextlib import contextmanager
 import fitz  # PyMuPDF
 from PySide6.QtGui import QImage, QPixmap
 
-from . import govform_js, jpfonts
+from . import fastwidgets, govform_js, jpfonts
 
 # 埋め込みの無い和文を、中国語の字形でなく Windows の和文フォントで描く
 jpfonts.install()
@@ -245,6 +245,8 @@ class PdfDocument:
         self._fields_cache: dict[int, list] = {}
         self._authenticated: bool = True
         self._doc_scripts_cache: dict[str, str] | None = None
+        # 直前のコンボ選択でフォームの JS が変えた欄（画面の入力欄に反映する）
+        self.last_form_effects = None
         # 文字選択用のレイアウト。ドラッグ中はマウスを動かすたびに参照される
         # ので、毎回 rawdict を解析すると重い。ページをまたぐ選択でも効くよう
         # 数ページ分を憶えておく。
@@ -408,7 +410,7 @@ class PdfDocument:
         kinds = (fitz.PDF_WIDGET_TYPE_TEXT, fitz.PDF_WIDGET_TYPE_COMBOBOX,
                  fitz.PDF_WIDGET_TYPE_LISTBOX)
         for page in self._doc:
-            for w in page.widgets() or []:
+            for w in fastwidgets.widgets(page):
                 if w.field_type in kinds and jpfonts.japanize_ap(
                         self._doc, w.xref, serif=jpfonts.is_mincho(w.text_font or "")):
                     n += 1
@@ -1269,7 +1271,8 @@ class PdfDocument:
         rules = self.field_rules()
         page = self._doc.load_page(index)
         out = []
-        for w in (page.widgets() or []):
+        rows = []   # 〇欄のクリックで使う表（govform_js.page_widgets）も一緒に作る
+        for w in fastwidgets.widgets(page):
             # choice_values は文字列のほか (エクスポート値, 表示名) のタプルのことがある
             choices = []
             for c in (getattr(w, "choice_values", None) or []):
@@ -1280,6 +1283,7 @@ class PdfDocument:
             is_text = w.field_type == fitz.PDF_WIDGET_TYPE_TEXT
             maxlen = int(getattr(w, "text_maxlen", 0) or 0)
             flags = int(getattr(w, "field_flags", 0) or 0)
+            PASSWORD = 1 << 13    # 伏せ字の欄
             out.append({
                 "xref": w.xref,
                 "name": w.field_name or "",
@@ -1299,9 +1303,14 @@ class PdfDocument:
                 "display": int(getattr(w, "field_display", 0) or 0),
                 "align": _align(w),               # 0=左 / 1=中央 / 2=右
                 "readonly": bool(flags & READONLY),
+                "password": bool(is_text and (flags & PASSWORD)),
+                "label": getattr(w, "field_label", None) or "",   # /TU（欄の説明）
                 # フォームの入力補助（数字だけ・小さいカナを大きく・入力の注意）
                 "rules": rules.get(w.field_name or ""),
             })
+            rows.append((w.xref, w.field_name or "", fitz.Rect(w.rect),
+                         (getattr(w, "script", None) or "").strip()))
+        govform_js.remember_page_widgets(self._doc, index, rows)
         self._fields_cache[index] = out
         return out
 
@@ -1321,13 +1330,15 @@ class PdfDocument:
         """欄の xref。番号で見つからなければ名前で探し直す（保存などで番号が
         付け直された後も、入れた値を確実に書き込むため）。"""
         page = self._doc.load_page(index)
-        by_name = None
-        for w in (page.widgets() or []):
-            if w.xref == xref:
-                return xref
-            if name and by_name is None and w.field_name == name:
-                by_name = w.xref
-        return by_name
+        if any(x == xref and t == fitz.PDF_ANNOT_WIDGET
+               for x, t, _id in page.annot_xrefs()):
+            return xref
+        if not name:
+            return None
+        for x, n, _rect, _script in govform_js.page_widgets(self._doc, index):
+            if n == name:
+                return x
+        return None
 
     def set_field_value(self, index: int, xref: int, value,
                         name: str | None = None) -> bool:
@@ -1338,26 +1349,26 @@ class PdfDocument:
         if xref is None:
             return False
         page = self._doc.load_page(index)
-        for w in (page.widgets() or []):
-            if w.xref == xref:
-                try:
-                    if w.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
-                        # field_value=True は、ON 状態名が非ASCII（日本語を
-                        # UTF-16 で PDF 名にしたもの。官公庁フォームで実在）だと
-                        # PyMuPDF が対応しきれず反映されないことがある。/AS・/V を
-                        # 直接書いて確実にチェック/解除する。
-                        if not self._set_checkbox(w, bool(value)):
-                            return False
-                    else:
-                        w.field_value = "" if value is None else str(value)
-                        # 外観（印刷・提出先で見える文字）はこちらで作る。欄に
-                        # 収まらなければ外観の中だけ縮める（/DA は書き換えない）
-                        jpfonts.update_widget(w)
-                    self.modified = True
-                    return True
-                except Exception:  # noqa: BLE001
+        w = fastwidgets.widget(page, xref)
+        if w is None:
+            return False
+        try:
+            if w.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+                # field_value=True は、ON 状態名が非ASCII（日本語を
+                # UTF-16 で PDF 名にしたもの。官公庁フォームで実在）だと
+                # PyMuPDF が対応しきれず反映されないことがある。/AS・/V を
+                # 直接書いて確実にチェック/解除する。
+                if not self._set_checkbox(w, bool(value)):
                     return False
-        return False
+            else:
+                w.field_value = "" if value is None else str(value)
+                # 外観（印刷・提出先で見える文字）はこちらで作る。欄に
+                # 収まらなければ外観の中だけ縮める（/DA は書き換えない）
+                jpfonts.update_widget(w)
+            self.modified = True
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def _set_checkbox(self, w, on: bool) -> bool:
         """チェックボックスの ON/OFF を /AS・/V を直接書いて反映する。
@@ -1412,19 +1423,19 @@ class PdfDocument:
         try:
             target = fitz.Rect(rect)
             fallback = None
-            for w in (self._doc.load_page(index).widgets() or []):
-                if int(getattr(w, "field_display", 0) or 0) in (1, 3):
-                    continue  # 非表示（Hidden/印刷のみ）は対象外
-                script = (getattr(w, "script", None) or "").strip()
+            for xref, _name, wr, script in govform_js.page_widgets(self._doc, index):
                 if not (script and govform_js.SIMPLE_CALL_RE.match(script)):
                     continue
-                wr = w.rect
+                if not wr.intersects(target):
+                    continue
+                if govform_js.widget_display(self._doc, xref) in (1, 3):
+                    continue  # 非表示（Hidden/印刷のみ）は対象外
                 if (abs(wr.x0 - target.x0) < 1.0 and abs(wr.y0 - target.y0) < 1.0
                         and abs(wr.x1 - target.x1) < 1.0
                         and abs(wr.y1 - target.y1) < 1.0):
-                    return w.xref               # 矩形一致（本命）
-                if fallback is None and wr.intersects(target):
-                    fallback = w.xref           # 念のための保険
+                    return xref                 # 矩形一致（本命）
+                if fallback is None:
+                    fallback = xref             # 念のための保険
             return fallback
         except Exception:  # noqa: BLE001
             return None
@@ -1452,18 +1463,16 @@ class PdfDocument:
         if not self._doc:
             return display_text
         try:
-            page = self._doc.load_page(index)
-            for w in (page.widgets() or []):
-                if w.xref != xref:
-                    continue
-                for c in (getattr(w, "choice_values", None) or []):
-                    if isinstance(c, (list, tuple)):
-                        export = str(c[0])
-                        face = str(c[1] if len(c) > 1 else c[0])
-                        if face == display_text or export == display_text:
-                            return export
-                    elif str(c) == display_text:
-                        return str(c)
+            page = self._doc.load_page(index)   # Widget はページを弱参照で持つ
+            w = fastwidgets.widget(page, xref)
+            for c in (getattr(w, "choice_values", None) or []):
+                if isinstance(c, (list, tuple)):
+                    export = str(c[0])
+                    face = str(c[1] if len(c) > 1 else c[0])
+                    if face == display_text or export == display_text:
+                        return export
+                elif str(c) == display_text:
+                    return str(c)
         except Exception:  # noqa: BLE001
             pass
         return display_text
@@ -1480,11 +1489,92 @@ class PdfDocument:
         if xref is None:
             return False
         export = self.govform_combo_export_value(index, xref, display_text)
+        effects = govform_js.FieldEffects()
+        self.last_form_effects = effects
+        scripts = self.doc_scripts()
         changed = govform_js.run_keystroke(
-            self._doc, index, xref, self.doc_scripts(), export)
+            self._doc, index, xref, scripts, export, effects=effects)
+        # 選んだら次の欄へ移る＝フォーカスを外したときの処理（例: 口座情報が
+        # あるのに空欄を選んだら「2」に戻す）もここで走らせる
+        own = name or govform_js._field_name(self._doc, xref)
+        if govform_js.run_blur(self._doc, index, xref, scripts, effects=effects):
+            changed = True
+            if own in effects.values:
+                # 欄自身の値が戻されたら、印刷用の欄・有効/無効もその値に合わせる
+                govform_js.run_keystroke(
+                    self._doc, index, xref, scripts,
+                    self.govform_combo_export_value(index, xref, effects.values[own]),
+                    effects=effects)
         if changed:
             self.modified = True
         return changed
+
+    def clear_form(self) -> int:
+        """入力した内容をすべて消して、配られたときの状態に戻す。戻した欄の数。
+
+        値は欄の既定値（/DV。無ければ空・チェックなし）に戻す。官公庁フォーム
+        は、〇の選択や入力できる欄の切り替えの初期状態を JS の初期化関数が
+        持っているので、その表示・書き換え禁止も当て直す。Ctrl+Z で戻せる。
+        """
+        if not self._doc:
+            return 0
+        self._push_doc_undo("フォームのクリア", None)
+        init = govform_js.initial_field_states(self.doc_scripts())
+        n = 0
+        for page in self._doc:
+            for w in fastwidgets.widgets(page):
+                changed = self._reset_widget_value(w)
+                state = init.get(w.field_name or "")
+                if state:
+                    if state[0] is not None and govform_js.apply_display_flags(
+                            self._doc, w.xref, state[0]):
+                        changed = True
+                    if state[1] is not None and govform_js.apply_readonly(
+                            self._doc, w.xref, state[1]):
+                        changed = True
+                n += bool(changed)
+        if n:
+            self.modified = True
+        return n
+
+    def _reset_widget_value(self, w) -> bool:
+        """欄の値を既定値に戻す。変わったら True。"""
+        kind = w.field_type
+        dv = self._doc.xref_get_key(w.xref, "DV")
+        if dv[0] == "null":
+            parent = self._doc.xref_get_key(w.xref, "Parent")
+            if parent[0] == "xref":
+                dv = self._doc.xref_get_key(int(parent[1].split()[0]), "DV")
+        default = dv[1] if dv[0] in ("string", "name") else ""
+        if dv[0] == "name":
+            default = default.lstrip("/")
+        try:
+            if kind in (fitz.PDF_WIDGET_TYPE_CHECKBOX, fitz.PDF_WIDGET_TYPE_RADIOBUTTON):
+                on = default not in ("", "Off")
+                if (str(w.field_value or "") not in ("", "Off", "False", "false")) == on:
+                    return False
+                if kind == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+                    return self._set_checkbox(w, on)
+                w.field_value = on
+                w.update()
+                return True
+            if kind in (fitz.PDF_WIDGET_TYPE_TEXT, fitz.PDF_WIDGET_TYPE_COMBOBOX,
+                        fitz.PDF_WIDGET_TYPE_LISTBOX):
+                default = govform_js.combo_display(w, default)   # 表示の文字で持つ
+                if str(w.field_value or "") == default:
+                    return False
+                w.field_value = default
+                jpfonts.update_widget(w)
+                return True
+        except Exception:  # noqa: BLE001  戻せない欄は飛ばす
+            return False
+        return False   # 押しボタン（値を持たない）
+
+    def field_is_readonly(self, index: int, xref: int) -> bool:
+        """欄が今、書き換え禁止か（フォームの JS が切り替えることがある）。"""
+        if not self._doc:
+            return False
+        return govform_js.widget_readonly(self._doc, xref)
 
     def govform_unsupported_helpers(self) -> list[str]:
         """このフォームが使う入力補助のうち、まだ未対応のヘルパー名一覧。

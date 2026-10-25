@@ -2527,14 +2527,60 @@ class PageView(QScrollArea):
         self._form_overlays.clear()
 
     def _build_form_overlays(self) -> None:
+        """入力欄の overlay を作る。今見ているページを先に、残りは次の周回で。
+
+        欄が数百あるフォームは全部作るのに 0.3〜0.5 秒かかる。開いた直後や
+        拡大縮小の後は、まず見えているページの欄を使えるようにする。作る順は
+        ページ順を回したもの（今のページ→後ろ→先頭から前）なので、Tab で
+        回る順はページ順のまま変わらない。
+        """
         # 作り直しで入力中の欄が消えても、作り直した欄へカーソルを戻す
         self._remember_focused_field()
         self._clear_form_overlays()
+        self._overlay_gen = getattr(self, "_overlay_gen", 0) + 1
         if not self._form_mode or not self._doc or not self._doc.is_open:
             return
-        for index in range(min(self._doc.page_count, len(self._labels))):
-            self._build_page_overlays(index)
+        n = min(self._doc.page_count, len(self._labels))
+        if n <= 0:
+            return
+        # 入力中の欄があるページ（無ければ今のページ）から。カーソルをすぐ戻せる
+        refocus = getattr(self, "_refocus", None)
+        if refocus and isinstance(refocus[0], int) and 0 <= refocus[0] < n:
+            first = refocus[0]
+        else:
+            first = max(0, min(self._index, n - 1))
+        order = [(first + k) % n for k in range(n)]
+        self._build_page_overlays(order[0])
         self._restore_focused_field()
+        self._build_rest_overlays(self._overlay_gen, order[1:], first != 0)
+
+    def _build_rest_overlays(self, gen: int, pages: list, reorder: bool) -> None:
+        """残りのページを 1 ページずつ、入力の合間に作る（画面を止めない）。"""
+        if gen != self._overlay_gen or not self._form_mode:
+            return   # その後に作り直しが始まった・フォーム入力を止めた
+        if not self._doc or not self._doc.is_open:
+            return
+        if not pages:
+            if reorder:
+                self._fix_form_tab_order()
+            return
+        if pages[0] < len(self._labels):
+            self._build_page_overlays(pages[0])
+        # 0 だと同じ周回でまとめて処理されてしまう（入力が割り込めない）ので 1ms。
+        # self に結びつけて、タブを閉じたら呼ばれないように
+        QTimer.singleShot(1, self, lambda: self._build_rest_overlays(gen, pages[1:], reorder))
+
+    def _fix_form_tab_order(self) -> None:
+        """途中のページから作ったときは、Tab の順をページ順に並べ直す。
+
+        作った順のままだと、先に作ったページの手前（＝最後に作ったページの
+        最後の欄）で Tab が画面の外（リボン）へ抜けてしまう。
+        """
+        ordered = sorted((c for c in self._form_overlays
+                          if c.focusPolicy() & Qt.FocusPolicy.TabFocus),
+                         key=lambda c: c.property("trv_page") or 0)
+        for a, b in zip(ordered, ordered[1:]):
+            QWidget.setTabOrder(a, b)
 
     def _build_page_overlays(self, index: int) -> None:
         """指定ページの overlay を作って self._form_overlays に足す。
@@ -2623,6 +2669,15 @@ class PageView(QScrollArea):
             ctl.editingFinished.connect(
                 lambda i=index, x=xref, c=ctl, n=field["name"]:
                 self._commit_field(i, x, c.text(), n))
+            if field.get("password"):
+                ctl.setEchoMode(QLineEdit.EchoMode.Password)   # 伏せ字の欄
+            else:
+                # 入力候補（以前に入れた内容）。欄に入ったときに付け、確定で覚える
+                rules = field.get("rules") or {}
+                ctl.setProperty("trv_hkey", rules.get("label") or field.get("label")
+                                or field["name"])
+                ctl.installEventFilter(self)
+                ctl.editingFinished.connect(lambda c=ctl: self._remember_entry(c))
         ctl.setGeometry(round(x0), round(y0), w, h)
         # どの欄か（ズームで作り直したあと、入力中の欄へカーソルを戻すため）
         ctl.setProperty("trv_field", field["name"])
@@ -2661,6 +2716,8 @@ class PageView(QScrollArea):
                 "QComboBox { background: #d7e6ff;"
                 " border: 1px solid #5b82c8; padding: 0px 16px 0px 3px;"
                 " color: #111; }"
+                "QComboBox:disabled { background: #eeeeee; border: 1px solid #c4c4c4;"
+                " color: #666; }"
                 "QComboBox::drop-down { subcontrol-origin: padding;"
                 " subcontrol-position: top right; width: 14px;"
                 " border-left: 1px solid #5b82c8; background: #b9d0f2; }"
@@ -2678,6 +2735,9 @@ class PageView(QScrollArea):
                 # 入力中の欄は、ほかの青い欄と見分けがつくようにする
                 "QLineEdit:focus, QPlainTextEdit:focus {"
                 " background: #fffbe6; border: 2px solid #1a73e8; }"
+                # 書き換えられない欄（フォームの他の欄の選択で入力できない等）
+                "QLineEdit[trv_ro=\"true\"], QPlainTextEdit[trv_ro=\"true\"] {"
+                " background: #eeeeee; border: 1px solid #c4c4c4; color: #555; }"
                 "QCheckBox { background: #e1ebff; }")
             # 自動サイズの1行欄: 入力に応じて縮小し、枠からはみ出さない（Adobe同等）。
             # IME変換中（composing）はフォントを変更しない（変換内容の消失を防ぐ）。
@@ -2703,10 +2763,7 @@ class PageView(QScrollArea):
     def _apply_field_rules(self, ctl, field) -> None:
         """フォームの入力補助と、書き換え禁止の欄を overlay に反映する。"""
         if field.get("readonly"):
-            if isinstance(ctl, (QLineEdit, QPlainTextEdit)):
-                ctl.setReadOnly(True)
-            elif not isinstance(ctl, _GovFormClickOverlay):
-                ctl.setEnabled(False)
+            self._set_overlay_readonly(ctl, True)
         rules = field.get("rules") or {}
         hint = rules.get("hint")
         if hint:
@@ -2719,6 +2776,122 @@ class PageView(QScrollArea):
             def fix(_text="", c=ctl, r=rules):
                 QTimer.singleShot(0, lambda: self._clean_field_text(c, r))
             ctl.textEdited.connect(fix)
+
+    @staticmethod
+    def _set_overlay_readonly(ctl, readonly: bool) -> None:
+        """書き換え禁止の欄にする／戻す（フォームの JS が切り替えることがある）。
+
+        Acrobat と同じく、書き換えられない欄にはカーソルが入らず Tab でも止まらない。
+        〇で選ぶ欄は押したときに確かめる（_click_govform_cell）。
+        """
+        if isinstance(ctl, _GovFormClickOverlay):
+            return
+        if isinstance(ctl, (QLineEdit, QPlainTextEdit)):
+            ctl.setReadOnly(readonly)
+            ctl.setFocusPolicy(Qt.FocusPolicy.NoFocus if readonly
+                               else Qt.FocusPolicy.StrongFocus)
+        else:
+            ctl.setEnabled(not readonly)
+        ctl.setProperty("trv_ro", readonly)
+        ctl.style().unpolish(ctl)   # 灰色の見た目（trv_ro）に切り替える
+        ctl.style().polish(ctl)
+        ctl.update()
+
+    def _apply_form_effects(self, index: int, effects, source: str | None) -> None:
+        """フォームの JS が変えた欄（書き換え禁止・値）を、作り直さずに入力欄へ
+        反映し、フォームが出す知らせを見せる。"""
+        if effects is None:
+            return
+        anchor = None
+        for ctl in list(self._form_overlays):
+            try:
+                if ctl.property("trv_page") != index:
+                    continue
+                name = ctl.property("trv_field")
+            except RuntimeError:
+                continue   # 破棄済み
+            if name == source:
+                anchor = ctl
+            if name in effects.readonly:
+                self._set_overlay_readonly(ctl, effects.readonly[name])
+            if name in effects.values:
+                self._show_overlay_value(ctl, effects.values[name])
+        for tip in effects.tips:
+            self.status_message.emit(str(tip).replace("\n", " "))
+        if effects.tips and anchor is not None:
+            from PySide6.QtWidgets import QToolTip
+            QToolTip.showText(anchor.mapToGlobal(QPoint(0, anchor.height())),
+                              "\n".join(effects.tips), anchor, anchor.rect(), 8000)
+        for msg in effects.alerts:
+            from PySide6.QtWidgets import QMessageBox
+            box = QMessageBox(QMessageBox.Icon.Warning, "フォームからのお知らせ", str(msg),
+                              QMessageBox.StandardButton.Ok, self)
+            box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            box.setModal(False)   # 入力を止めない（閉じなくても続けられる）
+            box.show()
+
+    @staticmethod
+    def _show_overlay_value(ctl, value: str) -> None:
+        """欄の表示を value に合わせる（書き込みはしない＝確定の合図を出さない）。"""
+        ctl.blockSignals(True)
+        try:
+            if isinstance(ctl, QLineEdit):
+                ctl.setText(value)
+            elif isinstance(ctl, QPlainTextEdit):
+                ctl.setPlainText(value)
+            elif isinstance(ctl, QComboBox):
+                # 書き込まれるのは選択肢の値（例 "2"）、項目の表示は " 2" のことがある
+                items = [ctl.itemText(i) for i in range(ctl.count())]
+                hit = next((t for t in items if t == value), None) or next(
+                    (t for t in items if t.strip() == value.strip()), value)
+                ctl.setCurrentText(hit)
+            elif isinstance(ctl, QCheckBox):
+                ctl.setChecked(value not in ("", "Off", "/Off", "No", "false", "0"))
+        finally:
+            ctl.blockSignals(False)
+        if isinstance(ctl, QLineEdit):
+            ctl.textChanged.emit(ctl.text())   # 文字の大きさの自動調整だけ走らせる
+
+    @staticmethod
+    def _attach_completer(ctl) -> None:
+        """以前に入れた内容を候補に出す（同じ項目で入れたものが先）。
+
+        候補の部品は欄ごとに 1 つだけ作り、入るたびに一覧を入れ替える（部品を
+        差し替えると、Qt が古い部品を使っている最中だと落ちる）。
+        """
+        from PySide6.QtCore import QStringListModel
+        from PySide6.QtWidgets import QCompleter
+
+        from . import form_history
+        items = []
+        if form_history.enabled() and not ctl.isReadOnly():
+            items = form_history.history().suggestions(
+                ctl.property("trv_hkey"),
+                ctl.maxLength() if ctl.maxLength() < 32767 else 0)
+        comp = ctl.completer()
+        if comp is None:
+            if not items:
+                return
+            comp = QCompleter(ctl)
+            comp.setModel(QStringListModel(items, comp))
+            comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            comp.setFilterMode(Qt.MatchFlag.MatchStartsWith)
+            comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+            comp.setMaxVisibleItems(8)
+            ctl.setCompleter(comp)
+        else:
+            comp.model().setStringList(items)
+
+    @staticmethod
+    def _remember_entry(ctl) -> None:
+        from . import form_history
+        try:
+            if not form_history.enabled() or ctl.isReadOnly():
+                return
+            form_history.history().add(ctl.text(), ctl.property("trv_hkey") or "",
+                                       ctl.property("trv_field") or "")
+        except RuntimeError:
+            pass   # 欄が破棄済み
 
     @staticmethod
     def _clean_field_text(ctl, rules) -> None:
@@ -2756,6 +2929,13 @@ class PageView(QScrollArea):
         js_changed = False
         if self._doc.is_govform_js_eligible():
             js_changed = self._doc.commit_govform_combo(index, xref, text, name=name)
+            effects = self._doc.last_form_effects
+            if effects is not None and (effects.readonly or effects.values
+                                        or effects.tips or effects.alerts):
+                # コンボの選択の処理が終わってから（このコンボ自身の表示も
+                # 変わることがあるので、選択の通知の中では触らない）
+                QTimer.singleShot(0, self, lambda e=effects, i=index, n=name:
+                                  self._apply_form_effects(i, e, n))
         if committed or js_changed:
             self.form_changed.emit()
         if js_changed:
@@ -2797,6 +2977,11 @@ class PageView(QScrollArea):
             return
         xref = self._doc.govform_click_target_at(index, pdf_rect)
         if xref is None:
+            return
+        if self._doc.field_is_readonly(index, xref):
+            # Acrobat でも押せない（例: 公金受取口座で「2」を選ぶまで口座の種類は
+            # 選べない）
+            self.status_message.emit("この項目は今は選べません（フォームの他の欄の選択による）")
             return
         if self._doc.click_govform_widget(index, xref):
             self.form_changed.emit()
@@ -2867,6 +3052,11 @@ class PageView(QScrollArea):
             hint = obj.property("trv_hint") if hasattr(obj, "property") else None
             if hint:
                 self.status_message.emit(str(hint).replace("\n", " "))
+            if (isinstance(obj, QLineEdit) and obj.property("trv_hkey")
+                    and event.reason() != Qt.FocusReason.PopupFocusReason):
+                # 候補の一覧を閉じて戻ってきたときは触らない（一覧の処理の最中に
+                # 差し替えると落ちる）
+                self._attach_completer(obj)
             return False
         if obj is self.viewport():
             et = event.type()

@@ -198,7 +198,10 @@ def main() -> int:
     # --- ズームは overlay を全再構築せず即応（重さの回帰防止）----------------
     import time
     pv.set_form_mode(True)
-    app.processEvents()
+    # 欄は今のページから 1 ページずつ作られるので、全部できるまで待つ
+    t_end = time.perf_counter() + 3
+    while time.perf_counter() < t_end:
+        app.processEvents()
     n_before = len(pv._form_overlays)
     t0 = time.perf_counter()
     pv.set_zoom(1.7)
@@ -207,10 +210,16 @@ def main() -> int:
     app.processEvents()
     time.sleep(0.2)
     app.processEvents()
+    first_page = len(pv._form_overlays)    # 落ち着いたら、まず今のページの分
+    t_end = time.perf_counter() + 3
+    while time.perf_counter() < t_end:
+        app.processEvents()
     check("zoom is responsive (no synchronous full overlay rebuild)",
           dt < 300 and right_after == 0 and n_before > 100, f"({dt:.0f}ms)")
+    check("current page's fields come back first after zoom settles",
+          0 < first_page, f"({first_page})")
     check("overlays rebuilt after zoom settles",
-          len(pv._form_overlays) > 100)
+          len(pv._form_overlays) == n_before, f"({len(pv._form_overlays)}/{n_before})")
 
     ok = sum(results)
     print(f"\n==== {ok}/{len(results)} checks passed ====")

@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import json
+
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QPageLayout, QPageSize, QPainter, QPen, QPixmap
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
@@ -28,8 +30,44 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from .mw_print import paper_for_page, place_on_paper, select_pages, svg_is_safe
+from .mw_print import paper_for_page, place_on_paper, select_pages
 from .util import parse_ranges
+
+# プリンターの問い合わせ（QPrinter を作る・用紙一覧・両面）はドライバー次第で
+# 0.4 秒以上かかる。印刷ダイアログを開くたびに待たされないよう、アプリを
+# 開いている間は使い回す（「プロパティ」で変えた設定もそのまま残る）。
+_PRINTERS: dict[str, QPrinter] = {}
+_CAPS: dict[str, tuple] = {}
+
+
+def printer_caps(name: str) -> tuple:
+    """(用紙の一覧, 両面にできるか, ドライバーの既定の両面 "none"/"long"/"short")。"""
+    caps = _CAPS.get(name)
+    if caps is None:
+        info = QPrinterInfo.printerInfo(name)
+        if info.isNull():
+            caps = ([], False, "none")
+        else:
+            modes = info.supportedDuplexModes()
+            default = {QPrinter.DuplexMode.DuplexLongSide: "long",
+                       QPrinter.DuplexMode.DuplexShortSide: "short",
+                       QPrinter.DuplexMode.DuplexAuto: "long"}.get(
+                           info.defaultDuplexMode(), "none")
+            caps = (list(info.supportedPageSizes()),
+                    any(m != QPrinter.DuplexMode.DuplexNone for m in modes), default)
+        _CAPS[name] = caps
+    return caps
+
+
+def printer_for(name: str) -> QPrinter:
+    pr = _PRINTERS.get(name)
+    if pr is None:
+        info = QPrinterInfo.printerInfo(name)
+        pr = (QPrinter(info, QPrinter.PrinterMode.HighResolution) if not info.isNull()
+              else QPrinter(QPrinter.PrinterMode.HighResolution))
+        _PRINTERS[name] = pr
+    return pr
+
 
 #: 「印刷する内容」の選択肢（PdfDocument.PRINT_* と同じ値）
 CONTENT_CHOICES = [
@@ -347,12 +385,6 @@ class PrintDialog(QDialog):
         self._printer_name = None
         self._sync_printer_caps()
         if settings:
-            # 両面は、前に選んだものが無ければプリンター（ドライバー）の既定に
-            # 従う。会社の複合機は既定が両面のことが多い。
-            duplex = settings.value("print/duplex", "", str) or self._driver_duplex()
-            idx = self.duplex_combo.findData(duplex)
-            if self.duplex_combo.isEnabled():
-                self.duplex_combo.setCurrentIndex(max(0, idx))
             self.collate_check.setChecked(
                 settings.value("print/collate", True, bool))
             idx = self.nup_combo.findData(int(settings.value("print/nup", 1, int)))
@@ -381,13 +413,17 @@ class PrintDialog(QDialog):
         self._preview_timer.start()
 
     def _driver_duplex(self) -> str:
-        info = QPrinterInfo.printerInfo(self.printer_combo.currentText())
-        if info.isNull():
-            return "none"
-        return {QPrinter.DuplexMode.DuplexLongSide: "long",
-                QPrinter.DuplexMode.DuplexShortSide: "short",
-                QPrinter.DuplexMode.DuplexAuto: "long"}.get(
-                    info.defaultDuplexMode(), "none")
+        return printer_caps(self.printer_combo.currentText())[2]
+
+    def _duplex_choices(self) -> dict:
+        """プリンターごとに前に選んだ両面の指定。"""
+        if not self._settings:
+            return {}
+        try:
+            data = json.loads(self._settings.value("print/duplex_by_printer", "", str) or "{}")
+            return data if isinstance(data, dict) else {}
+        except ValueError:
+            return {}
 
     def printer(self) -> QPrinter:
         """選んだプリンターの QPrinter（「プロパティ」で変えた詳細設定ごと）。"""
@@ -501,24 +537,20 @@ class PrintDialog(QDialog):
         """選択中のプリンターの QPrinter（用紙と余白を実際の値で得るため）。"""
         name = self.printer_combo.currentText()
         if getattr(self, "_printer_name", None) != name:
-            info = QPrinterInfo.printerInfo(name)
-            self._printer_obj = (
-                QPrinter(info, QPrinter.PrinterMode.HighResolution)
-                if not info.isNull()
-                else QPrinter(QPrinter.PrinterMode.HighResolution))
+            self._printer_obj = printer_for(name)
             self._printer_name = name
         return self._printer_obj
 
     def _sync_printer_caps(self) -> None:
         """選んだプリンターに合わせて、用紙の一覧と両面の可否を作り直す。"""
-        info = QPrinterInfo.printerInfo(self.printer_combo.currentText())
+        sizes, can_duplex, _default = printer_caps(self.printer_combo.currentText())
         prev = self.paper_combo.currentData()
         self.paper_combo.blockSignals(True)
         self.paper_combo.clear()
         self.paper_combo.addItem("プリンターの既定", None)
         self.paper_combo.addItem("PDF のページサイズに合わせる", "auto")
         seen = set()
-        for size in ([] if info.isNull() else info.supportedPageSizes()):
+        for size in sizes:
             if size.name() in seen:
                 continue
             seen.add(size.name())
@@ -536,14 +568,19 @@ class PrintDialog(QDialog):
         self.paper_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.paper_combo.blockSignals(False)
 
-        modes = [] if info.isNull() else info.supportedDuplexModes()
-        can_duplex = any(m != QPrinter.DuplexMode.DuplexNone for m in modes)
         self.duplex_combo.setEnabled(can_duplex)
         if not can_duplex:
             self.duplex_combo.setCurrentIndex(0)
             self.duplex_combo.setToolTip("このプリンターは両面印刷に対応していません")
         else:
             self.duplex_combo.setToolTip("")
+            # そのプリンターで前に選んだもの、無ければドライバーの既定（会社の
+            # 複合機は既定が両面のことが多い）。以前は全プリンター共通で覚えて
+            # いたので、両面のできないプリンターで 1 回刷ると「片面」が残った
+            want = (self._duplex_choices().get(self.printer_combo.currentText())
+                    or _default)
+            idx = self.duplex_combo.findData(want)
+            self.duplex_combo.setCurrentIndex(max(0, idx))
 
     def _paper_rects(self, nat_w: float, nat_h: float):
         """(用紙, 印刷可能領域) をポイントで返す。
@@ -615,7 +652,11 @@ class PrintDialog(QDialog):
         self._settings.setValue(
             "print/paper",
             "auto" if paper == "auto" else (paper.name() if paper else ""))
-        self._settings.setValue("print/duplex", self.duplex_combo.currentData())
+        if self.duplex_combo.isEnabled():
+            choices = self._duplex_choices()
+            choices[self.printer_combo.currentText()] = self.duplex_combo.currentData()
+            self._settings.setValue("print/duplex_by_printer",
+                                    json.dumps(choices, ensure_ascii=False))
         self._settings.setValue("print/collate", self.collate_check.isChecked())
         self._settings.setValue("print/nup", self.nup_combo.currentData())
         self._settings.setValue("print/content", self.content_combo.currentData())
@@ -661,29 +702,12 @@ class PrintDialog(QDialog):
         return False  # 自動: 用紙は縦のまま（内容側を回す）
 
     def _preview_pixmap(self, index: int, zoom: float) -> QPixmap:
-        """プレビュー用の描画。実際の印刷と同じくベクターで描く。
+        """プレビュー用の描画（MuPDF でそのまま描く。描画結果は使い回される）。
 
-        印刷がベクターなのにプレビューだけ画像だと、細い線や小さな文字の見え方が
-        食い違う。QSvgRenderer が使えないときは従来どおり画像で描く。
+        以前は印刷と同じく SVG 経由で描いていたが、遅いうえ（スキャンの割り付けで
+        0.6 秒）、印刷側の描き方は MuPDF の描画と同じ見た目になるよう揃えてある
+        （svg_print）ので、ここは速い方で描く。
         """
-        try:
-            from PySide6.QtSvg import QSvgRenderer
-
-            svg = self._preview_doc().page_svg(index)
-            # 印刷と同じ判断（重ね方を使うページは画像で描く）
-            renderer = QSvgRenderer(svg.encode("utf-8")) if svg_is_safe(svg) else None
-            if renderer is not None and renderer.isValid():
-                box = renderer.viewBoxF()
-                pm = QPixmap(max(1, int(box.width() * zoom)),
-                             max(1, int(box.height() * zoom)))
-                pm.fill(Qt.GlobalColor.white)
-                p = QPainter(pm)
-                p.setRenderHint(QPainter.RenderHint.Antialiasing)
-                renderer.render(p, QRectF(0, 0, pm.width(), pm.height()))
-                p.end()
-                return pm
-        except Exception:  # noqa: BLE001
-            pass
         return self._preview_doc().render_page(index, zoom=zoom)
 
     def _refresh(self) -> None:

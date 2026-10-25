@@ -72,6 +72,8 @@ jobs:
           python text_edit_test.py
           python jp_font_test.py
           python acrobat_parity_test.py
+          python form_logic_test.py
+          python svg_print_test.py
 
       - name: ビルド（exe 化）
         run: python build_exe.py

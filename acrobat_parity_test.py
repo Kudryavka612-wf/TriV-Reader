@@ -270,6 +270,87 @@ def test_print(app, root: str) -> None:
           dlg.options()["content"] == "filled")
     dlg.reject()
 
+    # 両面: この PC に両面のプリンターが無くても確かめられるよう、ドライバーの
+    # 答えを差し替える。既定はドライバーに従い、選んだものはプリンターごとに覚える
+    import viewer.print_dialog as pdlg
+    fake = {"複合機A": ([QPageSize(QPageSize.PageSizeId.A4)], True, "long"),
+            "複合機B": ([QPageSize(QPageSize.PageSizeId.A4)], True, "none")}
+    orig_caps = pdlg.printer_caps
+    pdlg.printer_caps = lambda name: fake.get(name) or orig_caps(name)
+    try:
+        def open_dlg():
+            d = PrintDialog(w.doc, 0, w.settings, w)
+            for name in fake:
+                d.printer_combo.addItem(name)
+            return d
+
+        dlg = open_dlg()
+        dlg.printer_combo.setCurrentText("複合機A")
+        app.processEvents()
+        check("duplex: a printer whose driver defaults to duplex starts on duplex",
+              dlg.duplex_combo.isEnabled() and dlg.duplex_combo.currentData() == "long")
+        dlg.duplex_combo.setCurrentIndex(dlg.duplex_combo.findData("short"))
+        dlg._on_accept()
+        class Recorder:   # この PC の Qt は両面の指定を持たない（対応機が無い）
+            def __getattr__(self, name):
+                return lambda *a: calls.setdefault(name, a)
+        calls: dict = {}
+        w._configure_printer(Recorder(), dlg.options())
+        check("duplex: the choice reaches the printer",
+              calls.get("setDuplex") == (QPrinter.DuplexMode.DuplexShortSide,),
+              str(calls.get("setDuplex")))
+        dlg = open_dlg()
+        dlg.printer_combo.setCurrentText("Microsoft Print to PDF")
+        app.processEvents()
+        dlg._on_accept()      # 両面のできないプリンターで刷っても…
+        dlg = open_dlg()
+        dlg.printer_combo.setCurrentText("複合機A")
+        app.processEvents()
+        check("duplex: the choice is remembered per printer (not reset by a simplex one)",
+              dlg.duplex_combo.currentData() == "short")
+        dlg.printer_combo.setCurrentText("複合機B")
+        app.processEvents()
+        check("duplex: another printer keeps its own driver default",
+              dlg.duplex_combo.currentData() == "none")
+        dlg.reject()
+    finally:
+        pdlg.printer_caps = orig_caps
+
+    # 「プロパティ…」: Windows の印刷ダイアログで変えた部数・用紙がこちらに映る
+    # （本物のダイアログは画面なしで操作できないので、同じ変え方をする代役で）
+    import PySide6.QtPrintSupport as qps
+    real_dialog = qps.QPrintDialog
+
+    class DriverDialog:
+        DialogCode = real_dialog.DialogCode
+
+        def __init__(self, printer, parent=None):
+            self.printer = printer
+
+        def setWindowTitle(self, _t):
+            pass
+
+        def exec(self):
+            self.printer.setCopyCount(3)
+            self.printer.setPageSize(QPageSize(QPageSize.PageSizeId.A5))
+            return real_dialog.DialogCode.Accepted
+
+    qps.QPrintDialog = DriverDialog
+    try:
+        dlg = PrintDialog(w.doc, 0, w.settings, w)
+        dlg.printer_combo.setCurrentText("Microsoft Print to PDF")
+        app.processEvents()
+        dlg._open_printer_properties()
+        check("printer properties: copies and paper chosen there show up in the dialog",
+              dlg.copies.value() == 3 and dlg.paper_combo.currentText()
+              == QPageSize(QPageSize.PageSizeId.A5).name(),
+              f"({dlg.copies.value()}, {dlg.paper_combo.currentText()})")
+        check("printer properties: the same printer object (with its settings) is printed to",
+              dlg.printer() is dlg._printer() and dlg.printer().copyCount() == 3)
+        dlg.reject()
+    finally:
+        qps.QPrintDialog = real_dialog
+
     for i in range(w.tabs.count()):
         t = w.tabs.widget(i)
         if hasattr(t, "doc"):
