@@ -409,8 +409,9 @@ class _CombLineEdit(QLineEdit):
         cell = r.width() / self._cells
         # 背景と枠（Adobe 風の薄青ハイライト）。下に描画済みの PDF 側の文字が
         # 透けて二重に見えないよう不透明にする
-        p.fillRect(r, QColor(225, 235, 255))
-        p.setPen(QPen(QColor(0x70, 0x96, 0xD8)))
+        locked = bool(self.property("trv_ro"))
+        p.fillRect(r, QColor(238, 238, 238) if locked else QColor(225, 235, 255))
+        p.setPen(QPen(QColor(0xC4, 0xC4, 0xC4) if locked else QColor(0x70, 0x96, 0xD8)))
         p.drawRect(r.adjusted(0, 0, -1, -1))
         # マスの区切り線（薄く）
         sep = QColor(0x70, 0x96, 0xD8)
@@ -445,8 +446,11 @@ class _CombLineEdit(QLineEdit):
                 y = min(int(baseline) + 2, r.height() - 3)
                 p.drawLine(int(x), y, int(x + w_ch), y)
 
-        # 入力中の欄だと分かるよう、枠を濃く太くする
-        if self.hasFocus():
+        # 入力中の欄だと分かるよう、枠を濃く太くする。入力の誤りは赤い枠
+        if self.property("trv_req"):
+            p.setPen(QPen(QColor(0xd9, 0x30, 0x25), 2))
+            p.drawRect(r.adjusted(1, 1, -1, -1))
+        elif self.hasFocus():
             p.setPen(QPen(QColor(0x1a, 0x73, 0xe8), 2))
             p.drawRect(r.adjusted(1, 1, -1, -1))
         # カーソル（フォーカス時のみ・マスの左端に描く）
@@ -498,6 +502,30 @@ class _FormCheckBox(QCheckBox):
 _SMALL_KANA = str.maketrans("ｧｨｩｪｫｬｭｮｯァィゥェォャュョッ", "ｱｲｳｴｵﾔﾕﾖﾂアイウエオヤユヨツ")
 
 
+def _half_kana_table() -> dict:
+    """全角カタカナ（と濁点・半濁点の結合文字）→ 半角カナ。NFKC の逆引き。"""
+    import unicodedata
+    table = {}
+    for cp in range(0xFF61, 0xFFA0):
+        full = unicodedata.normalize("NFKC", chr(cp))
+        if len(full) == 1:
+            table[ord(full)] = chr(cp)
+    table[0x309B] = "ﾞ"        # ゛（単独の濁点）
+    table[0x309C] = "ﾟ"        # ゜
+    table[0x3000] = " "        # 全角の空白
+    return table
+
+
+_HALF_KANA = _half_kana_table()
+
+
+def _to_half_kana(text: str) -> str:
+    """ひらがな・全角カタカナを半角カナに（「ガ」は「ｶﾞ」の 2 文字になる）。"""
+    import unicodedata
+    kata = "".join(chr(ord(c) + 0x60) if "ぁ" <= c <= "ゖ" else c for c in text)
+    return unicodedata.normalize("NFD", kata).translate(_HALF_KANA)
+
+
 def _clean_input(text: str, rules: dict | None) -> str:
     """フォームの入力補助どおりに直した文字列（数字だけ・小さいカナを大きく）。"""
     import unicodedata
@@ -508,6 +536,10 @@ def _clean_input(text: str, rules: dict | None) -> str:
         # 全角数字は半角にして受け付ける（Acrobat は弾くだけだが、日本語入力の
         # まま打っても入る方が親切）。数字以外は入れない
         text = "".join(c for c in unicodedata.normalize("NFKC", text) if "0" <= c <= "9")
+    if rules.get("half_kana"):
+        # フォームのチェックは半角カナしか認めない（Acrobat では F8 で変換して
+        # 打つ必要がある）。日本語入力のまま打っても入るよう、ここで直す
+        text = _to_half_kana(text)
     if rules.get("large_kana"):
         text = text.translate(_SMALL_KANA)
     return text
@@ -1303,6 +1335,10 @@ class PageView(QScrollArea):
         # フォーム（入力欄）入力モード
         self._form_mode = False
         self._form_overlays: list[QWidget] = []
+        # (ページ, 欄の名前) → フォームの入力チェックの知らせ（直すまで欄のヒントに出す）
+        self._field_errors: dict = {}
+        # 欄にいるまま書き込む間（保存・拡大縮小）は入力チェックを走らせない
+        self._no_field_checks = False
         # ズーム時の overlay 再構築はデバウンスする。全 overlay（このフォームで
         # 約270個）の再生成は ~0.5秒かかり、Ctrl+ホイールの1ノッチごとにこれを
         # 走らせると拡大縮小が極端に重くなるため、ズームが落ち着いてから1回だけ
@@ -1393,17 +1429,18 @@ class PageView(QScrollArea):
         self._fit_page_size = None  # 合わせた時のページの大きさ
         self._in_fit = False   # 合わせ直し中の再入防止
         self._form_mode = False
-        self._clear_form_overlays()
+        self._clear_form_overlays(commit=False)
         self._rebuild(fit=True, target=0)
 
-    def reload(self, target: int = 0) -> None:
+    def reload(self, target: int = 0, keep_input: bool = False) -> None:
         """ページ構成が変わった後（削除・並べ替え・統合）に再構築する。
 
-        現在のズーム倍率は維持し、target ページへスクロールする。
+        現在のズーム倍率は維持し、target ページへスクロールする。keep_input は
+        見た目だけ変えるとき（見開き）に、入力中の欄の打ちかけの文字を書き込む。
         """
         if self._doc and self._doc.is_open:
             target = max(0, min(target, self._doc.page_count - 1))
-        self._rebuild(fit=False, target=target)
+        self._rebuild(fit=False, target=target, keep_input=keep_input)
 
     @property
     def index(self) -> int:
@@ -1747,10 +1784,15 @@ class PageView(QScrollArea):
         overlays = set(self._form_overlays)
         while w is not None and w not in overlays:
             w = w.parentWidget()
-        if isinstance(w, QLineEdit):
-            w.editingFinished.emit()
-        elif isinstance(w, _FormTextArea):
-            w.committed.emit()
+        # 欄を抜けたわけではないので、入力チェック（誤りの知らせ）は走らせない
+        prev, self._no_field_checks = self._no_field_checks, True
+        try:
+            if isinstance(w, QLineEdit):
+                w.editingFinished.emit()
+            elif isinstance(w, _FormTextArea):
+                w.committed.emit()
+        finally:
+            self._no_field_checks = prev
 
     def _on_doc_renumbered(self) -> None:
         """文書のオブジェクト番号が付け直された（パスワード付きの保存など）。
@@ -2520,7 +2562,27 @@ class PageView(QScrollArea):
                     ctl.setCursorPosition(min(pos, len(ctl.text())))
                 return
 
-    def _clear_form_overlays(self) -> None:
+    def _clear_form_overlays(self, commit: bool = True) -> None:
+        """入力欄の overlay を消す。
+
+        カーソルのある欄から消すと、Qt はカーソルを次の欄へ、その欄も消すと
+        さらに次へ…と全部の欄に渡していき、そのたびに「欄を抜けた」ことになって
+        全欄が画面の文字で書き込み直されていた（フォームをクリアしても値が戻る・
+        拡大縮小のたびに全欄の入力チェックが走る）。先に合図を止めてカーソルを
+        外してから消す。commit=True なら、カーソルのある欄の打ちかけの文字は
+        先に書き込む（文書を差し替えたときは False＝古い文字を書き戻さない）。
+        """
+        from PySide6.QtWidgets import QApplication
+
+        fw = QApplication.focusWidget()
+        owner = next((w for w in self._form_overlays
+                      if fw is not None and (fw is w or w.isAncestorOf(fw))), None)
+        if owner is not None and commit:
+            self.commit_focused_field()   # 抜けたわけではない（入力チェックは走らない）
+        for w in self._form_overlays:
+            w.blockSignals(True)
+        if owner is not None:
+            fw.clearFocus()
         for w in self._form_overlays:
             w.setParent(None)
             w.deleteLater()
@@ -2718,6 +2780,7 @@ class PageView(QScrollArea):
                 " color: #111; }"
                 "QComboBox:disabled { background: #eeeeee; border: 1px solid #c4c4c4;"
                 " color: #666; }"
+                "QComboBox[trv_req=\"true\"] { border: 2px solid #d93025; }"
                 "QComboBox::drop-down { subcontrol-origin: padding;"
                 " subcontrol-position: top right; width: 14px;"
                 " border-left: 1px solid #5b82c8; background: #b9d0f2; }"
@@ -2738,6 +2801,9 @@ class PageView(QScrollArea):
                 # 書き換えられない欄（フォームの他の欄の選択で入力できない等）
                 "QLineEdit[trv_ro=\"true\"], QPlainTextEdit[trv_ro=\"true\"] {"
                 " background: #eeeeee; border: 1px solid #c4c4c4; color: #555; }"
+                # 入力の誤り（フォームの入力チェックに引っかかった欄）
+                "QLineEdit[trv_req=\"true\"], QPlainTextEdit[trv_req=\"true\"] {"
+                " border: 2px solid #d93025; }"
                 "QCheckBox { background: #e1ebff; }")
             # 自動サイズの1行欄: 入力に応じて縮小し、枠からはみ出さない（Adobe同等）。
             # IME変換中（composing）はフォントを変更しない（変換内容の消失を防ぐ）。
@@ -2772,10 +2838,15 @@ class PageView(QScrollArea):
             ctl.setToolTip(hint)
             ctl.setProperty("trv_hint", hint)
             ctl.installEventFilter(self)
-        if isinstance(ctl, QLineEdit) and (rules.get("digits") or rules.get("large_kana")):
+        if isinstance(ctl, QLineEdit) and (rules.get("digits") or rules.get("large_kana")
+                                           or rules.get("half_kana")):
             def fix(_text="", c=ctl, r=rules):
                 QTimer.singleShot(0, lambda: self._clean_field_text(c, r))
             ctl.textEdited.connect(fix)
+        if field.get("required"):
+            # 入力の誤りの印は保存した PDF にも残る。知らせの文は開いている間だけ
+            self._set_overlay_error(ctl, True, self._field_errors.get(
+                (ctl.property("trv_page"), field["name"])))
 
     @staticmethod
     def _set_overlay_readonly(ctl, readonly: bool) -> None:
@@ -2816,19 +2887,54 @@ class PageView(QScrollArea):
                 self._set_overlay_readonly(ctl, effects.readonly[name])
             if name in effects.values:
                 self._show_overlay_value(ctl, effects.values[name])
+        # 入力の誤り（Acrobat は止まる警告を出す）。入力を止めないよう、赤い枠と
+        # 吹き出し・ステータスバーで知らせ、直すまで欄のヒントにも残す
+        alerts = "\n".join(str(a) for a in effects.alerts)
+        marked = [n for n, on in effects.required.items() if on]
+        for ctl in list(self._form_overlays):
+            try:
+                if ctl.property("trv_page") != index:
+                    continue
+                name = ctl.property("trv_field")
+            except RuntimeError:
+                continue
+            if name in effects.required:
+                on = effects.required[name]
+                msg = alerts if on and alerts and (name in marked) else None
+                self._set_overlay_error(ctl, on, msg)
+                if on and msg:
+                    self._field_errors[(index, name)] = msg
+                elif not on:
+                    self._field_errors.pop((index, name), None)
+        if alerts:
+            self.status_message.emit("入力の確認: " + alerts.replace("\n", " "))
         for tip in effects.tips:
-            self.status_message.emit(str(tip).replace("\n", " "))
-        if effects.tips and anchor is not None:
+            if not alerts:
+                self.status_message.emit(str(tip).replace("\n", " "))
+        shown = "\n".join([*effects.alerts, *effects.tips])
+        if shown and anchor is not None:
             from PySide6.QtWidgets import QToolTip
             QToolTip.showText(anchor.mapToGlobal(QPoint(0, anchor.height())),
-                              "\n".join(effects.tips), anchor, anchor.rect(), 8000)
-        for msg in effects.alerts:
-            from PySide6.QtWidgets import QMessageBox
-            box = QMessageBox(QMessageBox.Icon.Warning, "フォームからのお知らせ", str(msg),
-                              QMessageBox.StandardButton.Ok, self)
-            box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-            box.setModal(False)   # 入力を止めない（閉じなくても続けられる）
-            box.show()
+                              shown, anchor, anchor.rect(), 8000)
+
+    def _set_overlay_error(self, ctl, on: bool, message: str | None = None) -> None:
+        """入力の誤りの印（赤い枠）。message は直すまでその欄のヒントにする。"""
+        if isinstance(ctl, _GovFormClickOverlay):
+            return
+        if ctl.property("trv_hint0") is None:
+            ctl.setProperty("trv_hint0", ctl.property("trv_hint") or "")
+        if on and message:
+            ctl.setToolTip(message)
+            ctl.setProperty("trv_hint", message)
+            ctl.installEventFilter(self)   # 欄に入ったらステータスバーに出す
+        elif not on:
+            hint = ctl.property("trv_hint0") or ""
+            ctl.setToolTip(hint)
+            ctl.setProperty("trv_hint", hint or None)
+        ctl.setProperty("trv_req", bool(on))
+        ctl.style().unpolish(ctl)
+        ctl.style().polish(ctl)
+        ctl.update()
 
     @staticmethod
     def _show_overlay_value(ctl, value: str) -> None:
@@ -2915,6 +3021,17 @@ class PageView(QScrollArea):
         # 番号（xref）が保存などで付け直されていても、欄の名前で探して書き込む
         if self._doc.set_field_value(index, xref, value, name=name):
             self.form_changed.emit()
+            if not isinstance(value, bool) and self._doc.is_govform_js_eligible():
+                # 欄を抜けたときのフォームの処理（入力チェック・年の 2 桁化）。
+                # 欄にいるまま書き込むとき（保存・拡大縮小）はチェックしない
+                self._doc.blur_govform_field(
+                    index, xref, name=name,
+                    checks=not self._no_field_checks)
+                effects = self._doc.last_form_effects
+                if effects is not None and (effects.values or effects.required
+                                            or effects.alerts or effects.readonly):
+                    QTimer.singleShot(0, self, lambda e=effects, i=index, n=name:
+                                      self._apply_form_effects(i, e, n))
         else:
             # 黙って捨てない（以前は保存後の入力がこうして消えていた）
             self.status_message.emit(
@@ -2931,7 +3048,8 @@ class PageView(QScrollArea):
             js_changed = self._doc.commit_govform_combo(index, xref, text, name=name)
             effects = self._doc.last_form_effects
             if effects is not None and (effects.readonly or effects.values
-                                        or effects.tips or effects.alerts):
+                                        or effects.tips or effects.alerts
+                                        or effects.required):
                 # コンボの選択の処理が終わってから（このコンボ自身の表示も
                 # 変わることがあるので、選択の通知の中では触らない）
                 QTimer.singleShot(0, self, lambda e=effects, i=index, n=name:
@@ -2988,7 +3106,7 @@ class PageView(QScrollArea):
             self._after_annot(index)  # 再描画のみ（overlay は据え置き）
 
     # --- 構築・レイアウト ----------------------------------------------
-    def _rebuild(self, fit: bool, target: int) -> None:
+    def _rebuild(self, fit: bool, target: int, keep_input: bool = False) -> None:
         self._discard_text_editor()  # 入力中の編集ボックスはページ再構築で捨てる
         # 既存ラベルを破棄
         while self._layout.count():
@@ -2998,7 +3116,10 @@ class PageView(QScrollArea):
                 w.deleteLater()
         self._labels.clear()
         self._rendered.clear()
-        self._clear_form_overlays()  # 旧ラベルと一緒に消えるので参照も掃除
+        # 旧ラベルと一緒に消えるので参照も掃除。中身が差し替わった後なら
+        # 画面に残っている古い文字は書き戻さない
+        self._clear_form_overlays(commit=keep_input)
+        self._field_errors.clear()
 
         if not self._doc or not self._doc.is_open:
             self._relayout_container()
@@ -3023,7 +3144,7 @@ class PageView(QScrollArea):
             return
         self._cols = cols
         if self._doc and self._doc.is_open:
-            self.reload(self._index)
+            self.reload(self._index, keep_input=True)
 
     def _resize_all(self) -> None:
         for i in range(len(self._labels)):

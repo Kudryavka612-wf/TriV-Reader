@@ -133,6 +133,7 @@ try:
     ime_on(hwnd, False)
 except Abort as e:
     print("ABORT:", e, flush=True)
+    results.append(("中止", "", False, None))
 finally:
     try:
         ime_on(hwnd, False)
@@ -143,4 +144,9 @@ for label, text, ok, saved in results:
     print(f"{'PASS' if ok and saved == text else 'FAIL'} {label}: 欄={text!r} 書き込み={saved!r}",
           flush=True)
 ok = bool(results) and all(r[2] and r[3] == r[1] for r in results)
-os._exit(0 if ok else 1)
+# 入力したファイルは保存しないで閉じる（os._exit で抜けると終了時に落ちることがある）
+w.doc.modified = False
+w._force_quit = True
+w.close()
+pump(0.3)
+sys.exit(0 if ok else 1)

@@ -364,17 +364,18 @@ class FieldBridge:
     ライブなプロキシとして JS 側から読み書きさせることはできない。そのため
     実際の getField() オブジェクトは V8 内の素の JS オブジェクト
     （__registerField が作る）として実装するが、その初期値はこのクラスの
-    フィールドから作る。display の変化だけを実行後に読み戻して PDF に反映
-    する（value・required・strokeColor 等はこのスコープでは書き戻さない）。
+    フィールドから作る。実行後に display・value（と、入力欄の切り替えでは
+    readonly・required）を読み戻して PDF に反映する。
     """
 
-    def __init__(self, name: str, display: int, value, readonly: bool) -> None:
+    def __init__(self, name: str, display: int, value, readonly: bool,
+                 required: bool = False) -> None:
         self.name = name
         self.display = display
         self.value = value
         self.valueAsString = "" if value is None else str(value)
         self.readonly = readonly
-        self.required = False
+        self.required = required
         self.strokeColor = None
 
     @classmethod
@@ -386,22 +387,20 @@ class FieldBridge:
             display=int(w.field_display),
             value=combo_export(w, w.field_value),
             readonly=bool(flags & readonly_bit),
+            required=bool(flags & 2),
         )
 
-    def register_js(self, ctx) -> None:
-        """このスナップショットを V8 コンテキスト内の __fields[name] として登録する。"""
-        ctx.eval(
-            "__registerField(%s, %d, %s, %s);"
-            % (_js_str(self.name), self.display,
-               _js_str(self.valueAsString), "true" if self.readonly else "false"),
-            timeout=_JS_EXEC_TIMEOUT_MS,
-        )
+    def row(self) -> list:
+        """__registerAll に渡す 1 行。"""
+        return [self.name, self.display, self.valueAsString, self.readonly, self.required]
 
 
 @dataclass
 class FieldEffects:
     """フォームの JS を走らせた結果のうち、画面の入力欄にも反映が要るもの。"""
     readonly: dict = field(default_factory=dict)   # 欄の名前 → 書き換え禁止か
+    # 欄の名前 → 誤りの印（フォームの AlertError / SetRedBorder が立てる required）
+    required: dict = field(default_factory=dict)
     values: dict = field(default_factory=dict)     # 欄の名前 → 新しい値
     tips: list = field(default_factory=list)       # フォームが出す吹き出しの文
     alerts: list = field(default_factory=list)     # フォームが出す警告（app.alert）
@@ -435,6 +434,25 @@ def _callee_closure(fns: dict[str, str], entry: str, depth: int = 6) -> list[str
             break
         frontier = nxt
     return seen
+
+
+def wants_check_run(doc_scripts: dict[str, str], entry_script: str) -> bool:
+    """欄を抜けたときの入力チェック（必須・桁・範囲など）を持つアクションか。
+
+    チェックだけのもの（値を変えない）も、誤りを知らせるために走らせる。
+    """
+    m = SIMPLE_CALL_RE.match((entry_script or "").strip())
+    if not m or not doc_scripts:
+        return False
+    return m.group(1) in function_bodies(doc_scripts) and m.group(1) not in ALLOWED_HELPERS
+
+
+def pads_two_digits(doc_scripts: dict[str, str], entry_script: str) -> bool:
+    """1 文字の年を「05」のように 2 桁にする欄か（FormatYearMonthDay を呼ぶ）。"""
+    m = SIMPLE_CALL_RE.match((entry_script or "").strip())
+    if not m or not doc_scripts:
+        return False
+    return "FormatYearMonthDay" in _callee_closure(function_bodies(doc_scripts), m.group(1))
 
 
 def wants_full_run(doc_scripts: dict[str, str], entry_script: str) -> bool:
@@ -482,6 +500,11 @@ def widget_readonly(doc: "fitz.Document", xref: int) -> bool:
 
 def _apply_readonly(doc: "fitz.Document", xref: int, readonly: bool) -> bool:
     """書き換え禁止を /Ff に書く（/Ff を持つのはフィールド＝/T のある辞書）。"""
+    return _apply_field_flag(doc, xref, 1, readonly)
+
+
+def _apply_field_flag(doc: "fitz.Document", xref: int, bit: int, on: bool) -> bool:
+    """/Ff のビット（1=書き換え禁止 2=必須）を書く。"""
     target = xref
     try:
         for _ in range(8):
@@ -494,7 +517,7 @@ def _apply_readonly(doc: "fitz.Document", xref: int, readonly: bool) -> bool:
             target = int(parent[1].split()[0])
         cur = doc.xref_get_key(target, "Ff")
         flags = int(cur[1]) if cur[0] == "int" else 0
-        new = (flags | 1) if readonly else (flags & ~1)
+        new = (flags | bit) if on else (flags & ~bit)
         if new == flags:
             return False
         doc.xref_set_key(target, "Ff", str(new))
@@ -513,10 +536,17 @@ _INIT_DISPLAY_RE = re.compile(
     r'getField\(\s*"([^"]+)"\s*\)\s*\.display\s*=\s*display\.(\w+)')
 _INIT_READONLY_RE = re.compile(
     r'getField\(\s*"([^"]+)"\s*\)\s*\.readonly\s*=\s*(true|false)\b')
+_INIT_REQUIRED_RE = re.compile(
+    r'getField\(\s*"([^"]+)"\s*\)\s*\.required\s*=\s*(true|false)\b')
 
 
 def initial_field_states(doc_scripts: dict[str, str]) -> dict[str, list]:
-    """欄の名前 → [配布時の display（無ければ None）, 書き換え禁止か（同）]。"""
+    """欄の名前 → [配布時の display（無ければ None）, 書き換え禁止か（同）,
+    必須の印か]。
+
+    必須の印（required）は、このフォームでは入力チェックの誤りの印として JS が
+    立てるもので、配布時は無い（初期化の関数が指定していればそれに従う）。
+    """
     out: dict[str, list] = {}
     if not doc_scripts:
         return out
@@ -525,10 +555,17 @@ def initial_field_states(doc_scripts: dict[str, str]) -> dict[str, list]:
             continue
         for m in _INIT_DISPLAY_RE.finditer(body):
             if m.group(2) in _DISPLAY_NAMES:
-                out.setdefault(m.group(1), [None, None])[0] = _DISPLAY_NAMES[m.group(2)]
+                out.setdefault(m.group(1), [None, None, False])[0] = \
+                    _DISPLAY_NAMES[m.group(2)]
         for m in _INIT_READONLY_RE.finditer(body):
-            out.setdefault(m.group(1), [None, None])[1] = m.group(2) == "true"
+            out.setdefault(m.group(1), [None, None, False])[1] = m.group(2) == "true"
+        for m in _INIT_REQUIRED_RE.finditer(body):
+            out.setdefault(m.group(1), [None, None, False])[2] = m.group(2) == "true"
     return out
+
+
+def apply_required(doc: "fitz.Document", xref: int, required: bool) -> bool:
+    return _apply_field_flag(doc, xref, 2, required)
 
 
 def apply_display_flags(doc: "fitz.Document", xref: int, display: int) -> bool:
@@ -558,12 +595,17 @@ def apply_readonly(doc: "fitz.Document", xref: int, readonly: bool) -> bool:
 
 
 def run_blur(doc: "fitz.Document", page_index: int, widget_xref: int,
-             doc_scripts: dict[str, str], effects: "FieldEffects | None" = None) -> bool:
-    """フォーカスを外したときのアクション（/AA/Bl）を、入力欄の有効/無効を変える
-    ものに限って走らせる（例: 口座情報があるのに空欄を選んだら「2」に戻す）。"""
+             doc_scripts: dict[str, str], effects: "FieldEffects | None" = None,
+             checks: bool = False) -> bool:
+    """フォーカスを外したときのアクション（/AA/Bl）を走らせる。
+
+    入力欄の有効/無効や値を変えるもの（例: 口座情報があるのに空欄を選んだら
+    「2」に戻す）に加え、checks=True なら入力チェックだけのものも（誤りの
+    知らせ・印を受け取るため）。"""
     try:
         entry_script = widget_action_js(doc, widget_xref, "Bl")
-        if not wants_full_run(doc_scripts, entry_script):
+        if not (wants_full_run(doc_scripts, entry_script)
+                or (checks and wants_check_run(doc_scripts, entry_script))):
             return False
         return _run_action_impl(doc, page_index, widget_xref, doc_scripts,
                                 entry_script, change_value=None,
@@ -1003,7 +1045,7 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
         var global = {};
         var app = {alert: function(){}, beep: function(){}};
         var __fields = {};
-        function __registerField(name, disp, value, readonly){
+        function __registerField(name, disp, value, readonly, required){
             __fields[name] = {
                 name: name,
                 display: disp,
@@ -1013,7 +1055,7 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
                     this.valueAsString = (v===null||v===undefined)?"":String(v); },
                 valueAsString: (value === null || value === undefined) ? "" : String(value),
                 readonly: readonly,
-                required: false,
+                required: !!required,
                 strokeColor: null,
                 setFocus: function(){},
                 setAction: function(){},
@@ -1022,16 +1064,24 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
             };
         }
         function getField(name){
-            if (!__fields[name]) { __registerField(name, 0, "", false); }
+            if (!__fields[name]) { __registerField(name, 0, "", false, false); }
             return __fields[name];
+        }
+        function __registerAll(rows){
+            for (var i = 0; i < rows.length; i++) {
+                var r = rows[i];
+                __registerField(r[0], r[1], r[2], r[3], r[4]);
+            }
         }
         var __this = this;
         __this.getField = getField;
         """,
         timeout=_JS_EXEC_TIMEOUT_MS,
     )
-    for bridge in bridges:
-        bridge.register_js(ctx)
+    # 1 欄ずつ渡すと欄の数だけ V8 を往復する（勤務状況のページは 319 欄）
+    ctx.eval("__registerAll(%s);" % json.dumps([b.row() for b in bridges],
+                                               ensure_ascii=False),
+             timeout=_JS_EXEC_TIMEOUT_MS)
     if full:
         # 吹き出し・警告は出さずに文だけ受け取る（画面には TriV-Reader が出す）
         ctx.eval(
@@ -1092,7 +1142,7 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
         after = json.loads(ctx.eval(
             "JSON.stringify(Object.keys(__fields).map(function(k){"
             " var f = __fields[k]; return [k, f.display,"
-            " String(f.valueAsString), !!f.readonly]; }))",
+            " String(f.valueAsString), !!f.readonly, !!f.required]; }))",
             timeout=_JS_EXEC_TIMEOUT_MS))
     except Exception:  # noqa: BLE001
         return False
@@ -1100,12 +1150,13 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
     if _DEBUG:
         print("govform_js:", entry_name, "error:", ctx.eval("__error"))
     before_ro = {b.name: b.readonly for b in bridges}
+    before_req = {b.name: b.required for b in bridges}
     changed = False
     for w in widgets:
         name = w.field_name
         if not name or name not in before_display or name not in state:
             continue
-        new_disp, new_val, new_ro = state[name]
+        new_disp, new_val, new_ro, new_req = state[name]
         try:
             new_disp = int(new_disp)
         except (TypeError, ValueError):
@@ -1124,6 +1175,12 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
                 changed = True
             if effects is not None:
                 effects.readonly[name] = bool(new_ro)
+        if full and bool(new_req) != before_req.get(name, False):
+            # 誤りの印（Acrobat では赤い枠）。保存した PDF にも残る（Acrobat と同じ）
+            if _apply_field_flag(doc, w.xref, 2, bool(new_req)):
+                changed = True
+            if effects is not None:
+                effects.required[name] = bool(new_req)
     if full and effects is not None:
         try:
             effects.tips += [t for t in json.loads(ctx.eval(
@@ -1197,6 +1254,9 @@ def _action_js(doc: "fitz.Document", xref: int, key: str) -> str:
     return ""
 
 
+# 半角カナだけを認めるチェック（CHKCMN_008: /^[\uFF65-\uFF9F…]*$/）
+_HALF_KANA_CHECK_RE = re.compile(r"\\u[fF][fF]65-\\u[fF][fF]9[fF]")
+
 # 官公庁フォームのラッパーは冒頭で項目名を持つ（fieldName = "氏名"; や
 # // fieldName: "公金受取口座希望"; の形）
 _FIELD_LABEL_RE = re.compile(r'fieldName\s*[:=]\s*"([^"]+)"')
@@ -1234,7 +1294,8 @@ def field_input_rules(doc: "fitz.Document", doc_scripts: dict[str, str]) -> dict
     （ReplaceChisaiKana）、hint=入力の注意（ShowToolTip の文言）、
     focus_to=フォーカスを別の欄へ渡すだけの見せかけの欄（_PRINT 等）なら渡す先、
     label=項目名（ラッパーの fieldName。「氏名」「個人番号（マイナンバー）１」等。
-    入力候補で同じ項目をまとめ、覚えてはいけない欄を見分けるのに使う）。
+    入力候補で同じ項目をまとめ、覚えてはいけない欄を見分けるのに使う）、
+    half_kana=欄を抜けたときのチェックが半角カナしか認めない（氏名のカナ等）。
     """
     bodies = function_bodies(doc_scripts) if doc_scripts else {}
     rules: dict = {}
@@ -1256,7 +1317,14 @@ def field_input_rules(doc: "fitz.Document", doc_scripts: dict[str, str]) -> dict
                 "hint": None,
                 "focus_to": None,
                 "label": None,
+                "half_kana": False,
             }
+            blur = _action_js(doc, xref, "Bl")
+            m = SIMPLE_CALL_RE.match((blur or "").strip())
+            if m and m.group(1) in bodies:
+                rule["half_kana"] = any(
+                    _HALF_KANA_CHECK_RE.search(bodies.get(n, ""))
+                    for n in _callee_closure(bodies, m.group(1)))
             for body in (keystroke, focus,
                          _wrapper_body(bodies, _action_js(doc, xref, "Bl"))):
                 m = _FIELD_LABEL_RE.search(body)

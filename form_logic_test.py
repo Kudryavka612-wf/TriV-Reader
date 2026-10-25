@@ -11,6 +11,10 @@
   状態に戻る。元に戻す（Ctrl+Z）で入力した状態に戻る
 - 入力候補: 以前に入れた内容を候補に出す。マイナンバー・口座番号などは覚えない。
   設定で止められ、履歴は消せる。テストでは本人の履歴に触れない
+- 欄を抜けたときの入力チェック: フォームの JS のチェック（必須・年の範囲・元号の
+  選び忘れ・半角カナ）を走らせ、誤りは止めずに知らせる（赤い枠・ステータスバー・
+  欄のヒント）。直すと消え、拡大縮小しても残る。年は「5」→「05」にそろえる
+  （元号を選んだ後も）。半角カナだけの欄は、ひらがな・全角カナを半角カナに直す
 
 同梱のフィクスチャ（tests/fixtures/6010_form_sample.pdf）を使う。
 """
@@ -43,6 +47,11 @@ def check(name: str, ok, extra: str = "") -> bool:
     results.append(bool(ok))
     print(f"[{'PASS' if ok else 'FAIL'}] {name} {extra}")
     return bool(ok)
+
+
+def key(ctl, k) -> None:
+    """キーを押す。入力候補の一覧が開いていれば、本物のキーボードと同じく一覧へ。"""
+    QTest.keyClick(QApplication.activePopupWidget() or ctl, k)
 
 
 def pump(app, sec: float = 0.3) -> None:
@@ -180,13 +189,13 @@ def test_readonly_by_js(app, w) -> None:
     pump(app, 0.1)
     combo.setCurrentIndex(combo.findText(" "))
     pump(app, 0.4)
-    boxes = [b for b in QApplication.topLevelWidgets()
-             if isinstance(b, QMessageBox) and b.isVisible()]
+    status = w.statusBar().currentMessage()
     check("blanking it while an account is entered warns and goes back to '2'",
           combo.currentText().strip() == "2" and not bank.isReadOnly()
-          and any("クリア" in b.text() for b in boxes))
-    for b in boxes:
-        b.close()
+          and "クリア" in status, status)
+    boxes = [b for b in QApplication.topLevelWidgets()
+             if isinstance(b, QMessageBox) and b.isVisible()]
+    check("…without a dialog that takes the keyboard away", not boxes)
     printed = next(x.field_value for x in doc._doc[0].widgets()
                    if x.field_name == "FRM6010-01-024_PRINT")
     check("…and the printed twin follows the restored value", str(printed).strip() == "2",
@@ -219,7 +228,7 @@ def test_clear_form(app, w) -> None:
     after = snap(doc._doc)
     bad = [k for k in pristine if pristine[k] != after.get(k)]
     check("clearing the form brings back the state it was handed out in",
-          not bad, f"({len(bad)} differ)")
+          not bad, f"({len(bad)} differ: {[(k, pristine[k], after.get(k)) for k in bad][:3]})")
     bank = next(c for c in w.page_view._form_overlays
                 if c.property("trv_field") == "FRM6010-01-015")
     check("…including the on-screen fields (account locked again, empty)",
@@ -251,10 +260,13 @@ def test_history(app, w) -> None:
         pv.ensureWidgetVisible(ctl)
         ctl.setFocus()
         pump(app, 0.05)
+        ctl.selectAll()
+        QTest.keyClick(ctl, Qt.Key.Key_Delete)
         ev = QInputMethodEvent("", [])
         ev.setCommitString(text)
         app.sendEvent(ctl, ev)
-        QTest.keyClick(ctl, Qt.Key.Key_Return)
+        key(ctl, Qt.Key.Key_Return)
+        key(ctl, Qt.Key.Key_Return)   # 一覧が開いていたら 1 回目はそれを閉じる
         pump(app, 0.05)
 
     type_in(ov("FRM6010-01-008"), "山田太郎")          # 氏名
@@ -303,6 +315,92 @@ def test_history(app, w) -> None:
           and not os.path.exists(path))
 
 
+def test_checks(app, w) -> None:
+    from PySide6.QtGui import QInputMethodEvent
+    pv = w.page_view
+    w.activateWindow()
+    pv.set_page(0)
+    pump(app, 0.3)
+
+    def ov(name):
+        return next(c for c in pv._form_overlays if c.property("trv_field") == name)
+
+    def enter(ctl, text, ime=False):
+        pv.ensureWidgetVisible(ctl)
+        ctl.setFocus()
+        pump(app, 0.05)
+        ctl.selectAll()
+        QTest.keyClick(ctl, Qt.Key.Key_Delete)
+        if ime:
+            ev = QInputMethodEvent("", [])
+            ev.setCommitString(text)
+            app.sendEvent(ctl, ev)
+        else:
+            QTest.keyClicks(ctl, text)
+        pump(app, 0.05)
+        key(ctl, Qt.Key.Key_Tab)
+        pump(app, 0.4)
+
+    def value(name):
+        return next(x.field_value for x in pv._doc._doc[0].widgets() if x.field_name == name)
+
+    year, era = ov("FRM6010-01-004"), ov("FRM6010-01-003")   # 生年月日（年）・元号
+    era.setCurrentIndex(0)
+    pump(app, 0.3)
+    enter(year, "5")
+    check("a one-digit year becomes two digits (5 -> 05)",
+          year.text() == "05" and value("FRM6010-01-004") == "05",
+          f"({year.text()!r}, {value('FRM6010-01-004')!r})")
+    check("…and the form's check points at the era that was not chosen",
+          bool(era.property("trv_req")) and "元号" in w.statusBar().currentMessage(),
+          w.statusBar().currentMessage())
+    era.setCurrentIndex(1)
+    pump(app, 0.4)
+    check("choosing the era clears its mark", not era.property("trv_req"))
+    enter(year, "7")
+    check("…and the year is still padded once the era is chosen (the form itself does not)",
+          year.text() == "07" and value("FRM6010-01-004") == "07")
+    enter(year, "00")
+    check("an out-of-range year is marked, with the form's message as the field's hint",
+          bool(year.property("trv_req")) and "2桁" in year.toolTip(), year.toolTip())
+    enter(year, "63")
+    check("fixing it removes the mark", not year.property("trv_req"))
+    # 欄にいるまま保存しても、年は 2 桁にそろうが、打ちかけで誤りの印は付かない
+    pv.ensureWidgetVisible(year)
+    year.setFocus()
+    pump(app, 0.05)
+    year.selectAll()
+    QTest.keyClick(year, Qt.Key.Key_Delete)
+    QTest.keyClicks(year, "8")
+    pv.finish_text_edit()
+    pump(app, 0.3)
+    check("saving with the cursor in the year pads it without flagging anything",
+          value("FRM6010-01-004") == "08" and not year.property("trv_req"),
+          f"({value('FRM6010-01-004')!r}, {year.property('trv_req')})")
+    key(year, Qt.Key.Key_Tab)
+    pump(app, 0.3)
+
+    name = ov("FRM6010-01-008")                               # 氏名（必須）
+    enter(name, "山田", ime=True)
+    enter(name, "")
+    check("leaving a required field empty is marked",
+          bool(name.property("trv_req")) and "必須" in w.statusBar().currentMessage())
+    pv.set_zoom(pv.zoom * 1.1)
+    pv._overlay_rebuild_timer.timeout.emit()
+    pump(app, 1.5)
+    name = ov("FRM6010-01-008")
+    check("the mark and its message survive zooming",
+          bool(name.property("trv_req")) and "必須" in name.toolTip())
+    enter(name, "山田", ime=True)
+    check("…and go away once it is filled in", not name.property("trv_req"),
+          f"(text={name.text()!r}, value={value('FRM6010-01-008')!r})")
+
+    kana = ov("FRM6010-01-007")                               # 氏名（カタカナ）: 半角カナだけ
+    enter(kana, "やまだ　たろう", ime=True)
+    check("a half-width-kana field takes hiragana / full-width kana as half-width",
+          kana.text() == "ﾔﾏﾀﾞ ﾀﾛｳ" and not kana.property("trv_req"), repr(kana.text()))
+
+
 def main() -> int:
     app = QApplication(sys.argv[:1])
     theme.apply_theme(app, dark=False)
@@ -317,6 +415,7 @@ def main() -> int:
         test_clear_value(root)
         test_open_and_tab(app, w)
         test_readonly_by_js(app, w)
+        test_checks(app, w)
         test_clear_form(app, w)
         test_history(app, w)
     finally:

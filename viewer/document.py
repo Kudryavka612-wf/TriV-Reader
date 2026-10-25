@@ -1303,6 +1303,7 @@ class PdfDocument:
                 "display": int(getattr(w, "field_display", 0) or 0),
                 "align": _align(w),               # 0=左 / 1=中央 / 2=右
                 "readonly": bool(flags & READONLY),
+                "required": bool(flags & 2),   # 誤りの印（フォームの JS が立てる）
                 "password": bool(is_text and (flags & PASSWORD)),
                 "label": getattr(w, "field_label", None) or "",   # /TU（欄の説明）
                 # フォームの入力補助（数字だけ・小さいカナを大きく・入力の注意）
@@ -1497,7 +1498,8 @@ class PdfDocument:
         # 選んだら次の欄へ移る＝フォーカスを外したときの処理（例: 口座情報が
         # あるのに空欄を選んだら「2」に戻す）もここで走らせる
         own = name or govform_js._field_name(self._doc, xref)
-        if govform_js.run_blur(self._doc, index, xref, scripts, effects=effects):
+        if govform_js.run_blur(self._doc, index, xref, scripts, effects=effects,
+                               checks=True):
             changed = True
             if own in effects.values:
                 # 欄自身の値が戻されたら、印刷用の欄・有効/無効もその値に合わせる
@@ -1532,6 +1534,8 @@ class PdfDocument:
                     if state[1] is not None and govform_js.apply_readonly(
                             self._doc, w.xref, state[1]):
                         changed = True
+                    if govform_js.apply_required(self._doc, w.xref, state[2]):
+                        changed = True   # 入力チェックの誤りの印も消す
                 n += bool(changed)
         if n:
             self.modified = True
@@ -1569,6 +1573,41 @@ class PdfDocument:
         except Exception:  # noqa: BLE001  戻せない欄は飛ばす
             return False
         return False   # 押しボタン（値を持たない）
+
+    def blur_govform_field(self, index: int, xref: int, name: str | None = None,
+                           checks: bool = True) -> bool:
+        """文字欄を抜けたときのフォームの処理（入力チェック・年の 2 桁化）。
+
+        誤りの知らせと印は last_form_effects に入る。値が変わったら True。
+        checks=False は欄にいるまま書き込むとき（保存など）で、年の 2 桁化だけ。
+        """
+        self.last_form_effects = None
+        if not self._doc or not self.is_govform_js_eligible():
+            return False
+        xref = self._widget_xref(index, xref, name)
+        if xref is None:
+            return False
+        effects = govform_js.FieldEffects()
+        self.last_form_effects = effects
+        scripts = self.doc_scripts()
+        changed = checks and govform_js.run_blur(self._doc, index, xref, scripts,
+                                                 effects=effects, checks=True)
+        # 年は「05」のように 2 桁にそろえる。フォームの JS は元号を選ぶ前だけ
+        # 0 を足す作りで、選んだ後に「5」と入れると左のマスに「5」だけが刷られ
+        # た（欄の注意書きは「数値2桁です」）。ここでは元号に関係なくそろえる
+        if govform_js.pads_two_digits(scripts, govform_js.widget_action_js(
+                self._doc, xref, "Bl")):
+            page = self._doc.load_page(index)   # Widget はページを弱参照で持つ
+            w = fastwidgets.widget(page, xref)
+            value = str(w.field_value or "") if w is not None else ""
+            if len(value) == 1:
+                w.field_value = "0" + value
+                jpfonts.update_widget(w)
+                effects.values[w.field_name or name or ""] = "0" + value
+                changed = True
+        if changed:
+            self.modified = True
+        return changed
 
     def field_is_readonly(self, index: int, xref: int) -> bool:
         """欄が今、書き換え禁止か（フォームの JS が切り替えることがある）。"""
