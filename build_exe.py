@@ -150,9 +150,10 @@ def _sign_if_requested(exe: str) -> None:
     """--sign <PFX> が指定されていればコード署名する（任意）。
 
     例: python build_exe.py --sign C:\\path\\cert.pfx
-        パスワードは環境変数 TRIVREADER_PFX_PW で渡す。
+        パスワードは環境変数 CODESIGN_PFX_PASSWORD（互換: TRIVREADER_PFX_PW）で渡す。
     自己署名証明書（社内配布向け）でも SmartScreen の「不明な発行元」を
     抑制できます（証明書を配布先の「信頼されたルート/発行元」に入れた場合）。
+    署名の中身は sign_release.py（CI の自動署名と同じ）。
     """
     if "--sign" not in sys.argv:
         return
@@ -161,20 +162,11 @@ def _sign_if_requested(exe: str) -> None:
     if not pfx or not os.path.exists(pfx):
         print("署名スキップ: --sign の後に PFX ファイルのパスを指定してください")
         return
-    import shutil
-    import subprocess
+    import sign_release
 
-    signtool = shutil.which("signtool") or shutil.which("signtool.exe")
-    if not signtool:
-        print("署名スキップ: signtool が見つかりません（Windows SDK を導入してください）")
-        return
-    pw = os.environ.get("TRIVREADER_PFX_PW", "")
-    cmd = [signtool, "sign", "/fd", "SHA256", "/f", pfx]
-    if pw:
-        cmd += ["/p", pw]
-    cmd += ["/tr", "http://timestamp.digicert.com", "/td", "SHA256", exe]
+    pw = os.environ.get("CODESIGN_PFX_PASSWORD") or os.environ.get("TRIVREADER_PFX_PW", "")
     try:
-        subprocess.run(cmd, check=True)
+        sign_release.sign([exe], pfx, pw)
         print("コード署名しました:", exe)
     except Exception as exc:  # noqa: BLE001
         print("署名に失敗:", exc)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import sys
 
-from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtCore import QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -13,6 +13,7 @@ from PySide6.QtGui import (
     QIcon,
     QKeySequence,
     QPainter,
+    QPen,
     QPixmap,
 )
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
@@ -1140,7 +1141,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             self.act_open_log: "🧾",
             self.act_report_govform: "📮",
             self.act_toggle_pagedock: "▤",
-            self.act_fill_enabled: "🪣", self.act_fill_color: "🎨",
+            # 塗り色は、いまの色の見本（_refresh_fill_icon）が絵文字の代わり
+            self.act_fill_enabled: "🪣",
             self.act_open_acrobat: "🅐", self.act_set_default_pdf: "⭐",
             self.act_nav_back: "⬅", self.act_nav_forward: "➡",
             self.act_fullscreen: "⛶", self.act_shortcuts: "⌨",
@@ -1207,13 +1209,25 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         return (self._highlight_color if tool == page_view.TOOL_HIGHLIGHT
                 else self._annot_color)
 
+    def _swatch(self, color: QColor) -> QPixmap:
+        """色見本（枠つきの角丸）。黒い色はダークのリボンに溶け込み、白い色はライトで
+        地と区別がつかないので、文字色の枠で囲む。"""
+        size = 18
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        edge = QColor(self.palette().color(self.foregroundRole()))
+        edge.setAlpha(200)
+        p.setPen(QPen(edge, 1.5))
+        p.setBrush(color)
+        p.drawRoundedRect(QRectF(1.25, 1.25, size - 2.5, size - 2.5), 3, 3)
+        p.end()
+        return pm
+
     def _refresh_color_icon(self) -> None:
         """色ボタンに、選んでいるツールで使う色のアイコンを表示する。"""
-        from PySide6.QtGui import QPixmap
-
-        pm = QPixmap(18, 18)
-        pm.fill(self._color_for_tool(self._current_tool()))
-        self.act_color.setIcon(pm)
+        self.act_color.setIcon(self._swatch(self._color_for_tool(self._current_tool())))
 
     def _all_views(self) -> list:
         """開いている全タブのページビュー（＋タブが無いとき用の予備）。"""
@@ -1246,11 +1260,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
 
     def _refresh_fill_icon(self) -> None:
         """塗り色ボタンに現在の塗り色のアイコンを表示する。"""
-        from PySide6.QtGui import QPixmap
-
-        pm = QPixmap(18, 18)
-        pm.fill(self._fill_color)
-        self.act_fill_color.setIcon(pm)
+        self.act_fill_color.setIcon(self._swatch(self._fill_color))
 
     def _connect(self) -> None:
         self.act_open.triggered.connect(self.open_file)
@@ -1984,7 +1994,9 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self._refresh_annot_list()
         self._update_undo_actions()
         self._update_title()
-        self.statusBar().showMessage(f"{label}を{verb}", 3000)
+        note = getattr(self.doc, "undo_notice", "")
+        self.statusBar().showMessage(f"{label}を{verb}" + (f"（{note}）" if note else ""),
+                                     6000 if note else 3000)
 
     def _update_undo_actions(self) -> None:
         pv = self.page_view
@@ -2849,6 +2861,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.welcome.apply_theme(on)
         self._apply_title_bar_theme(on)  # Windows のタイトルバーも合わせる
         self._assign_icons()  # 記号アイコンの色をテーマに追従させる
+        self._refresh_color_icon()   # 色見本の枠も、テーマの文字色に合わせて描き直す
+        self._refresh_fill_icon()
         if hasattr(self, "ribbon"):
             self.ribbon.refresh_min_widths()  # 再スタイル後もラベルを省略させない
         self.tabs.tabBar().apply_theme(on)   # タブのスクロール矢印をテーマ色で

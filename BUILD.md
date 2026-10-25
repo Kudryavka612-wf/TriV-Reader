@@ -95,18 +95,39 @@ powershell -ExecutionPolicy Bypass -File update.ps1 --portable # 引数は build
 
 ## 1.9 コード署名（SmartScreen の「不明な発行元」対策）
 
+署名は**任意**です。証明書が無ければ、署名なしで配ります（これまでどおり）。
+
+### 手元で署名する
+
 ```powershell
-# 署名付きでビルド（PFX とパスワードを用意）
-$env:TRIVREADER_PFX_PW = "パスワード"
+# 署名付きでビルド（exe）。PFX のパスワードは環境変数で渡す
+$env:CODESIGN_PFX_PASSWORD = "パスワード"
 python build_exe.py --sign C:\path\to\cert.pfx
+# できあがった Setup.exe にも付けるとき
+python sign_release.py --pfx C:\path\to\cert.pfx "$env:USERPROFILE\TriVReader_release\TriVReader-Setup-<版>.exe"
 ```
 
-- 正式には有料のコード署名証明書（OV/EV）が確実です（EVは即SmartScreen評価あり）。
-- 社内/自分のPC向けなら**自己署名証明書**でも警告を消せます:
+### GitHub のリリースで自動署名する
+
+リポジトリの Settings > Secrets and variables > Actions に、次の 2 つを登録します。
+
+| 名前 | 中身 |
+|---|---|
+| `CODESIGN_PFX_BASE64` | PFX を base64 にした文字列（`[Convert]::ToBase64String([IO.File]::ReadAllBytes("cert.pfx"))`） |
+| `CODESIGN_PFX_PASSWORD` | PFX のパスワード |
+
+登録すると、タグを push したときの CI が、`TriVReader.exe`（zip と Setup.exe に入る前）と
+`Setup.exe` に署名します（`sign_release.py`）。登録しなければ、署名の工程は何もしません。
+登録してあるのに署名に失敗したときは、署名なしで公開しないよう、リリース全体を失敗にします。
+
+- 署名は signtool（Windows SDK。GitHub の Windows ランナーには入っています）で行い、無ければ
+  PowerShell の `Set-AuthenticodeSignature` で行います。署名のあと、証明書本人の署名が付いたかを確かめます。
+- 正式には有料のコード署名証明書（OV/EV）が確実です（EV は SmartScreen の評価が最初から付きます）。
+  自己署名の証明書でも署名はできますが、SmartScreen の警告は、その証明書を入れていない PC では消えません。
+- 社内/自分の PC 向けなら自己署名でも警告を消せます:
   1. 証明書作成: `New-SelfSignedCertificate -Type CodeSigning -Subject "CN=MyName" -CertStoreLocation Cert:\CurrentUser\My`
-  2. それを PFX に書き出し、配布先PCの「信頼されたルート証明機関／発行元」に取り込む
-  3. 上記 `--sign` で署名
-- `signtool`（Windows SDK 同梱）が必要です。
+  2. それを PFX に書き出し、配布先 PC の「信頼されたルート証明機関／発行元」に取り込む
+  3. 上記のどちらかで署名
 
 ## 1.10 自動アップデート（アプリ内で更新→再起動）
 
@@ -196,9 +217,21 @@ python make_installer.py            # 既存ビルドから Setup.exe を生成
 - インストール先は `%LOCALAPPDATA%\Programs\TriV-Reader`（UAC なし）。
 - 利用者はインストール時のチェックで「デスクトップアイコン」「.pdf 関連付け」を選べます。
 - 配布: できあがった Setup.exe を相手に渡すだけ。GitHub Releases に添付しても可。
+- アンインストール:
+  - 起動したまま（トレイに隠れている場合を含む）だと、「トレイのアイコンから［終了］してから
+    ［OK］」と案内して待ちます（使用中のファイルが残らないように）。
+  - 自動更新で後から増えた部品（`_internal` の中身）、更新が控えた「前の版」
+    （`%LOCALAPPDATA%\trivreader\previous_version`）と起動の記録を消します。インストール先の
+    フォルダそのものは、利用者のファイルがあるかもしれないので、空のときだけ消します。
+  - アプリの［既定の PDF アプリに設定］で足した関連付け（インストール時に選んでいなくても残る）も、
+    この PC の TriV-Reader を指しているものは消します。別の場所を指すものは消しません。
+  - 設定・入力履歴・OCR の言語データは、聞いてから消します（既定は残す。`/SILENT` のときは残す）。
+  - 入れる→更新で足される→消す、を試験用の名前で通しで確かめるスクリプト:
+    `powershell -ExecutionPolicy Bypass -File installer\uninstall_check.ps1`（本物のインストール・
+    関連付け・設定には触れません）。
 
 > SmartScreen の「不明な発行元」警告を消したい場合は「1.9 コード署名」を参照。
-> 署名は build_exe 段の exe と、必要なら Setup.exe の両方に行うのが理想です。
+> CI で証明書の Secrets を登録すれば、exe と Setup.exe の両方に自動で署名します。
 
 ## 3. 配布時の注意
 - onedir 形式は `TriVReader` フォルダ丸ごとが必要です（exe 単体では動きません）。

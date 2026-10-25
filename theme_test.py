@@ -119,6 +119,49 @@ def main() -> int:  # noqa: C901
         "開いたファイルがウェルカムのカードに出ていない"
     print("OK: 開いた履歴がウェルカム画面に載る")
 
+    # --- ダークで白く残る所・色見本 ------------------------------------
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor as _QC
+
+    def lum(c) -> int:
+        return (c.red() * 299 + c.green() * 587 + c.blue() * 114) // 1000
+
+    w.act_dark.setChecked(True)
+    app.processEvents()
+    pal = app.palette()
+    for role in (QPalette.ColorRole.Light, QPalette.ColorRole.Midlight):
+        assert lum(pal.color(role)) < 90, (
+            f"ダークなのに {role.name} が明るいまま（白い 1px の線の原因）: {pal.color(role).name()}")
+    # 枠の色は実際の Windows の画面でだけ効く（offscreen は指定を受け付けない）。
+    # そちらは scratchpad の実機プローブで DwmGetWindowAttribute を見て確かめた
+    real = app.platformName() == "windows"
+    if real:
+        assert app.styleHints().colorScheme() == Qt.ColorScheme.Dark, \
+            "ダイアログのタイトルバー用の配色がダークにならない"
+    w.act_dark.setChecked(False)
+    app.processEvents()
+    if real:
+        assert app.styleHints().colorScheme() == Qt.ColorScheme.Light
+    print("OK: ダークでは Light/Midlight も沈み、配色の指定も切り替わる")
+
+    # 黒の色見本はダークのリボンに溶けない（枠がある）／塗り色は絵文字に置き換わらない
+    w.act_dark.setChecked(True)
+    app.processEvents()
+    sw = w._swatch(_QC(0, 0, 0)).toImage()
+    edge = sw.pixelColor(1, 9)
+    assert edge.alpha() > 100 and lum(edge) > 80, \
+        f"黒い見本の枠が見えない（ダークの地に溶ける）: {edge.name()} a={edge.alpha()}"
+    assert w.act_color.icon().pixmap(18, 18).toImage().pixelColor(9, 9) == _QC(0, 0, 0)
+    w._fill_color = _QC(255, 128, 0)
+    w._refresh_fill_icon()
+    w._toggle_dark(True)   # アイコンを付け直す処理を通っても、塗り色の見本のまま
+    center = w.act_fill_color.icon().pixmap(18, 18).toImage().pixelColor(9, 9)
+    assert (center.red(), center.green(), center.blue()) == (255, 128, 0), \
+        f"塗り色のアイコンが色見本でなくなっている: {center.name()}"
+    w.act_dark.setChecked(False)
+    app.processEvents()
+    print("OK: 色見本は枠つきで見え、塗り色のアイコンはテーマ切替後も色のまま")
+
     # --- タイトルバーの色（Windows 以外・古い OS でも落ちないこと）----
     w._apply_title_bar_theme(True)
     w._apply_title_bar_theme(False)

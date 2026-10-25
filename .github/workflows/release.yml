@@ -17,6 +17,10 @@ jobs:
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
+      # コード署名（任意）。リポジトリの Secrets に両方入れると、exe と Setup.exe に署名して
+      # 配る。入れなければ、署名なしで配る（これまでどおり）。手順は BUILD.md の「コード署名」
+      CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
+      CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
     steps:
       - name: ソース取得
         uses: actions/checkout@v4
@@ -64,6 +68,13 @@ jobs:
 
       - name: ビルド（exe 化）
         run: python build_exe.py
+
+      - name: コード署名 — exe（証明書があるときだけ。zip と Setup.exe に入る前に付ける）
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:USERPROFILE "TriVReader_dist\dist\TriVReader\TriVReader.exe"
+          python sign_release.py --optional "$exe"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: できた exe が起動するか確認（落ちる exe を配らない）
         # ソースのテストが通っても、凍結した exe でだけ落ちることがある（同梱漏れ・
@@ -113,6 +124,14 @@ jobs:
 
       - name: インストーラ生成 (Setup.exe)
         run: python make_installer.py
+
+      - name: コード署名 — Setup.exe（証明書があるときだけ）
+        shell: pwsh
+        run: |
+          $rel = Join-Path $env:USERPROFILE "TriVReader_release"
+          $setup = (Get-ChildItem (Join-Path $rel "TriVReader-Setup-*.exe")).FullName
+          python sign_release.py --optional "$setup"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: GitHub リリース作成＆アップロード
         shell: pwsh

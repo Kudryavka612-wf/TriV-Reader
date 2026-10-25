@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import fitz
 from PySide6.QtCore import (
     QElapsedTimer, QEvent, QPoint, QRect, QRectF, Qt, QTimer, Signal,
 )
@@ -508,6 +509,40 @@ class _FormCheckBox(QCheckBox):
                    QPoint(int(cx - side * 0.10), int(cy + side * 0.32)),
                    QPoint(int(cx + side * 0.42), int(cy - side * 0.34))]
             p.drawPolyline(QPolygon(pts))
+        p.end()
+
+
+class _FormRadioButton(QCheckBox):
+    """フォームのラジオボタン。丸で表し、押すと選ばれる（もう一度押しても外れない）。
+
+    同じグループの他のボタンを外す処理は PdfDocument.select_radio と、PageView の
+    _sync_radio_group が受け持つ。PDF の四角のどこを押しても反応する。
+    """
+
+    def hitButton(self, pos) -> bool:  # noqa: N802 (Qt 命名)
+        return self.rect().contains(pos)
+
+    def nextCheckState(self) -> None:  # noqa: N802 (Qt 命名)
+        if not self.isChecked():
+            self.setChecked(True)   # 選ばれているものを押しても外さない
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect()
+        p.fillRect(r, QColor(225, 235, 255))
+        focus = self.hasFocus()
+        p.setPen(QPen(QColor(0x1a, 0x73, 0xe8) if focus else QColor(0x70, 0x96, 0xD8),
+                      2 if focus else 1))
+        side = max(4.0, min(r.width(), r.height()) - 4.0)
+        circle = QRectF(r.center().x() - side / 2, r.center().y() - side / 2, side, side)
+        p.setBrush(QColor(255, 255, 255))
+        p.drawEllipse(circle)
+        if self.isChecked():
+            d = side * 0.5
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0x11, 0x11, 0x11))
+            p.drawEllipse(QRectF(r.center().x() - d / 2, r.center().y() - d / 2, d, d))
         p.end()
 
 
@@ -1158,11 +1193,17 @@ class _PageLabel(QLabel):
                 pm = self.pixmap()
                 if pm is not None and not pm.isNull():
                     b0 = self._view.selection_box_label(self._index) or box
-                    src = QRect(int(b0[0]), int(b0[1]), int(b0[2] - b0[0]),
-                                int(b0[3] - b0[1])).intersected(pm.rect())
-                    if not src.isEmpty():
+                    # pixmap の座標はデバイス px（高 DPI では論理 px の dpr 倍）
+                    dpr = pm.devicePixelRatio() or 1.0
+                    size = pm.deviceIndependentSize()
+                    logical = QRectF(b0[0], b0[1], b0[2] - b0[0], b0[3] - b0[1]).intersected(
+                        QRectF(0, 0, size.width(), size.height()))
+                    if not logical.isEmpty():
+                        src = QRectF(logical.x() * dpr, logical.y() * dpr,
+                                     logical.width() * dpr, logical.height() * dpr)
+                        dst = logical.translated(self._move_offset.x(), self._move_offset.y())
                         sp.setOpacity(0.85)
-                        sp.drawPixmap(src.translated(self._move_offset).topLeft(), pm, src)
+                        sp.drawPixmap(dst, pm, src)
                         sp.setOpacity(1.0)
             sp.setPen(QPen(QColor(26, 115, 232), 2, Qt.PenStyle.DashLine))
             sp.drawRect(rect)
@@ -1934,7 +1975,8 @@ class PageView(QScrollArea):
         if xref is not None:
             # 直す前の注釈が下に透けて二重に見えないよう、注釈を除いた紙面を敷く
             try:
-                ed.set_backdrop(self._doc.render_page_without_annots(index, self._zoom))
+                ed.set_backdrop(self._doc.render_page_without_annots(
+                    index, self._zoom, self.devicePixelRatioF()))
             except Exception:  # noqa: BLE001  下地が無くても編集はできる
                 pass
         if text:
@@ -2586,7 +2628,7 @@ class PageView(QScrollArea):
             if self._text_ctx and self._text_ctx.get("xref") is not None:
                 try:
                     self._text_editor.set_backdrop(self._doc.render_page_without_annots(
-                        self._text_ctx["index"], self._zoom))
+                        self._text_ctx["index"], self._zoom, self.devicePixelRatioF()))
                 except Exception:  # noqa: BLE001
                     pass
         if self._form_mode:
@@ -2834,6 +2876,16 @@ class PageView(QScrollArea):
             ctl.clicked.connect(
                 lambda checked=False, i=index, r=field["rect"]:
                 self._click_govform_cell(i, r))
+        elif kind == "radio" and field.get("ftype") == fitz.PDF_WIDGET_TYPE_BUTTON:
+            return None   # 押しボタン: 文字を打つ所ではない。何も重ねない（以前は文字欄が重なった）
+        elif kind == "radio" and field.get("on_state"):
+            # 本物のラジオボタン（官公庁フォームの「丸で選択」ではないもの）
+            ctl = _FormRadioButton(label)
+            ctl.setProperty("trv_on", field["on_state"])
+            ctl.setChecked(str(value).lstrip("/") == field["on_state"])
+            ctl.toggled.connect(
+                lambda on, i=index, x=xref, n=field["name"], s=field["on_state"]:
+                self._commit_radio(i, x, n, s) if on else None)
         elif kind == "checkbox":
             ctl = _FormCheckBox(label)
             checked = str(value) not in ("", "Off", "/Off", "No", "false", "False", "0")
@@ -3176,6 +3228,20 @@ class PageView(QScrollArea):
             self.status_message.emit(
                 f"入力欄「{name or xref}」に値を書き込めませんでした")
 
+    def _commit_radio(self, index, xref, name, on_state) -> None:
+        """ラジオボタンを選ぶ。同じグループの、画面に出ている他のボタンは外す。"""
+        if not self._doc:
+            return
+        if self._doc.set_field_value(index, xref, True, name=name):
+            self.form_changed.emit()
+            for ctl in self._form_overlays:
+                if (isinstance(ctl, _FormRadioButton) and ctl.property("trv_field") == name):
+                    ctl.blockSignals(True)
+                    ctl.setChecked(ctl.property("trv_on") == on_state)
+                    ctl.blockSignals(False)
+        else:
+            self.status_message.emit(f"ラジオボタン「{name or xref}」を選べませんでした")
+
     def _commit_combo(self, index, xref, text, name=None) -> None:
         """コンボ選択: 値を確定し、官公庁フォームなら JS 連動（_PRINT 転写・
         枝ラベル表示切替）も再現してからページを再描画する。"""
@@ -3490,9 +3556,19 @@ class PageView(QScrollArea):
         h = self.viewport().height()
         return (top - h, top + 2 * h)
 
+    def event(self, e) -> bool:
+        # 別の倍率のディスプレイへ窓を動かしたら、描き直す（古い倍率の絵だとにじむ）
+        if e.type() == QEvent.Type.DevicePixelRatioChange:
+            self._render_visible()
+        return super().event(e)
+
     def _render_visible(self) -> None:
         if not self._doc or not self._doc.is_open:
             return
+        dpr = self.devicePixelRatioF()
+        if getattr(self, "_last_dpr", dpr) != dpr:
+            self._rendered.clear()   # ラベルの絵を、新しい DPR で描いたものに入れ替える
+        self._last_dpr = dpr
         lo, hi = self._visible_range()
         page_count = self._doc.page_count
         for i, label in enumerate(self._labels):
@@ -3503,7 +3579,7 @@ class PageView(QScrollArea):
             y1 = y0 + label.height()
             visible = y1 >= lo and y0 <= hi
             if visible and i not in self._rendered:
-                pixmap = self._doc.render_page(i, zoom=self._zoom)
+                pixmap = self._doc.render_page(i, zoom=self._zoom, dpr=self.devicePixelRatioF())
                 label.setPixmap(pixmap)
                 self._rendered.add(i)
             elif not visible and i in self._rendered:
@@ -3528,7 +3604,7 @@ class PageView(QScrollArea):
                    if 0 <= i < self._doc.page_count and i not in self._rendered]
         for i in targets:
             try:
-                self._doc.render_page(i, zoom=self._zoom)
+                self._doc.render_page(i, zoom=self._zoom, dpr=self.devicePixelRatioF())
             except Exception:  # noqa: BLE001  先読みは失敗しても無視
                 return
 

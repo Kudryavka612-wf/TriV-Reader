@@ -74,6 +74,10 @@ LINE_DASH_PATTERNS = {
 # 「指定なし（元の値を引き継ぐ）」を None（＝塗り無しに設定）と区別するための番兵。
 _UNSET = object()
 
+# 文字の位置を読むときの指定。既定は画像の中身（スキャン PDF では 1 ページ数 MB）まで
+# 取り出すので、文字だけでよい選択・語の判定では外す（スキャンのページが 1/10 の時間になる）
+_TEXT_FLAGS = fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
+
 
 def _span_dist(lo: float, hi: float, v: float) -> float:
     """区間 [lo, hi] と点 v の距離（中にあれば 0）。"""
@@ -218,6 +222,7 @@ class PdfDocument:
     _UNDO_DOC_MAX = 5
     _UNDO_DOC_BYTES = 192 * 1024 * 1024
     _LAYOUT_CACHE_MAX = 8   # 文字レイアウトを憶えておくページ数
+    _WHOLE_CACHE_MAX = 2000   # 「ページ全体を選んだ結果」を憶えておくページ数（小さい）
     # 注釈に記録する作成者名。設定ダイアログから
     # PdfDocument.annot_author = "..." で全ドキュメントに効かせる。
     annot_author: str = ""
@@ -240,6 +245,7 @@ class PdfDocument:
         # 書き込み、古いページ番号を持つ検索結果・文字選択を捨てる）
         self._pre_change_listeners: list = []
         self._in_pre_change = False
+        self.undo_notice: str = ""   # 直前の取り消し・やり直しで、利用者に知らせたいこと
         # ページ描画のキャッシュ（LRU）。スクロールで画面外に出たページを
         # 戻ったときに描き直さずに済ませる。合計バイト数で上限を決める。
         self._render_cache: "OrderedDict[tuple, QPixmap]" = OrderedDict()
@@ -260,6 +266,7 @@ class PdfDocument:
         # ので、毎回 rawdict を解析すると重い。ページをまたぐ選択でも効くよう
         # 数ページ分を憶えておく。
         self._layout_cache: dict[int, tuple] = {}
+        self._whole_cache: dict[int, tuple] = {}   # ページ → (全文, 行ごとの矩形)
         # ページ内リンク（目次のジャンプ・URL）。ホバーのたびに get_links() を
         # 呼ぶと重いので、ページごとに憶えておく。中身が変われば捨てる。
         self._links_cache: dict[int, list] = {}
@@ -295,6 +302,7 @@ class PdfDocument:
         self._render_bytes = 0
         self._fields_cache.clear()
         self._layout_cache.clear()
+        self._whole_cache.clear()
         self._links_cache.clear()
 
     def _cache_render(self, key: tuple, pixmap: "QPixmap") -> None:
@@ -597,8 +605,27 @@ class PdfDocument:
         return (max(1, round(rect.width * zoom)), max(1, round(rect.height * zoom)))
 
     # --- レンダリング ---------------------------------------------------
-    def render_page(self, index: int, zoom: float = 1.0) -> QPixmap:
+    #: 1 枚の描画に使うデバイス画素数の上限。高 DPI で DPR をそのままかけると、巨大なページ
+    #: ×高倍率で数百 MB になる。超えるときは DPR を下げる（Qt が拡大して表示する）
+    MAX_RENDER_PIXELS: int = 48_000_000
+
+    def _effective_dpr(self, index: int, zoom: float, dpr: float) -> float:
+        """実際に使う DPR（1.0 以上。描画が大きすぎるときは下げる）。"""
+        dpr = max(1.0, float(dpr or 1.0))
+        if dpr <= 1.0:
+            return 1.0
+        rect = self._doc.load_page(index).rect
+        base = max(1.0, rect.width * zoom * rect.height * zoom)
+        if base * dpr * dpr > self.MAX_RENDER_PIXELS:
+            dpr = max(1.0, (self.MAX_RENDER_PIXELS / base) ** 0.5)
+        return round(dpr, 3)
+
+    def render_page(self, index: int, zoom: float = 1.0, dpr: float = 1.0) -> QPixmap:
         """指定ページを zoom 倍で描画して QPixmap を返す。
+
+        dpr はディスプレイの表示倍率（devicePixelRatio）。Windows の表示拡大 125〜200% で
+        論理 px のまま描くと、Qt が拡大して表示するので文字がにじむ。dpr 倍の細かさで描き、
+        QPixmap に devicePixelRatio を付ける（論理サイズ＝dpr 1 のときと同じ）。
 
         同じページを同じ倍率で描く要求はキャッシュから返す（スクロールで
         往復したときや、開いた直後にレイアウトが数回決め直されるときに効く）。
@@ -606,20 +633,23 @@ class PdfDocument:
         """
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
-        key = (index, round(zoom, 4))
+        dpr = self._effective_dpr(index, zoom, dpr)
+        key = (index, round(zoom, 4), dpr)
         cached = self._render_cache.get(key)
         if cached is not None:
             self._render_cache.move_to_end(key)
             return cached
         page = self._doc.load_page(index)
-        matrix = fitz.Matrix(zoom, zoom)
+        matrix = fitz.Matrix(zoom * dpr, zoom * dpr)
         # alpha=False で不透明背景にする（白紙が透過にならない）
         pix = page.get_pixmap(matrix=matrix, alpha=False)
         pixmap = self._pixmap_from_fitz(pix)
+        pixmap.setDevicePixelRatio(dpr)
         self._cache_render(key, pixmap)
         return pixmap
 
-    def render_page_without_annots(self, index: int, zoom: float = 1.0) -> QPixmap:
+    def render_page_without_annots(self, index: int, zoom: float = 1.0,
+                                   dpr: float = 1.0) -> QPixmap:
         """注釈を描かずにページを描く（テキスト注釈の編集中の下地に使う）。
 
         編集中の注釈そのものが下に透けて二重に見えないようにしつつ、罫線や
@@ -627,10 +657,13 @@ class PdfDocument:
         """
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        dpr = self._effective_dpr(index, zoom, dpr)
         page = self._doc.load_page(index)
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False,
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom * dpr, zoom * dpr), alpha=False,
                               annots=False)
-        return self._pixmap_from_fitz(pix)
+        pixmap = self._pixmap_from_fitz(pix)
+        pixmap.setDevicePixelRatio(dpr)
+        return pixmap
 
     def page_svg(self, index: int, text_as_path: bool = True) -> str:
         """ページを SVG（ベクター）で書き出す。
@@ -664,15 +697,18 @@ class PdfDocument:
         img = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
         return img.copy()  # PyMuPDF 側のバッファは後で解放されるので複製する
 
-    def render_thumbnail(self, index: int, max_width: int = 160) -> QPixmap:
-        """サムネイル用の小さな描画。横幅 max_width に合わせて縮小する。"""
+    def render_thumbnail(self, index: int, max_width: int = 160, dpr: float = 1.0) -> QPixmap:
+        """サムネイル用の小さな描画。横幅 max_width（論理 px）に合わせて縮小する。"""
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
         page = self._doc.load_page(index)
         rect = page.rect
         zoom = max_width / rect.width if rect.width else 1.0
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        return self._pixmap_from_fitz(pix)
+        dpr = self._effective_dpr(index, zoom, dpr)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom * dpr, zoom * dpr), alpha=False)
+        pixmap = self._pixmap_from_fitz(pix)
+        pixmap.setDevicePixelRatio(dpr)
+        return pixmap
 
     # --- 回転 -----------------------------------------------------------
     def rotation(self, index: int) -> int:
@@ -1480,6 +1516,9 @@ class PdfDocument:
                 "xref": w.xref,
                 "name": w.field_name or "",
                 "kind": self._widget_kind(w.field_type),
+                "ftype": w.field_type,   # 生の種類（ラジオと押しボタンは、kind では同じ "radio"）
+                "on_state": (self._on_state(w.xref)
+                             if w.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON else ""),
                 "value": w.field_value if w.field_value is not None else "",
                 "rect": w.rect,
                 "choices": choices,
@@ -1544,6 +1583,16 @@ class PdfDocument:
         w = fastwidgets.widget(page, xref)
         if w is None:
             return False
+        if w.field_type == fitz.PDF_WIDGET_TYPE_BUTTON:
+            return False   # 押しボタンは値を持たない（文字を書かない）
+        if w.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+            # ラジオは、同じグループの 1 つだけが選ばれる。value が真ならこのボタンを選ぶ
+            if not value:
+                return False
+            ok = self.select_radio(index, xref)
+            if ok:
+                self.modified = True
+            return ok
         if (w.field_type != fitz.PDF_WIDGET_TYPE_CHECKBOX
                 and str(w.field_value or "") == ("" if value is None else str(value))):
             # 変わっていない。保存・タブを閉じる前にカーソルのある欄を書き込むので、
@@ -1567,6 +1616,34 @@ class PdfDocument:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    def _on_state(self, xref: int) -> str:
+        """チェック・ラジオの ON 状態の名前（/AP/N にある "Off" 以外の名前。無ければ ""）。"""
+        apn = self._doc.xref_get_key(xref, "AP/N")
+        if not apn or apn[0] != "dict":
+            return ""
+        keys = re.findall(r"/([^ /<>]+)\s+\d+\s+0\s+R", apn[1])
+        states = [k for k in keys if k != "Off"]
+        return states[0] if states else ""
+
+    def select_radio(self, index: int, xref: int) -> bool:
+        """ラジオボタン xref を選び、同じグループの他のボタンは外す。成功で True。
+
+        値（/V）は欄（名前 /T のある辞書）に、見た目（/AS）は各ボタンに書く。
+        以前は、ラジオに文字入力欄が重なり、何か打つと /V に文字が入った。
+        """
+        on = self._on_state(xref)
+        if not on:
+            return False
+        field = jpfonts.field_xref(self._doc, xref)
+        kids = [xref]
+        kd = self._doc.xref_get_key(field, "Kids")
+        if kd and kd[0] == "array":
+            kids = [int(m) for m in re.findall(r"(\d+)\s+0\s+R", kd[1])] or [xref]
+        for k in kids:
+            self._doc.xref_set_key(k, "AS", "/" + on if k == xref else "/Off")
+        self._doc.xref_set_key(field, "V", "/" + on)
+        return True
 
     def _set_checkbox(self, w, on: bool) -> bool:
         """チェックボックスの ON/OFF を /AS・/V を直接書いて反映する。
@@ -2369,12 +2446,107 @@ class PdfDocument:
         self._invalidate_view_caches()
         self._modified = True   # setter を通すと履歴まで巻き込むので直接立てる
 
+    #: 入力値・しおり・文書情報を変えない（変えても、取り消しで戻すべきでない）ページ操作。
+    #: これらを取り消しても、そのあとに入れた入力値・しおり・文書情報は残す。「フォームの
+    #: クリア」と「墨消しの適用」は値そのものを変える操作なので、取り消せば値が戻るのが正しい
+    _VALUE_KEEPING_OPS = frozenset({
+        "ページの回転", "透かしの追加", "ヘッダー/フッターの追加", "白紙ページの挿入",
+        "ページの複製", "余白のトリミング", "ページの移動", "ページの並べ替え",
+        "ページの削除", "PDF の結合", "画像の取り込み", "傾き補正", "ページ番号の追加"})
+
+    @staticmethod
+    def _field_values(doc) -> dict:
+        """文書の入力欄の値 {欄の名前: (種類, 値)}。ボタン・署名は含めない。"""
+        out: dict = {}
+        skip = (fitz.PDF_WIDGET_TYPE_BUTTON, fitz.PDF_WIDGET_TYPE_SIGNATURE)
+        for page in doc:
+            for w in fastwidgets.widgets(page):
+                if w.field_name and w.field_type not in skip:
+                    out[w.field_name] = (w.field_type, str(w.field_value or ""))
+        return out
+
+    def _later_changes(self, base_bytes: bytes) -> dict:
+        """取り消して base_bytes の状態に戻すとき、そのあとに入れた変更（履歴に入らないもの）。
+
+        ページ操作の履歴は文書全体のバイト列。入力欄の値・しおり・文書情報の変更は履歴に
+        入らないので、そのまま戻すと、ページを回したあとに入力した欄の値やしおりが、確認なしに
+        消えていた（さらに何か編集すると、やり直しも消える）。
+        """
+        base = fitz.open("pdf", base_bytes)
+        try:
+            base_vals = self._field_values(base)
+            base_meta = dict(base.metadata or {})
+            base_toc = [(t[0], t[1]) for t in base.get_toc(simple=True)]
+            base_pages = base.page_count
+        finally:
+            base.close()
+        cur_vals = self._field_values(self._doc)
+        fields = {n: v for n, v in cur_vals.items()
+                  if n in base_vals and base_vals[n] != v}
+        meta = dict(self._doc.metadata or {})
+        toc_full = self._doc.get_toc(simple=False)
+        toc_changed = [(t[0], t[1]) for t in toc_full] != base_toc
+        out = {"fields": fields, "meta": meta if meta != base_meta else None,
+               "toc": None, "toc_lost": False}
+        if toc_changed:
+            if self._doc.page_count == base_pages:
+                out["toc"] = toc_full     # ページ数が同じなら、ページ番号もそのまま使える
+            else:
+                out["toc_lost"] = True    # ページの数が違うと、番号を対応づけられない
+        return out
+
+    def _reapply_changes(self, carried: dict) -> None:
+        """_later_changes で控えた変更を、戻した文書へ書き直す。"""
+        fields = carried.get("fields") or {}
+        if fields:
+            done = set()
+            for page in self._doc:
+                for w in fastwidgets.widgets(page):
+                    want = fields.get(w.field_name)
+                    if want is None or w.field_name in done:
+                        continue
+                    typ, val = want
+                    try:
+                        if typ == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+                            self._set_checkbox(w, val not in ("", "Off"))
+                        elif typ in (fitz.PDF_WIDGET_TYPE_TEXT, fitz.PDF_WIDGET_TYPE_COMBOBOX,
+                                     fitz.PDF_WIDGET_TYPE_LISTBOX):
+                            w.field_value = val
+                            jpfonts.update_widget(w)
+                        else:
+                            continue
+                        done.add(w.field_name)
+                    except Exception:  # noqa: BLE001  1 欄の失敗で取り消し全体を止めない
+                        continue
+        if carried.get("meta") is not None:
+            try:
+                self._doc.set_metadata(carried["meta"])
+            except Exception:  # noqa: BLE001
+                pass
+        if carried.get("toc") is not None:
+            try:
+                self._doc.set_toc(carried["toc"])
+            except Exception:  # noqa: BLE001
+                pass
+
     def _apply_entry(self, entry: tuple, opposite: list) -> tuple:
         """entry の状態へ戻し、戻す前の状態を opposite に積む。"""
         kind, index, payload, label = entry
+        self.undo_notice = ""
         if kind == "doc":
             current = self._doc.tobytes()
+            carried = None
+            if label in self._VALUE_KEEPING_OPS:
+                try:
+                    carried = self._later_changes(payload)
+                except Exception:  # noqa: BLE001  控えられなくても、取り消し自体はする
+                    carried = None
             self._restore_doc_bytes(payload)
+            if carried:
+                self._reapply_changes(carried)
+                if carried.get("toc_lost"):
+                    self.undo_notice = ("ページの数が変わる操作を戻したので、そのあとに追加・変更した"
+                                        "しおりは戻りませんでした")
             opposite.append(("doc", index, current, label))
         else:
             current = self._annot_snapshot(index)
@@ -2878,7 +3050,7 @@ class PdfDocument:
         chars = []
         if self._doc:
             page = self._doc.load_page(index)
-            raw = page.get_text("rawdict")
+            raw = page.get_text("rawdict", flags=_TEXT_FLAGS)
             line_id = 0
             for block in raw.get("blocks", []):
                 if block.get("type", 0) != 0:  # 0 = テキストブロックのみ
@@ -2908,6 +3080,7 @@ class PdfDocument:
     def invalidate_text_layout(self) -> None:
         """憶えている文字レイアウトを捨てる（選択を始めるときに呼ぶ）。"""
         self._layout_cache.clear()
+        self._whole_cache.clear()
 
     @staticmethod
     def _caret_at(chars, lines, pt) -> int:
@@ -2971,9 +3144,43 @@ class PdfDocument:
         return ("".join(text_parts), rects)
 
     def _select_whole_page(self, index):
-        """そのページの文字を全部選ぶ。"""
-        chars, _lines = self._page_layout(index)
-        return self._selection_from(chars, 0, len(chars))
+        """そのページの文字を全部選ぶ。(文字列, 行ごとの矩形)。
+
+        ページ全体なら 1 文字ずつの位置は要らないので、行単位で読む（文字ごとの
+        解析より 4 倍ほど速い）。結果は憶えておく。ページをまたぐドラッグは
+        マウスを動かすたびに途中のページを全部選び直すので、憶えていないと
+        文字レイアウトの上限（数ページ）を超える長さのドラッグが毎回全ページを
+        読み直していた。
+        """
+        cached = self._whole_cache.get(index)
+        if cached is not None:
+            return cached
+        layout = self._layout_cache.get(index)
+        if layout is not None:
+            result = self._selection_from(layout[0], 0, len(layout[0]))
+        else:
+            result = self._whole_page_by_lines(index)
+        if len(self._whole_cache) >= self._WHOLE_CACHE_MAX:
+            self._whole_cache.clear()
+        self._whole_cache[index] = result
+        return result
+
+    def _whole_page_by_lines(self, index):
+        """_selection_from(全文字) と同じ結果を、行単位の読み取りで作る。"""
+        if not self._doc:
+            return ("", [])
+        page = self._doc.load_page(index)
+        raw = page.get_text("dict", flags=_TEXT_FLAGS)
+        texts, rects = [], []
+        for block in raw.get("blocks", []):
+            if block.get("type", 0) != 0:  # 0 = テキストブロックのみ
+                continue
+            for line in block.get("lines", []):
+                text = "".join(span.get("text", "") for span in line.get("spans", []))
+                if text:
+                    texts.append(text)
+                    rects.append(fitz.Rect(line["bbox"]))
+        return ("\n".join(texts), rects)
 
     def _select_from_point(self, index, pt):
         """クリック位置からページの終わりまで。"""

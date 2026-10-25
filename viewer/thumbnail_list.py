@@ -133,7 +133,8 @@ class ThumbnailList(QListWidget):
             i = self._pending.pop(0)
             if 0 <= i < self.count():
                 try:
-                    pixmap = self._doc.render_thumbnail(i, max_width=self.THUMB_WIDTH)
+                    pixmap = self._doc.render_thumbnail(
+                        i, max_width=self.THUMB_WIDTH, dpr=self.devicePixelRatioF())
                     self.item(i).setIcon(pixmap)
                     self._rendered.add(i)
                 except Exception:  # noqa: BLE001 (描画失敗は枠のまま継続)
@@ -171,7 +172,8 @@ class ThumbnailList(QListWidget):
     def refresh_page(self, doc: PdfDocument, index: int) -> None:
         """1 ページ分のサムネイルを再描画（回転後の反映などに使う）。"""
         if 0 <= index < self.count() and doc.is_open:
-            pixmap = doc.render_thumbnail(index, max_width=self.THUMB_WIDTH)
+            pixmap = doc.render_thumbnail(
+                index, max_width=self.THUMB_WIDTH, dpr=self.devicePixelRatioF())
             self.item(index).setIcon(pixmap)
             self._rendered.add(index)
 

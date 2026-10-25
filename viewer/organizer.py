@@ -74,9 +74,12 @@ class _PreviewPane(QWidget):
         avail_w = max(1, r.width() - 12)
         avail_h = max(1, r.height() - self.CAPTION_H - 8)
         pm = self._pixmap
-        scale = min(avail_w / pm.width(), avail_h / pm.height(), 1.0)
-        w = max(1, int(pm.width() * scale))
-        h = max(1, int(pm.height() * scale))
+        # 高 DPI の pixmap は、width() がデバイス px（論理 px の dpr 倍）。論理サイズで測る
+        lw = max(1.0, pm.deviceIndependentSize().width())
+        lh = max(1.0, pm.deviceIndependentSize().height())
+        scale = min(avail_w / lw, avail_h / lh, 1.0)
+        w = max(1, int(lw * scale))
+        h = max(1, int(lh * scale))
         x = (r.width() - w) // 2
         y = self.CAPTION_H + (avail_h - h) // 2
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -419,7 +422,8 @@ class PageOrganizer(QWidget):
         if not doc.is_open:
             return
         for i in range(doc.page_count):
-            pixmap = doc.render_thumbnail(i, max_width=self.THUMB)
+            pixmap = doc.render_thumbnail(
+                i, max_width=self.THUMB, dpr=self.devicePixelRatioF())
             item = QListWidgetItem(f"ページ {i + 1}")
             item.setIcon(pixmap)
             item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -475,7 +479,7 @@ class PageOrganizer(QWidget):
             avail_w = max(120, self.preview.width() - 12)
             avail_h = max(120, self.preview.height() - 32)
             zoom = min(avail_w / max(1, w_pt), avail_h / max(1, h_pt), 3.0)
-            pixmap = self._doc.render_page(orig, zoom=zoom)
+            pixmap = self._doc.render_page(orig, zoom=zoom, dpr=self.devicePixelRatioF())
         except Exception:  # noqa: BLE001
             self.preview.clear_page("プレビューを表示できません")
             return

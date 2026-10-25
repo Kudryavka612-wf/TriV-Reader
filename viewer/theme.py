@@ -69,7 +69,7 @@ def _tokens(dark: bool) -> dict:
     return _DARK if dark else _LIGHT
 
 
-def _palette(c: dict) -> QPalette:
+def _palette(c: dict, dark: bool = False) -> QPalette:
     p = QPalette()
     p.setColor(QPalette.ColorRole.Window, QColor(c["bg"]))
     p.setColor(QPalette.ColorRole.WindowText, QColor(c["text"]))
@@ -84,6 +84,14 @@ def _palette(c: dict) -> QPalette:
     p.setColor(QPalette.ColorRole.HighlightedText, QColor(c["accent_text"]))
     p.setColor(QPalette.ColorRole.Link, QColor(c["accent"]))
     p.setColor(QPalette.ColorRole.Mid, QColor(c["muted"]))
+    if dark:
+        # Light / Midlight / Dark / Shadow は、指定しないと Qt 既定（ライト用）のまま。
+        # Fusion が枠・タブの下線・区切りを描くときに使うので、ダークでも白い 1px の線が
+        # 出ていた（ウィンドウ最上部・リボンの下など）。面の階調に合わせて沈める
+        p.setColor(QPalette.ColorRole.Light, QColor(c["border"]))
+        p.setColor(QPalette.ColorRole.Midlight, QColor(c["surface_alt"]))
+        p.setColor(QPalette.ColorRole.Dark, QColor(c["canvas2"]))
+        p.setColor(QPalette.ColorRole.Shadow, QColor("#0b0c0e"))
     p.setColor(QPalette.ColorRole.PlaceholderText, QColor(c["muted"]))
     grp = QPalette.ColorGroup.Disabled
     for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText,
@@ -427,6 +435,14 @@ def apply_theme(app: QApplication, dark: bool, force: bool = False) -> None:
     c = _tokens(dark)
     app.setStyle("Fusion")
     apply_font(app)
-    app.setPalette(_palette(c))
+    # ダイアログ（確認・設定・色選びなど）のタイトルバーも合わせる。パレットだけでは
+    # メインウィンドウ以外の枠が白いままになる。パレットより先に（切替で標準の
+    # パレットに戻されないように）。
+    try:
+        app.styleHints().setColorScheme(
+            Qt.ColorScheme.Dark if dark else Qt.ColorScheme.Light)
+    except Exception:  # noqa: BLE001  古い Qt では枠の色が変わらないだけ
+        pass
+    app.setPalette(_palette(c, dark))
     app.setStyleSheet(_qss(c, _arrow_images(c, dark)))
     app._trv_theme_dark = dark
