@@ -6,7 +6,7 @@ APP_VERSION = "1.6.0"
 # ここに "オーナー名/リポジトリ名" を設定するだけで更新元URLが決まります。
 # 例: GITHUB_REPO = "zhelangsenxia720/trivreader"
 # （リポジトリは public 推奨。private はリリース資産のDLに認証が必要で非対応）
-GITHUB_REPO = "zhelangsenxia720-source/TriV-Reader"
+GITHUB_REPO = "Kudryavka612-wf/TriV-Reader"
 
 # 任意: 上の自動URLを使わず、update.json のURLを直接指定したい場合に設定。
 # 例: "https://example.com/trivreader/update.json"
