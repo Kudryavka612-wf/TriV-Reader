@@ -4,6 +4,7 @@
 - 全画面表示（F11、Esc で戻る）
 - キーボードショートカット一覧（F1）
 - タブの右クリックメニュー（エクスプローラーで表示・パスをコピー・他を閉じる）
+- フォルダを使っているアプリを調べる（「使用中」で移動・削除できないとき）
 - 注釈・フォーム入力値を固定して保存（フラット化）
 - スナップショット（範囲を画像としてコピー）の後始末
 
@@ -28,12 +29,62 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
     QTabBar,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
 )
+
+
+class FolderUsersDialog(QDialog):
+    """フォルダを使っているアプリの一覧。もう一度調べる・別のフォルダを選べる。"""
+
+    def __init__(self, folder: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("フォルダを使っているアプリ")
+        self.resize(640, 420)
+        self.folder = folder
+        lay = QVBoxLayout(self)
+        self.where = QLabel()
+        self.where.setWordWrap(True)
+        lay.addWidget(self.where)
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        lay.addWidget(self.text, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("閉じる")
+        self.again = QPushButton("もう一度調べる")
+        self.other = QPushButton("別のフォルダを選ぶ…")
+        buttons.addButton(self.again, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.addButton(self.other, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.rejected.connect(self.reject)
+        self.again.clicked.connect(self.run)
+        self.other.clicked.connect(self._choose)
+        lay.addWidget(buttons)
+
+    def _choose(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "調べるフォルダを選ぶ", self.folder)
+        if folder:
+            self.folder = os.path.normpath(folder)
+            self.run()
+
+    def run(self) -> None:
+        from . import lockfinder
+
+        self.where.setText(f"調べたフォルダ: {self.folder}")
+        self.text.setPlainText("調べています…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            text = lockfinder.report(lockfinder.find(self.folder))
+        except Exception as exc:  # noqa: BLE001
+            text = f"調べられませんでした: {exc}"
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.text.setPlainText(text)
 
 
 class DocTabBar(QTabBar):
@@ -222,6 +273,11 @@ class ToolsMixin:
         self.act_copy_path = QAction("ファイルのパスをコピー", self)
         self.act_close_others = QAction("他のタブをすべて閉じる", self)
         self.act_close_all = QAction("すべてのタブを閉じる", self)
+        self.act_folder_users = QAction("フォルダを使っているアプリを調べる…", self)
+        self.act_folder_users.setIconText("使用中のアプリ")
+        self.act_folder_users.setToolTip(
+            "「ファイルは使用中です」でフォルダを移動・削除できないとき、"
+            "何が使っているかを調べます")
         for act in (self.act_nav_back, self.act_nav_forward, self.act_fullscreen,
                     self.act_shortcuts):
             self.addAction(act)   # ショートカットをウィンドウ全体で効かせる
@@ -240,6 +296,7 @@ class ToolsMixin:
         self.act_close_others.triggered.connect(
             lambda: self.close_other_tabs(self.tabs.currentIndex()))
         self.act_close_all.triggered.connect(self.close_all_tabs)
+        self.act_folder_users.triggered.connect(lambda: self.find_folder_users())
 
         # Esc は全画面のときだけ拾う（テキスト注釈の入力中の Esc を奪わない）
         self._esc_fullscreen = QShortcut(QKeySequence("Escape"), self)
@@ -468,8 +525,10 @@ class ToolsMixin:
         menu = QMenu(self)
         a_explorer = menu.addAction("エクスプローラーで表示")
         a_copy = menu.addAction("ファイルのパスをコピー")
+        a_users = menu.addAction("このフォルダを使っているアプリを調べる…")
         a_explorer.setEnabled(bool(path))
         a_copy.setEnabled(bool(path))
+        a_users.setEnabled(bool(path))
         menu.addSeparator()
         a_close = menu.addAction("このタブを閉じる")
         a_others = menu.addAction("他のタブをすべて閉じる")
@@ -478,6 +537,8 @@ class ToolsMixin:
         chosen = menu.exec(bar.mapToGlobal(pos))
         if chosen is a_explorer:
             self.show_in_explorer(path)
+        elif chosen is a_users:
+            self.find_folder_users(os.path.dirname(path))
         elif chosen is a_copy:
             self._copy_path(path)
         elif chosen is a_close:
@@ -486,6 +547,19 @@ class ToolsMixin:
             self.close_other_tabs(idx)
         elif chosen is a_all:
             self.close_all_tabs()
+
+    def find_folder_users(self, folder: str | None = None) -> None:
+        """フォルダを使っているアプリを調べて見せる（「使用中」で動かせないとき）。"""
+        if not folder:
+            start = (os.path.dirname(self.doc.path) if self.doc.is_open and self.doc.path
+                     else self._last_dir())
+            folder = QFileDialog.getExistingDirectory(self, "調べるフォルダを選ぶ", start)
+            if not folder:
+                return
+        dlg = FolderUsersDialog(os.path.normpath(folder), self)
+        dlg.show()
+        dlg.run()
+        dlg.exec()
 
     def show_in_explorer(self, path: str | None) -> None:
         if not path or not os.path.exists(path):

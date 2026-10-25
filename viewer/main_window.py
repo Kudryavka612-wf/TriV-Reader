@@ -728,6 +728,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         m_help.addAction(self.act_report_govform)
         m_help.addAction(self.act_telemetry_toggle)
         m_help.addAction(self.act_open_log)
+        m_help.addAction(self.act_folder_users)
         m_help.addSeparator()
         m_help.addAction(self.act_about)
 
@@ -952,7 +953,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         g.add_stack([self.act_shortcuts, self.act_settings,
                      self.act_set_default_pdf, self.act_check_update,
                      self.act_set_update_url, self.act_report_govform,
-                     self.act_open_log, self.act_about])
+                     self.act_open_log, self.act_folder_users, self.act_about])
         r.end_page(p)
 
         # リボンを最上部に据え、従来のメニューバー/ツールバーは隠す
@@ -3063,14 +3064,19 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             self._backup_if_enabled(self.doc.path)
             self.doc.save()
         except Exception as exc:  # noqa: BLE001
-            ret = QMessageBox.question(
-                self,
-                "上書きできません",
-                f"上書き保存に失敗しました:\n{exc}\n\n"
-                "別の場所に名前を付けて保存しますか？",
-            )
-            if ret == QMessageBox.StandardButton.Yes:
+            box = QMessageBox(QMessageBox.Icon.Question, "上書きできません",
+                              f"上書き保存に失敗しました:\n{exc}\n\n"
+                              "別の場所に名前を付けて保存しますか？", parent=self)
+            b_save_as = box.addButton("名前を付けて保存…", QMessageBox.ButtonRole.AcceptRole)
+            # ほかのアプリが開いている（使用中）ときは、何が使っているかを調べられる
+            b_users = box.addButton("使っているアプリを調べる…",
+                                    QMessageBox.ButtonRole.ActionRole)
+            box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is b_save_as:
                 self.save_as()
+            elif box.clickedButton() is b_users:
+                self.find_folder_users(os.path.dirname(self.doc.path))
             return
         self._update_title()
         self.statusBar().showMessage("保存しました", 3000)

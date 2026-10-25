@@ -4,6 +4,10 @@
 プロセスの CWD になる。Windows は CWD にしているフォルダの削除/移動を拒否する
 （WinError 32）ため、閲覧しただけでフォルダを整理できなくなっていた。
 トレイ常駐でプロセスが残る分、症状も長引く。
+
+「フォルダを使っているアプリを調べる」（viewer/lockfinder.py）が、ファイルを開いて
+いる別のアプリと、フォルダを作業フォルダにしている別のアプリを見つけ、上書き保存に
+失敗したときの画面からも調べられることも確かめる。
 """
 from __future__ import annotations
 
@@ -168,6 +172,94 @@ def test_launch_from_folder(root: str) -> None:
             proc.kill()
 
 
+def ok(label: str, cond, extra: str = "") -> None:
+    print(f"{'OK  ' if cond else 'NG  '}: {label} {extra}")
+    results.append(bool(cond))
+
+
+def test_find_users(app: QApplication, root: str) -> None:
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QMessageBox
+
+    from viewer import lockfinder
+    from viewer.mw_tools import FolderUsersDialog
+
+    folder = os.path.join(root, "使用中のフォルダ")
+    os.makedirs(os.path.join(folder, "sub"))
+    build_sample(os.path.join(folder, "申請書.pdf"))
+    build_sample(os.path.join(folder, "sub", "控え.pdf"))
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys, time; f = open(sys.argv[1], 'rb'); time.sleep(60)",
+         os.path.join(folder, "申請書.pdf")])
+    sitter = subprocess.Popen(["cmd", "/c", "ping -n 60 127.0.0.1 >nul"],
+                              cwd=os.path.join(folder, "sub"),
+                              creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        time.sleep(2)
+        result = lockfinder.find(folder)
+        by_pid = {f["pid"]: f for f in result["found"]}
+        held = by_pid.get(holder.pid)
+        ok("finds the app that has a file open, and which file",
+           held is not None and any(p.endswith("申請書.pdf") for p in held["files"]),
+           str(held))
+        ok("finds the app using the folder as its working folder",
+           by_pid.get(sitter.pid, {}).get("cwd", "").endswith("sub"), str(by_pid.get(sitter.pid)))
+        text = lockfinder.report(result)
+        ok("the report names the app, the file and how to free it",
+           "申請書.pdf" in text and "cmd.exe" in text and "作業フォルダ" in text
+           and "→" in text, text[:200])
+
+        # 上書き保存に失敗したときの画面から調べられる
+        w = MainWindow()
+        w.show()
+        app.processEvents()
+        w.open_path(os.path.join(folder, "申請書.pdf"))
+        app.processEvents()
+        w.doc.modified = True
+        w.settings.setValue("confirm_overwrite", False)
+
+        def fail(*_a, **_k):
+            raise PermissionError("[WinError 32] 別のプロセスが使用中です")
+        w.doc.save = fail
+        seen = {}
+
+        def click_check():
+            box = QApplication.activeModalWidget()
+            if isinstance(box, QMessageBox):
+                for b in box.buttons():
+                    if "使っているアプリ" in b.text():
+                        b.click()
+                        return
+            QTimer.singleShot(100, click_check)
+
+        orig_exec = FolderUsersDialog.exec
+
+        def capture(self):
+            seen["text"] = self.text.toPlainText()
+            seen["folder"] = self.folder
+            return 0
+        FolderUsersDialog.exec = capture
+        try:
+            QTimer.singleShot(100, click_check)
+            w.save()
+        finally:
+            FolderUsersDialog.exec = orig_exec
+        ok("a failed save offers to look up which app is using the folder",
+           seen.get("folder") == os.path.normpath(folder) and "申請書.pdf" in seen.get("text", ""),
+           str(seen.get("folder")))
+        w.doc.modified = False
+        w._force_quit = True
+        w.close()
+    finally:
+        holder.kill()
+        sitter.kill()
+        holder.wait()
+        sitter.wait()
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(sitter.pid)],
+                       capture_output=True)   # 子の ping も止める
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     root = tempfile.mkdtemp(prefix="trv_lock_")
@@ -177,6 +269,7 @@ def main() -> int:
         test_main_window(app, root)
         test_ensure_safe_cwd(root)
         test_launch_from_folder(root)
+        test_find_users(app, root)
     finally:
         os.chdir(ROOT)
         shutil.rmtree(root, ignore_errors=True)
