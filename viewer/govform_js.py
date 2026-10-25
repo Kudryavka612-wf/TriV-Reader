@@ -769,7 +769,8 @@ def _apply_value(widget, new_value: str) -> bool:
     """ウィジェットのフィールド値を書き込む（_PRINT 欄への転写用）。"""
     try:
         widget.field_value = new_value
-        widget.update()
+        from . import jpfonts
+        jpfonts.update_widget(widget)   # 和文は日本語のフォントで書き込む
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -796,3 +797,73 @@ def _apply_display(doc: "fitz.Document", xref: int, new_display: int) -> bool:
 def _js_str(s: str) -> str:
     """Python 文字列を JS の文字列リテラルソースへ（安全にエスケープして）変換する。"""
     return json.dumps(s)
+
+
+# --- 入力欄の入力補助（JS を走らせずに読み取る）---------------------------
+# 官公庁フォームの各欄は「FRM…_Keystroke(event)」「FRM…_OnFocus(event)」の
+# ような薄いラッパーを呼び、その中で共通の補助関数を呼ぶ。Acrobat では
+# 「数字しか入らない」「小さいカナが大きいカナになる」「入力の注意が出る」
+# が効くが、TriV-Reader では何も起きず、全角数字が入ったまま提出されていた。
+_SHOW_TIP_RE = re.compile(r'ShowToolTip\s*\(\s*[^,]+,\s*"((?:[^"\\]|\\.)*)"')
+_FOCUS_REDIRECT_RE = re.compile(
+    r"getField\(\s*\"([^\"]+)\"\s*\)\s*\.\s*setFocus\s*\(")
+
+
+def _action_js(doc: "fitz.Document", xref: int, key: str) -> str:
+    """欄（無ければ親のフィールド）の /AA/<key>/JS。"""
+    for _ in range(3):
+        try:
+            js = doc.xref_get_key(xref, f"AA/{key}/JS")
+            if js and js[0] == "string" and js[1]:
+                return js[1]
+            if js and js[0] == "xref":
+                return _decode_js_stream(doc.xref_stream(int(js[1].split()[0])))
+            parent = doc.xref_get_key(xref, "Parent")
+        except Exception:  # noqa: BLE001
+            return ""
+        if parent[0] != "xref":
+            return ""
+        xref = int(parent[1].split()[0])
+    return ""
+
+
+def _wrapper_body(bodies: dict[str, str], js: str) -> str:
+    """「Name(event)」だけのアクションなら、その関数の中身。それ以外は js そのもの。"""
+    m = SIMPLE_CALL_RE.match((js or "").strip().rstrip(";").strip())
+    if m and m.group(1) in bodies:
+        return bodies[m.group(1)]
+    return js or ""
+
+
+def field_input_rules(doc: "fitz.Document", doc_scripts: dict[str, str]) -> dict:
+    """欄の名前 → {"digits", "large_kana", "hint", "focus_to"}。
+
+    digits=数字だけ（FormatSingleByteNumber）、large_kana=小さいカナを大きく
+    （ReplaceChisaiKana）、hint=入力の注意（ShowToolTip の文言）、
+    focus_to=フォーカスを別の欄へ渡すだけの見せかけの欄（_PRINT 等）なら渡す先。
+    """
+    combined = "\n".join(doc_scripts.values()) if doc_scripts else ""
+    bodies = _all_function_bodies(combined) if combined else {}
+    rules: dict = {}
+    for page in doc:
+        for w in page.widgets() or []:
+            name = w.field_name or ""
+            if not name or name in rules:
+                continue
+            keystroke = _wrapper_body(bodies, _action_js(doc, w.xref, "K"))
+            focus = _wrapper_body(bodies, _action_js(doc, w.xref, "Fo"))
+            rule = {
+                "digits": "FormatSingleByteNumber" in keystroke,
+                "large_kana": "ReplaceChisaiKana" in keystroke,
+                "hint": None,
+                "focus_to": None,
+            }
+            m = _SHOW_TIP_RE.search(focus)
+            if m:
+                rule["hint"] = m.group(1).replace("\\n", "\n").replace('\\"', '"')
+            m = _FOCUS_REDIRECT_RE.search(focus)
+            if m and m.group(1) != name:
+                rule["focus_to"] = m.group(1)
+            if any(rule.values()):
+                rules[name] = rule
+    return rules

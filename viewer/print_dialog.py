@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, QSizeF, Qt, QTimer
+from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QPageLayout, QPageSize, QPainter, QPen, QPixmap
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
@@ -28,7 +28,16 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from .mw_print import paper_for_page, place_on_paper, select_pages, svg_is_safe
 from .util import parse_ranges
+
+#: 「印刷する内容」の選択肢（PdfDocument.PRINT_* と同じ値）
+CONTENT_CHOICES = [
+    ("all", "文書と注釈（すべて）"),
+    ("filled", "文書と、書き込んだ文字・スタンプ（ハイライト等は除く）"),
+    ("doc", "文書のみ（入力欄の値は残す）"),
+    ("fields", "書き込んだ文字と入力値だけ（印刷済みの用紙に刷る）"),
+]
 
 # サイズ処理モード
 SIZE_FIT, SIZE_ACTUAL, SIZE_SHRINK, SIZE_CUSTOM = range(4)
@@ -93,7 +102,16 @@ class PrintDialog(QDialog):
             self.printer_combo.setCurrentText(last)
         elif default and default.printerName() in names:
             self.printer_combo.setCurrentText(default.printerName())
-        form.addRow("プリンター:", self.printer_combo)
+        # ドライバーの設定（給紙トレイ・用紙の種類・ホチキス等）はプリンター
+        # ごとに違うので、Windows の印刷ダイアログ（詳細設定）に任せる
+        self.props_button = QPushButton("プロパティ…")
+        self.props_button.setToolTip(
+            "給紙トレイ・用紙の種類・部門コードなど、プリンターの詳細設定を開きます")
+        self.props_button.clicked.connect(self._open_printer_properties)
+        row = QHBoxLayout()
+        row.addWidget(self.printer_combo, 1)
+        row.addWidget(self.props_button)
+        form.addRow("プリンター:", row)
         self.copies = QSpinBox()
         self.copies.setRange(1, 999)
         self.copies.setValue(1)
@@ -137,6 +155,12 @@ class PrintDialog(QDialog):
         v.addWidget(self.rb_all)
         v.addWidget(self.rb_current)
         v.addLayout(row)
+        # 書き方の誤りは見えるところに出す（印刷ボタンが押せない理由が分かるように）
+        self.range_error_label = QLabel()
+        self.range_error_label.setStyleSheet("color: #d64545;")
+        self.range_error_label.setWordWrap(True)
+        self.range_error_label.hide()
+        v.addWidget(self.range_error_label)
         self._page_group = QButtonGroup(self)
         for rb in (self.rb_all, self.rb_current, self.rb_range):
             self._page_group.addButton(rb)
@@ -211,12 +235,18 @@ class PrintDialog(QDialog):
 
         self.gray_check = QCheckBox("グレースケール（白黒）で印刷")
         left.addWidget(self.gray_check)
-        self.annots_check = QCheckBox("注釈も印刷する（外すと文書のみ）")
-        self.annots_check.setChecked(True)
-        self.annots_check.setToolTip(
-            "ハイライトや付箋、ペンなどの注釈を紙に出すかどうか。"
-            "外しても、フォームに入力した値は印刷されます。")
-        left.addWidget(self.annots_check)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("印刷する内容:"))
+        self.content_combo = QComboBox()
+        for key, label in CONTENT_CHOICES:
+            self.content_combo.addItem(label, key)
+        self.content_combo.setToolTip(
+            "ハイライトやペン・付箋などの注釈を刷るかどうか。\n"
+            "「書き込んだ文字・スタンプ」は、テキストツールで入れた文字と承認印などを残し、\n"
+            "赤入れ（ハイライト・ペン・付箋）だけを外します。\n"
+            "「印刷済みの用紙に刷る」は、紙面を刷らず、入れた文字と入力欄の値だけを刷ります。")
+        row.addWidget(self.content_combo, 1)
+        left.addLayout(row)
 
         # 印刷品質（ラスタライズの解像度）。プリンタ解像度より粗く描くと、
         # 紙面へ拡大されるぶんだけ文字の輪郭が甘くなる。
@@ -298,7 +328,8 @@ class PrintDialog(QDialog):
         self.printer_combo.currentTextChanged.connect(self._on_printer_changed)
         self.paper_combo.currentIndexChanged.connect(self._refresh)
         self.nup_combo.currentIndexChanged.connect(self._refresh)
-        self.annots_check.toggled.connect(self._on_annots_toggled)
+        self.copies.valueChanged.connect(self._refresh)   # 用紙の枚数の表示
+        self.content_combo.currentIndexChanged.connect(self._on_content_changed)
         # ページ指定欄に打ち始めたら、そのラジオを選ぶ（打ったのに「すべて」の
         # まま刷ってしまうのを防ぐ）。中身は打つたびに検査して、誤りなら
         # 印刷ボタンを押せなくする。
@@ -306,18 +337,39 @@ class PrintDialog(QDialog):
         self.range_edit.textChanged.connect(self._validate_range)
         for rb in (self.rb_all, self.rb_current, self.rb_range):
             rb.toggled.connect(self._validate_range)
+        # 刷るページが変わったらプレビューも（刷るページだけを送れるように）
+        self.range_edit.textChanged.connect(self._on_pages_changed)
+        for w in (self.rb_all, self.rb_current, self.rb_range):
+            w.toggled.connect(self._on_pages_changed)
+        self.subset_combo.currentIndexChanged.connect(self._on_pages_changed)
+        self.reverse_check.toggled.connect(self._on_pages_changed)
 
         self._printer_name = None
         self._sync_printer_caps()
         if settings:
-            idx = self.duplex_combo.findData(settings.value("print/duplex", "none", str))
-            self.duplex_combo.setCurrentIndex(max(0, idx))
+            # 両面は、前に選んだものが無ければプリンター（ドライバー）の既定に
+            # 従う。会社の複合機は既定が両面のことが多い。
+            duplex = settings.value("print/duplex", "", str) or self._driver_duplex()
+            idx = self.duplex_combo.findData(duplex)
+            if self.duplex_combo.isEnabled():
+                self.duplex_combo.setCurrentIndex(max(0, idx))
             self.collate_check.setChecked(
                 settings.value("print/collate", True, bool))
             idx = self.nup_combo.findData(int(settings.value("print/nup", 1, int)))
             self.nup_combo.setCurrentIndex(max(0, idx))
-            self.annots_check.setChecked(
-                settings.value("print/annots", True, bool))
+            content = settings.value("print/content", "", str)
+            if not content:   # 以前のチェックボックス（注釈も印刷する）から読み替え
+                content = "all" if settings.value("print/annots", True, bool) else "doc"
+            idx = self.content_combo.findData(content)
+            self.content_combo.setCurrentIndex(max(0, idx))
+            ori = settings.value("print/orientation", "auto", str)
+            {"portrait": self.rb_portrait, "landscape": self.rb_landscape}.get(
+                ori, self.rb_auto).setChecked(True)
+            self.gray_check.setChecked(settings.value("print/grayscale", False, bool))
+        self._preview_pos = 0
+        self._preview_pages = self._pages_to_print()
+        if self._current_index in self._preview_pages:
+            self._preview_pos = self._preview_pages.index(self._current_index)
         self._refresh()
 
     def _on_printer_changed(self, _name: str) -> None:
@@ -327,6 +379,48 @@ class PrintDialog(QDialog):
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         super().resizeEvent(event)
         self._preview_timer.start()
+
+    def _driver_duplex(self) -> str:
+        info = QPrinterInfo.printerInfo(self.printer_combo.currentText())
+        if info.isNull():
+            return "none"
+        return {QPrinter.DuplexMode.DuplexLongSide: "long",
+                QPrinter.DuplexMode.DuplexShortSide: "short",
+                QPrinter.DuplexMode.DuplexAuto: "long"}.get(
+                    info.defaultDuplexMode(), "none")
+
+    def printer(self) -> QPrinter:
+        """選んだプリンターの QPrinter（「プロパティ」で変えた詳細設定ごと）。"""
+        return self._printer()
+
+    def _open_printer_properties(self) -> None:
+        """Windows の印刷ダイアログ（詳細設定）を開き、変えた分をこちらにも映す。"""
+        from PySide6.QtPrintSupport import QPrintDialog
+
+        pr = self._printer()
+        pr.setCopyCount(self.copies.value())
+        dlg = QPrintDialog(pr, self)
+        dlg.setWindowTitle("プリンターの詳細設定")
+        if dlg.exec() != QPrintDialog.DialogCode.Accepted:
+            return
+        name = pr.printerName()
+        if name and name != self.printer_combo.currentText():
+            self.printer_combo.blockSignals(True)
+            self.printer_combo.setCurrentText(name)
+            self.printer_combo.blockSignals(False)
+            self._printer_name = name   # 今の QPrinter（設定込み）をそのまま使う
+            self._sync_printer_caps()
+        self.copies.setValue(max(1, pr.copyCount()))
+        idx = self.duplex_combo.findData({
+            QPrinter.DuplexMode.DuplexLongSide: "long",
+            QPrinter.DuplexMode.DuplexShortSide: "short"}.get(pr.duplex(), "none"))
+        if idx >= 0 and self.duplex_combo.isEnabled():
+            self.duplex_combo.setCurrentIndex(idx)
+        size = pr.pageLayout().pageSize()
+        i = self.paper_combo.findText(size.name())
+        if i >= 0:
+            self.paper_combo.setCurrentIndex(i)
+        self._refresh()
 
     def range_error(self) -> str:
         """ページ指定の誤り（空文字なら問題なし）。"""
@@ -345,13 +439,33 @@ class PrintDialog(QDialog):
         err = self.range_error()
         self.print_button.setEnabled(not err)
         self.print_button.setToolTip(err)
-        self.range_edit.setStyleSheet(
-            "border: 2px solid #d64545;" if err and self.range_edit.text().strip()
-            else "")
+        shown = bool(err and self.range_edit.text().strip())
+        self.range_edit.setStyleSheet("border: 2px solid #d64545;" if shown else "")
+        self.range_error_label.setText(err if shown else "")
+        self.range_error_label.setVisible(shown)
 
-    def _on_annots_toggled(self, _on: bool) -> None:
+    def _on_content_changed(self, _i: int) -> None:
         self._release_stripped()
         self._refresh()
+
+    def _pages_to_print(self) -> list[int]:
+        """今の設定で刷るページ（0 始まり・刷る順）。指定が誤っていれば全ページ。"""
+        try:
+            pages = select_pages(self.options(), self._doc.page_count, self._current_index)
+        except ValueError:
+            pages = []
+        return pages or list(range(self._doc.page_count))
+
+    def _on_pages_changed(self, *_args) -> None:
+        pages = self._pages_to_print()
+        cur = self._preview_page()
+        self._preview_pages = pages
+        self._preview_pos = pages.index(cur) if cur in pages else 0
+        self._refresh()
+
+    def _preview_page(self) -> int:
+        pages = getattr(self, "_preview_pages", None) or [self._preview_index]
+        return pages[max(0, min(getattr(self, "_preview_pos", 0), len(pages) - 1))]
 
     # --- プレビューに使う文書（注釈なしのときは複製から描く）------------
     def _release_stripped(self) -> None:
@@ -361,13 +475,14 @@ class PrintDialog(QDialog):
         self._stripped = None
 
     def _preview_doc(self):
-        """プレビュー用の文書。「文書のみ」なら注釈を外した複製を使う。"""
-        if self.annots_check.isChecked():
-            return self._doc
+        """プレビュー用の文書。印刷と同じ複製（印刷しない欄を除き、刷る中身を
+        絞ったもの）を使う。手を入れずに刷れるときは元の文書。"""
         if getattr(self, "_stripped", None) is None:
             try:
-                self._stripped = self._doc.stripped_copy()
+                self._stripped = self._doc.print_copy(self.content_combo.currentData())
             except Exception:  # noqa: BLE001  作れなければ元のまま出す
+                self._stripped = None
+            if self._stripped is None:
                 return self._doc
         return self._stripped
 
@@ -443,11 +558,13 @@ class PrintDialog(QDialog):
             if isinstance(choice, QPageSize):
                 pr.setPageSize(choice)
             elif choice == "auto":
-                pr.setPageSize(QPageSize(QSizeF(nat_w, nat_h), QPageSize.Unit.Point,
-                                         "PDF", QPageSize.SizeMatchPolicy.ExactMatch))
+                size = paper_for_page(nat_w, nat_h)
+                if size is not None:
+                    pr.setPageSize(size)
+            landscape = (nat_w > nat_h if choice == "auto"
+                         else self.rb_landscape.isChecked())
             pr.setPageOrientation(
-                QPageLayout.Orientation.Landscape
-                if self.rb_landscape.isChecked()
+                QPageLayout.Orientation.Landscape if landscape
                 else QPageLayout.Orientation.Portrait)
         except Exception:  # noqa: BLE001  用紙を変えられないプリンターもある
             pass
@@ -480,7 +597,8 @@ class PrintDialog(QDialog):
             "quality": self.quality_combo.currentData(),
             "paper": self.paper_combo.currentData(),
             "nup": self.nup_combo.currentData(),
-            "annots": self.annots_check.isChecked(),
+            "content": self.content_combo.currentData(),
+            "annots": self.content_combo.currentData() == "all",
             "duplex": self.duplex_combo.currentData() if self.duplex_combo.isEnabled() else "none",
             "collate": self.collate_check.isChecked(),
             "subset": self.subset_combo.currentData(),
@@ -500,13 +618,17 @@ class PrintDialog(QDialog):
         self._settings.setValue("print/duplex", self.duplex_combo.currentData())
         self._settings.setValue("print/collate", self.collate_check.isChecked())
         self._settings.setValue("print/nup", self.nup_combo.currentData())
-        self._settings.setValue("print/annots", self.annots_check.isChecked())
+        self._settings.setValue("print/content", self.content_combo.currentData())
+        self._settings.setValue("print/orientation", self.options()["orientation"])
+        self._settings.setValue("print/grayscale", self.gray_check.isChecked())
         self.accept()
 
     # --- プレビュー -------------------------------------------------------
     def _step_preview(self, step: int) -> None:
-        n = self._doc.page_count
-        self._preview_index = max(0, min(self._preview_index + step, n - 1))
+        """刷るページだけを送る（範囲や奇数・偶数を選んでいればそのページだけ）。"""
+        nup = self.nup_combo.currentData() or 1
+        n = len(self._preview_pages)
+        self._preview_pos = max(0, min(self._preview_pos + step * nup, n - 1))
         self._refresh()
 
     @staticmethod
@@ -547,9 +669,10 @@ class PrintDialog(QDialog):
         try:
             from PySide6.QtSvg import QSvgRenderer
 
-            renderer = QSvgRenderer(
-                self._preview_doc().page_svg(index).encode("utf-8"))
-            if renderer.isValid():
+            svg = self._preview_doc().page_svg(index)
+            # 印刷と同じ判断（重ね方を使うページは画像で描く）
+            renderer = QSvgRenderer(svg.encode("utf-8")) if svg_is_safe(svg) else None
+            if renderer is not None and renderer.isValid():
                 box = renderer.viewBoxF()
                 pm = QPixmap(max(1, int(box.width() * zoom)),
                              max(1, int(box.height() * zoom)))
@@ -564,9 +687,18 @@ class PrintDialog(QDialog):
         return self._preview_doc().render_page(index, zoom=zoom)
 
     def _refresh(self) -> None:
-        i = self._preview_index
+        pages = getattr(self, "_preview_pages", None)
+        if not pages:
+            return   # 作りかけ（__init__ の途中）
+        pos = max(0, min(self._preview_pos, len(pages) - 1))
+        i = pages[pos]
         n = self._doc.page_count
-        self.page_pos_label.setText(f"{i + 1} / {n}")
+        nup = self.nup_combo.currentData() or 1
+        sheets = (len(pages) + nup - 1) // nup
+        copies = self.copies.value()
+        total = f"／ 用紙 {sheets * copies} 枚" if copies > 1 else ""
+        self.page_pos_label.setText(
+            f"{pos // nup + 1} / {sheets} 枚目（{i + 1} ページ）{total}")
         try:
             nat_w, nat_h = self._doc.page_pixel_size(i, 1.0)
             pix = self._preview_pixmap(i, 0.5)
@@ -594,10 +726,11 @@ class PrintDialog(QDialog):
         nup = self.nup_combo.currentData() or 1
         if nup > 1:
             # 割り付け: 区画ごとに 1 ページずつ、収まるように縮小して並べる
-            start = (i // nup) * nup
+            start = (pos // nup) * nup
+            sheet = pages[start:start + nup]
             slots = nup_slots(margin_rect, nup, nat_w, nat_h)
             zoom = max(0.12, 0.5 / (nup ** 0.5))
-            for slot, idx in zip(slots, range(start, min(start + nup, n))):
+            for slot, idx in zip(slots, sheet):
                 try:
                     pm = self._preview_pixmap(idx, zoom)
                 except Exception:  # noqa: BLE001
@@ -611,8 +744,9 @@ class PrintDialog(QDialog):
             p.drawRect(margin_rect.adjusted(0, 0, -1, -1))
             p.end()
             self.preview.setPixmap(canvas)
+            first, last = sheet[0] + 1, sheet[-1] + 1
             self.page_pos_label.setText(
-                f"{start + 1}-{min(start + nup, n)} / {n}")
+                f"{start // nup + 1} / {sheets} 枚目（{first}〜{last} ページ）{total}")
             return
 
         rotate = (self.rb_auto.isChecked()
@@ -633,8 +767,8 @@ class PrintDialog(QDialog):
             s = self.scale_spin.value() / 100.0
         tw = eff_w * s * px_per_pt
         th = eff_h * s * px_per_pt
-        x = margin_rect.x() + (margin_rect.width() - tw) / 2
-        y = margin_rect.y() + (margin_rect.height() - th) / 2
+        # 印刷と同じ置き方（用紙の中央。印刷できる範囲に収まるならその中へ）
+        x, y = place_on_paper(QRectF(0, 0, pw, ph), margin_rect, tw, th)
         img = pix.toImage()
         if self.gray_check.isChecked():
             img = img.convertToFormat(img.Format.Format_Grayscale8)

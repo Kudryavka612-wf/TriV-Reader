@@ -238,8 +238,17 @@ def test_edit_existing(app, pv, doc, lbl) -> None:
     texts = [doc.annot_text(0, a.xref) for a in fts]
     check("Ctrl+Enter commits the edit in place", "Hello日本語 world" in texts
           and len(fts) == n0, str(texts))
-    # 全部消して確定 → 注釈ごと消える
+    # テキストツールのまま、押して動かせば移動（編集は開かない）
     tgt = [a for a in fts if doc.annot_text(0, a.xref) == "Hello日本語 world"][0]
+    r0 = fitz.Rect(tgt.rect)
+    drag(app, lbl, QPoint(int(r0.x0 + 6), int((r0.y0 + r0.y1) / 2)),
+         QPoint(int(r0.x0 + 46), int((r0.y0 + r0.y1) / 2) + 30))
+    page, fts = freetexts(doc)
+    tgt = [a for a in fts if doc.annot_text(0, a.xref) == "Hello日本語 world"][0]
+    check("with the text tool, dragging existing text moves it (no editor)",
+          pv._text_editor is None and abs(tgt.rect.x0 - r0.x0 - 40) < 1.5
+          and abs(tgt.rect.y0 - r0.y0 - 30) < 1.5, f"{r0} -> {tgt.rect}")
+    # 全部消して確定 → 注釈ごと消える
     rr = fitz.Rect(tgt.rect)
     click(app, lbl, QPoint(int(rr.x0 + 4), int((rr.y0 + rr.y1) / 2)))
     ed = pv._text_editor

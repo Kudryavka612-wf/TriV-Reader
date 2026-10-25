@@ -276,6 +276,7 @@ class ToolsMixin:
         pv.link_activated.connect(self._on_link_activated)
         pv.link_hovered.connect(self._on_link_hovered)
         pv.snapshot_copied.connect(self._on_snapshot_copied)
+        pv.status_message.connect(lambda m: self.statusBar().showMessage(m, 6000))
 
     # --- リンク ---------------------------------------------------------
     def _on_link_activated(self, link: dict) -> None:

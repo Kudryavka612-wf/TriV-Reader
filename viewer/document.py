@@ -13,7 +13,10 @@ from contextlib import contextmanager
 import fitz  # PyMuPDF
 from PySide6.QtGui import QImage, QPixmap
 
-from . import govform_js
+from . import govform_js, jpfonts
+
+# 埋め込みの無い和文を、中国語の字形でなく Windows の和文フォントで描く
+jpfonts.install()
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -228,6 +231,11 @@ class PdfDocument:
         self._modified: bool = False
         # 表示内容の版。中身が変わるたびに増え、描画キャッシュの鍵に使う。
         self._epoch: int = 0
+        # オブジェクト番号（xref）の版。保存の整理などで番号が付け直されたら
+        # 増える。入力欄・選択中の注釈・注釈一覧は xref を覚えているので、
+        # これが変わったら作り直す（MainWindow._after_renumber）。
+        self.xref_epoch: int = 0
+        self._renumber_listeners: list = []
         # ページ描画のキャッシュ（LRU）。スクロールで画面外に出たページを
         # 戻ったときに描き直さずに済ませる。合計バイト数で上限を決める。
         self._render_cache: "OrderedDict[tuple, QPixmap]" = OrderedDict()
@@ -290,6 +298,49 @@ class PdfDocument:
             self._render_bytes -= (old.width() * old.height()
                                    * max(1, old.depth()) // 8)
 
+    def _save_doc(self, path: str, **kwargs) -> None:
+        """開いている文書を path に保存する。開いている文書の番号は変えない。
+
+        MuPDF の不要オブジェクトの整理（garbage=2 以上）は、保存のついでに
+        開いている文書のオブジェクト番号まで詰め直す。番号は入力欄・選択中の
+        注釈・注釈一覧が覚えているので、以前は保存した後に入れた値が PDF に
+        書き込まれず、黙って消えていた。整理は複製の方でだけ行う。
+        """
+        if self._doc.needs_pass or self._doc.is_encrypted:
+            # パスワード付きの文書は、指定が無ければパスワードを付けたまま保存
+            # する（PyMuPDF の既定は「外す」で、上書き保存しただけで保護が
+            # 外れていた）
+            kwargs.setdefault("encryption", fitz.PDF_ENCRYPT_KEEP)
+        if int(kwargs.get("garbage", 0) or 0) < 2:
+            self._doc.save(path, **kwargs)
+            return
+        if self._doc.needs_pass or self._doc.is_encrypted:
+            # パスワード付きの文書は複製するとパスワードが外れてしまう（解錠後は
+            # is_encrypted が False になるので needs_pass で見る）。直接保存し、
+            # 番号が変わったことを知らせる
+            self._doc.save(path, **kwargs)
+            self._renumbered()
+            return
+        work = fitz.open("pdf", self._doc.tobytes())
+        try:
+            work.save(path, **kwargs)
+        finally:
+            work.close()
+
+    def add_renumber_listener(self, fn) -> None:
+        """オブジェクト番号が付け直されたときに呼ぶ関数を登録する。"""
+        if fn not in self._renumber_listeners:
+            self._renumber_listeners.append(fn)
+
+    def _renumbered(self) -> None:
+        self.xref_epoch += 1
+        self._invalidate_view_caches()
+        for fn in list(self._renumber_listeners):
+            try:
+                fn()
+            except Exception:  # noqa: BLE001  画面側の都合で保存を失敗させない
+                pass
+
     def _save_over_self(self, out_path: str, **kwargs) -> None:
         """開いているファイル自身へ上書きする（安全な順序で置き換える）。
 
@@ -300,7 +351,7 @@ class PdfDocument:
         置き換えが成功してから開き直す。
         """
         tmp = out_path + ".tmp_save"
-        self._doc.save(tmp, **kwargs)
+        self._save_doc(tmp, **kwargs)
         try:
             os.replace(tmp, out_path)
         except OSError:
@@ -309,12 +360,9 @@ class PdfDocument:
             except OSError:
                 pass
             raise
-        # 置き換え後もファイルをロックしないよう、stream で開き直す
-        with open(out_path, "rb") as f:
-            data = f.read()
-        self._doc.close()
-        self._doc = fitz.open(stream=data, filetype="pdf")
-        self._invalidate_view_caches()
+        # 開き直さない。開いている文書は保存した中身と同じで、ファイルも
+        # 掴んでいない（メモリに読んで開いている）。開き直すとオブジェクト
+        # 番号が付け直され、入力欄などが古い番号を指したままになる。
 
     def _finish_annot(self, annot) -> None:
         """注釈の仕上げ。作成者名を入れてから外観を確定する。
@@ -327,7 +375,48 @@ class PdfDocument:
                     annot.set_info(title=self.annot_author)
             except Exception:  # noqa: BLE001
                 pass  # 作成者名は付けられなくても注釈自体は残す
+        self._update_annot(annot)
+
+    def _update_annot(self, annot) -> None:
+        """注釈の外観を作り直す。テキスト注釈は和文を日本語として書き込む。
+
+        MuPDF は言語の指定が無いと簡体中国語として扱い、漢字を中国語フォント
+        （/Song）で書き込む（Acrobat でも中国語の字形になる）。"""
+        freetext = annot.type[1] == "FreeText"
+        if freetext:
+            try:
+                annot.set_language("ja")
+            except Exception:  # noqa: BLE001
+                pass
         annot.update()
+        if freetext:
+            _fs, _tc, fn = self._parse_freetext_da(annot)
+            jpfonts.japanize_ap(self._doc, annot.xref, serif=(fn == "tiro"))
+
+    def _japanize_before_saving(self) -> None:
+        try:
+            self.japanize_all()
+        except Exception:  # noqa: BLE001  直せなくても保存そのものは止めない
+            pass
+
+    def japanize_all(self) -> int:
+        """入力欄・テキスト注釈の外観にある中国語扱いの和文フォントを、日本語の
+        ものに差し替える（以前の版で書き込んだ分も、保存の前に直す）。"""
+        if not self._doc:
+            return 0
+        n = 0
+        kinds = (fitz.PDF_WIDGET_TYPE_TEXT, fitz.PDF_WIDGET_TYPE_COMBOBOX,
+                 fitz.PDF_WIDGET_TYPE_LISTBOX)
+        for page in self._doc:
+            for w in page.widgets() or []:
+                if w.field_type in kinds and jpfonts.japanize_ap(
+                        self._doc, w.xref, serif=jpfonts.is_mincho(w.text_font or "")):
+                    n += 1
+            for a in page.annots(types=(fitz.PDF_ANNOT_FREE_TEXT,)):
+                _fs, _tc, fn = self._parse_freetext_da(a)
+                if jpfonts.japanize_ap(self._doc, a.xref, serif=(fn == "tiro")):
+                    n += 1
+        return n
 
     # --- ライフサイクル -------------------------------------------------
     def open(self, path: str, password: str | None = None) -> None:
@@ -1175,6 +1264,9 @@ class PdfDocument:
             return cached
         COMB = 1 << 24       # 1文字ずつマス目に入れる欄
         MULTILINE = 1 << 12  # 複数行欄
+        READONLY = 1         # 書き換えられない欄
+        from .field_ap import _align
+        rules = self.field_rules()
         page = self._doc.load_page(index)
         out = []
         for w in (page.widgets() or []):
@@ -1205,13 +1297,45 @@ class PdfDocument:
                 # 表示状態(0=表示,1=非表示,2=画面のみ,3=印刷のみ)。画面に出す
                 # かどうかの判定に使う（_PRINT 欄など画面非表示の欄を除外）。
                 "display": int(getattr(w, "field_display", 0) or 0),
+                "align": _align(w),               # 0=左 / 1=中央 / 2=右
+                "readonly": bool(flags & READONLY),
+                # フォームの入力補助（数字だけ・小さいカナを大きく・入力の注意）
+                "rules": rules.get(w.field_name or ""),
             })
         self._fields_cache[index] = out
         return out
 
-    def set_field_value(self, index: int, xref: int, value) -> bool:
-        """xref で欄を特定し値を設定して外観を更新する。成功で True。"""
+    def field_rules(self) -> dict:
+        """欄の名前 → 入力補助（govform_js.field_input_rules）。文書ごとに 1 回だけ読む。"""
+        key = id(self._doc)
+        if getattr(self, "_field_rules_key", None) != key:
+            try:
+                self._field_rules = govform_js.field_input_rules(
+                    self._doc, self.doc_scripts())
+            except Exception:  # noqa: BLE001  読めないフォームは補助なし
+                self._field_rules = {}
+            self._field_rules_key = key
+        return self._field_rules
+
+    def _widget_xref(self, index: int, xref: int, name: str | None) -> int | None:
+        """欄の xref。番号で見つからなければ名前で探し直す（保存などで番号が
+        付け直された後も、入れた値を確実に書き込むため）。"""
+        page = self._doc.load_page(index)
+        by_name = None
+        for w in (page.widgets() or []):
+            if w.xref == xref:
+                return xref
+            if name and by_name is None and w.field_name == name:
+                by_name = w.xref
+        return by_name
+
+    def set_field_value(self, index: int, xref: int, value,
+                        name: str | None = None) -> bool:
+        """xref（無ければ name）で欄を特定し値を設定して外観を更新する。成功で True。"""
         if not self._doc:
+            return False
+        xref = self._widget_xref(index, xref, name)
+        if xref is None:
             return False
         page = self._doc.load_page(index)
         for w in (page.widgets() or []):
@@ -1226,8 +1350,9 @@ class PdfDocument:
                             return False
                     else:
                         w.field_value = "" if value is None else str(value)
-                        self._fit_text_fontsize(w)
-                        w.update()
+                        # 外観（印刷・提出先で見える文字）はこちらで作る。欄に
+                        # 収まらなければ外観の中だけ縮める（/DA は書き換えない）
+                        jpfonts.update_widget(w)
                     self.modified = True
                     return True
                 except Exception:  # noqa: BLE001
@@ -1343,12 +1468,16 @@ class PdfDocument:
             pass
         return display_text
 
-    def commit_govform_combo(self, index: int, xref: int, display_text: str) -> bool:
+    def commit_govform_combo(self, index: int, xref: int, display_text: str,
+                             name: str | None = None) -> bool:
         """コンボ選択時の JS（_PRINT 転写・枝ラベル表示切替）を再現する。
 
         値/表示が実際に変化すれば True を返し modified を立てる。
         """
         if not self._doc:
+            return False
+        xref = self._widget_xref(index, xref, name)
+        if xref is None:
             return False
         export = self.govform_combo_export_value(index, xref, display_text)
         changed = govform_js.run_keystroke(
@@ -1409,37 +1538,6 @@ class PdfDocument:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(text)
         return names
-
-    @staticmethod
-    def _fit_text_fontsize(w) -> None:
-        """1行テキスト欄の文字サイズを枠の幅にも収める（Adobe の自動縮小相当）。
-
-        MuPDF の外観生成は高さ基準でしかサイズを決めないため、長い文字列が
-        枠の右へあふれて描画される。自動サイズ（0）の欄と、指定サイズでは
-        収まらない欄は、実測幅から収まるサイズに詰める。
-        """
-        COMB = 1 << 24
-        MULTILINE = 1 << 12
-        if w.field_type != fitz.PDF_WIDGET_TYPE_TEXT:
-            return
-        flags = int(getattr(w, "field_flags", 0) or 0)
-        if flags & (COMB | MULTILINE):  # コム欄・複数行は MuPDF 側の配置に任せる
-            return
-        text = str(w.field_value or "")
-        if not text:
-            return
-        rect = w.rect
-        avail_w = max(4.0, rect.width - 4)
-        avail_h = max(4.0, rect.height)
-        # 「japan」フォントで実測（ASCII は半角幅・かな漢字は全角幅で測れる）
-        unit = fitz.get_text_length(text, fontname="japan", fontsize=1)
-        cur = float(getattr(w, "text_fontsize", 0) or 0)
-        base = cur if cur > 0 else avail_h * 0.75
-        if unit <= 0:
-            return
-        fit = min(base, avail_w / unit, avail_h * 0.9)
-        if cur == 0 or unit * cur > avail_w:
-            w.text_fontsize = max(4.0, fit)
 
     @staticmethod
     def _find_on(page, xref):
@@ -1591,7 +1689,7 @@ class PdfDocument:
             return None
         if opacity is not None and 0 <= opacity < 1.0:
             annot.set_opacity(opacity)
-        annot.update()
+        self._update_annot(annot)
         self.modified = True
         return annot.xref
 
@@ -2201,11 +2299,12 @@ class PdfDocument:
         """
         if not self._doc:
             raise RuntimeError("ドキュメントが開かれていません")
+        self._japanize_before_saving()
         try:
             if self.path and _same_path(self.path, out_path):
                 self._save_over_self(out_path, garbage=4, deflate=True)
             else:
-                self._doc.save(out_path, garbage=4, deflate=True)
+                self._save_doc(out_path, garbage=4, deflate=True)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(friendly_error(exc, saving=True)) from exc
         self.path = out_path
@@ -2224,7 +2323,8 @@ class PdfDocument:
             raise RuntimeError("ドキュメントが開かれていません")
         if self.path and _same_path(self.path, out_path):
             raise ValueError("開いているファイルとは別名で保存してください")
-        self._doc.save(
+        self._japanize_before_saving()
+        self._save_doc(
             out_path,
             encryption=fitz.PDF_ENCRYPT_AES_256,
             owner_pw=owner_pw or user_pw,
@@ -2240,7 +2340,7 @@ class PdfDocument:
             raise RuntimeError("ドキュメントが開かれていません")
         if self.path and _same_path(self.path, out_path):
             raise ValueError("開いているファイルとは別名で保存してください")
-        self._doc.save(
+        self._save_doc(
             out_path, encryption=fitz.PDF_ENCRYPT_NONE, garbage=3, deflate=True
         )
 
@@ -2257,6 +2357,7 @@ class PdfDocument:
             raise RuntimeError("ドキュメントが開かれていません")
         if self.path and _same_path(self.path, out_path):
             raise ValueError("開いているファイルとは別名で保存してください")
+        self._japanize_before_saving()
         work = fitz.open("pdf", self._doc.tobytes())
         try:
             work.bake(annots=annots, widgets=widgets)
@@ -2601,9 +2702,66 @@ class PdfDocument:
                 self.path = out_path
                 self.modified = False
             else:
-                self._doc.save(out_path, **kwargs)
+                self._save_doc(out_path, **kwargs)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(friendly_error(exc, saving=True)) from exc
+
+    # 印刷する中身（印刷ダイアログの選択肢）
+    PRINT_ALL = "all"        # 文書と注釈
+    PRINT_FILLED = "filled"  # 文書と、書き込んだ文字・スタンプ（ハイライトやペン等は除く）
+    PRINT_DOC = "doc"        # 文書のみ（入力欄に入れた値は残す）
+    PRINT_FIELDS = "fields"  # 入れた値と書き込んだ文字だけ（印刷済みの用紙に刷る）
+
+    _F_HIDDEN, _F_PRINT, _F_NOVIEW = 2, 4, 32
+    # 書き込み（記入）として扱う注釈。ハイライト・ペン・付箋などの「赤入れ」とは分ける
+    _FILLED_TYPES = (fitz.PDF_ANNOT_FREE_TEXT, fitz.PDF_ANNOT_STAMP, fitz.PDF_ANNOT_WIDGET)
+
+    def print_copy(self, content: str = "all") -> "PdfDocument | None":
+        """印刷用の複製を返す。手を入れずにそのまま刷れるなら None。
+
+        - PDF の印刷の指定どおりにする。「印刷しない」欄・注釈（画面用の
+          ボタンや、官公庁フォームで画面だけに出すコンボ）は隠し、「印刷だけ
+          する」もの（_PRINT 欄など。画面には出ない）は出す。以前は画面の
+          見た目のまま刷っていたため、月日が 2 マスの 1 マス目に詰まった。
+        - content で刷る中身を絞る（PRINT_*）。
+        使い終わったら close() すること。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        plan: dict[int, int] = {}   # xref → 印刷用に書き換える /F
+        blank = content == self.PRINT_FIELDS
+        for page in self._doc:
+            for xref, atype, _id in page.annot_xrefs():
+                if atype in (fitz.PDF_ANNOT_LINK, fitz.PDF_ANNOT_POPUP):
+                    continue
+                f = self._doc.xref_get_key(xref, "F")
+                flags = int(f[1]) if f[0] == "int" else 0
+                new = flags
+                if not flags & self._F_PRINT or flags & self._F_HIDDEN:
+                    new |= self._F_HIDDEN          # 印刷しないもの
+                elif flags & self._F_NOVIEW:
+                    new &= ~self._F_NOVIEW         # 印刷だけするもの
+                keep = {
+                    self.PRINT_ALL: True,
+                    self.PRINT_DOC: atype == fitz.PDF_ANNOT_WIDGET,
+                }.get(content, atype in self._FILLED_TYPES)
+                if not keep:
+                    new |= self._F_HIDDEN
+                if new != flags:
+                    plan[xref] = new
+        if not plan and not blank:
+            return None
+        copy = PdfDocument()
+        copy._doc = fitz.open("pdf", self._doc.tobytes())
+        copy.path = self.path
+        for xref, new in plan.items():
+            copy._doc.xref_set_key(xref, "F", str(new))
+        if blank:
+            # 紙面（印刷済みの用紙に既にある部分）は描かず、入れた値と文字だけ
+            for page in copy._doc:
+                for x in page.get_contents():
+                    copy._doc.update_stream(x, b"")
+        return copy
 
     def stripped_copy(self) -> "PdfDocument":
         """注釈（コメント類）を外した使い捨ての複製を返す。
@@ -2739,7 +2897,7 @@ class PdfDocument:
 
         stats = {"images": 0, "recompressed": 0, "skipped": 0, "canceled": False}
         # 開いている文書自体は劣化させたくないので作業用コピーで処理する
-        work = fitz.open("pdf", self._doc.tobytes(garbage=3, deflate=True))
+        work = fitz.open("pdf", self._doc.tobytes(deflate=True))
         try:
             if max_dpi > 0 or grayscale:
                 try:
@@ -2808,7 +2966,7 @@ class PdfDocument:
                         data = f.read()
                     self._doc.close()
                     self._doc = fitz.open(stream=data, filetype="pdf")
-                    self._invalidate_view_caches()  # 別の中身に差し替えた
+                    self._renumbered()   # 別の中身に差し替えた
                     self.path = out_path
                     self.modified = False
                 else:
@@ -2839,7 +2997,7 @@ class PdfDocument:
 
         # 現在の内容（注釈・回転等を反映）を一時PDFへ
         tmp = out_path + ".pre_pdfa"
-        self._doc.save(tmp, garbage=4, deflate=True)
+        self._save_doc(tmp, garbage=4, deflate=True)
         try:
             with pikepdf.open(tmp) as pdf:
                 with open(self.SRGB_ICC, "rb") as f:

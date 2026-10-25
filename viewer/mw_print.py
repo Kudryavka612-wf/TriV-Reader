@@ -37,6 +37,53 @@ def select_pages(opt: dict, total: int, current: int) -> list[int]:
     return pages
 
 
+def print_content(opt: dict) -> str:
+    """刷る中身（PdfDocument.PRINT_*）。古い呼び出しの annots=True/False も読む。"""
+    content = opt.get("content")
+    if content:
+        return content
+    return "all" if opt.get("annots", True) else "doc"
+
+
+def svg_is_safe(svg: str) -> bool:
+    """QSvgRenderer でそのまま描いてよい SVG か。
+
+    ハイライトは「乗算」の重ね方で描かれる（下の文字が透ける）。QSvgRenderer は
+    重ね方（mix-blend-mode）を無視して塗りつぶすので、ハイライトの下の文字が
+    消えた。そういうページは画像として描く。
+    """
+    return "mix-blend-mode" not in svg
+
+
+def paper_for_page(w_pt: float, h_pt: float):
+    """PDF のページに合わせる用紙（縦向きの寸法で、定形に近ければ定形）。"""
+    from PySide6.QtCore import QSizeF
+    from PySide6.QtGui import QPageSize
+
+    if w_pt <= 0 or h_pt <= 0:
+        return None
+    short, long_ = sorted((w_pt, h_pt))
+    # FuzzyMatch: 1pt ずれた A4（596×843 など）も A4 として扱う
+    return QPageSize(QSizeF(short, long_), QPageSize.Unit.Point, "",
+                     QPageSize.SizeMatchPolicy.FuzzyMatch)
+
+
+def place_on_paper(paper, printable, w: float, h: float) -> tuple[float, float]:
+    """幅 w・高さ h の内容を置く左上の位置。
+
+    用紙の中央に置く（Acrobat と同じ。実寸で刷れば印刷済みの用紙の枠と合う）。
+    印刷できる範囲に収まる大きさなら、その中へ最小限ずらす（余白の左右が
+    違うプリンターでも端が欠けない）。
+    """
+    x = paper.left() + (paper.width() - w) / 2
+    y = paper.top() + (paper.height() - h) / 2
+    if w <= printable.width():
+        x = min(max(x, printable.left()), printable.right() - w)
+    if h <= printable.height():
+        y = min(max(y, printable.top()), printable.bottom() - h)
+    return x, y
+
+
 class PrintMixin:
     """印刷ダイアログとプリンタへの描画。MainWindow に混ぜて使う。"""
 
@@ -45,8 +92,6 @@ class PrintMixin:
         if not self.doc.is_open:
             return
         self.page_view.finish_text_edit()   # 打ちかけの文字も刷る
-        from PySide6.QtPrintSupport import QPrinterInfo
-
         from .print_dialog import PrintDialog
 
         dlg = PrintDialog(self.doc, self.page_view.index, self.settings, self)
@@ -54,10 +99,9 @@ class PrintMixin:
             return
         opt = dlg.options()
 
-        # プリンタを構成
-        info = QPrinterInfo.printerInfo(opt["printer"])
-        printer = (QPrinter(info, QPrinter.PrinterMode.HighResolution)
-                   if not info.isNull() else QPrinter(QPrinter.PrinterMode.HighResolution))
+        # プリンタを構成。ダイアログの「プロパティ」で変えたドライバーの設定
+        # （給紙トレイ・用紙の種類など）を持った QPrinter をそのまま使う
+        printer = dlg.printer()
         self._configure_printer(printer, opt)
 
         # 対象ページ
@@ -108,22 +152,31 @@ class PrintMixin:
         auto_paper = opt.get("paper") == "auto"
         nup = max(1, int(opt.get("nup", 1) or 1))   # 1 枚に載せるページ数
 
-        # 「文書のみ」なら注釈を外した複製から描く。入力欄（Widget）は
-        # annots() に出てこないので、フォームに入れた値はそのまま残る。
+        # PDF の印刷の指定（印刷しない欄・印刷だけする欄）と、刷る中身の選択を
+        # 反映した複製から描く。手を入れずに刷れるときは複製を作らない。
         source = self.doc
-        stripped = None
-        if not opt.get("annots", True):
-            try:
-                stripped = self.doc.stripped_copy()
-                source = stripped
-            except Exception:  # noqa: BLE001  作れなければ注釈込みで出す
-                source = self.doc
+        try:
+            copy = self.doc.print_copy(print_content(opt))
+        except Exception:  # noqa: BLE001  作れなければそのまま出す
+            copy = None
+        if copy is not None:
+            source = copy
 
         sheets = [pages[i:i + nup] for i in range(0, len(pages), nup)]
         if auto_paper and sheets:
             self._set_paper_from_page(printer, sheets[0][0])
 
         painter = QPainter(printer)
+        if not painter.isActive():
+            # プリンターが止まっている・ドライバーが応答しない・出力先に書けない等
+            if copy is not None:
+                copy.close()
+            QMessageBox.warning(
+                self, "印刷",
+                f"「{opt.get('printer') or 'プリンター'}」で印刷を始められませんでした。\n"
+                "プリンターの電源・接続と、Windows の「プリンターとスキャナー」で"
+                "エラーが出ていないかを確認してください。")
+            return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         progress = QProgressDialog("印刷を準備中…", "キャンセル", 0, len(sheets), self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -132,18 +185,28 @@ class PrintMixin:
             for n, sheet in enumerate(sheets):
                 progress.setValue(n)
                 if progress.wasCanceled():
+                    # 描いた分も捨てる（end だけだと途中までのジョブが送られる）
+                    printer.abort()
                     painter.end()
-                    self.statusBar().showMessage("印刷をキャンセルしました", 3000)
+                    self.statusBar().showMessage(
+                        "印刷を中止しました（プリンターには送っていません）", 4000)
                     return
                 if n > 0:
                     # 用紙をページごとに変える場合、newPage の前に指定する
                     if auto_paper:
                         self._set_paper_from_page(printer, sheet[0])
                     printer.newPage()
-                # 印刷可能領域はページごとに取り直す（用紙が変わることがある）
-                area = QRectF(printer.pageRect(QPrinter.Unit.DevicePixel))
+                # QPainter の原点は「印刷できる範囲」の左上。pageRect は用紙の
+                # 左上からの位置なので、そのまま使うと余白を 2 回足すことになり、
+                # 紙の上で右下へずれて右端・下端が欠けていた。用紙・範囲は
+                # ページごとに取り直す（用紙が変わることがある）。
+                page_rect = QRectF(printer.pageRect(QPrinter.Unit.DevicePixel))
+                paper_rect = QRectF(printer.paperRect(QPrinter.Unit.DevicePixel))
+                area = QRectF(0, 0, page_rect.width(), page_rect.height())
+                paper = paper_rect.translated(-page_rect.left(), -page_rect.top())
                 if nup == 1:
-                    self._draw_page_in(painter, source, sheet[0], area, opt, res)
+                    self._draw_page_in(painter, source, sheet[0], area, opt, res,
+                                       paper=paper)
                     continue
                 # 割り付け: 区画に分けて、それぞれに収まるよう縮小して並べる
                 w_pt, h_pt = source.page_pixel_size(sheet[0], 1.0)
@@ -154,31 +217,38 @@ class PrintMixin:
         finally:
             if painter.isActive():
                 painter.end()
-            if stripped is not None:
-                stripped.close()
-        self.statusBar().showMessage("印刷ジョブを送信しました", 3000)
+            if copy is not None:
+                copy.close()
+        self.statusBar().showMessage(
+            f"{len(sheets)} 枚分を「{opt.get('printer') or 'プリンター'}」に送りました", 5000)
 
     def _set_paper_from_page(self, printer, index: int) -> None:
         """そのページの実寸を用紙サイズにする（B5 の届出書やはがき向け）。"""
-        from PySide6.QtCore import QSizeF
-        from PySide6.QtGui import QPageSize
+        from PySide6.QtGui import QPageLayout
 
         w_pt, h_pt = self.doc.page_pixel_size(index, 1.0)
-        if w_pt <= 0 or h_pt <= 0:
+        size = paper_for_page(w_pt, h_pt)
+        if size is None:
             return
         try:
-            printer.setPageSize(QPageSize(
-                QSizeF(w_pt, h_pt), QPageSize.Unit.Point, "PDF",
-                QPageSize.SizeMatchPolicy.ExactMatch))
+            printer.setPageSize(size)
+            # 横長のページは「A4 の横向き」として渡す。横長の寸法のまま渡すと
+            # 定形外（ユーザー定義）用紙になり、複合機が手差しを待って止まる
+            printer.setPageOrientation(
+                QPageLayout.Orientation.Landscape if w_pt > h_pt
+                else QPageLayout.Orientation.Portrait)
         except Exception:  # noqa: BLE001  受け付けないプリンターは既定のまま
             pass
 
     def _draw_page_in(self, painter, source, index: int, area, opt: dict,
-                      res: int, fit_only: bool = False) -> None:
-        """1 ページを area（紙面のピクセル座標）に描く。
+                      res: int, fit_only: bool = False, paper=None) -> None:
+        """1 ページを area（印刷できる範囲。描画のピクセル座標）に描く。
 
-        fit_only=True（割り付け）のときは、ページサイズ処理を無視して区画に
-        収まるよう縮小する。区画に対して縦横が食い違うページは 90 度回す。
+        paper は用紙全体（同じ座標）。ページは用紙の中央に置く（実寸で刷ると
+        印刷済みの用紙の枠とぴったり合う）。印刷できる範囲に収まる大きさなら
+        その中へずらす。fit_only=True（割り付け）のときは、ページサイズ処理を
+        無視して区画の中央に収まるよう縮小する。区画に対して縦横が食い違う
+        ページは 90 度回す。
         """
         from PySide6.QtCore import QRectF
 
@@ -215,8 +285,11 @@ class PrintMixin:
             s = opt["custom_scale"]
         tgt_w = eff_w * s
         tgt_h = eff_h * s
-        x = box.left() + (box.width() - tgt_w) / 2
-        y = box.top() + (box.height() - tgt_h) / 2
+        if fit_only or paper is None:
+            x = box.left() + (box.width() - tgt_w) / 2
+            y = box.top() + (box.height() - tgt_h) / 2
+        else:
+            x, y = place_on_paper(paper, box, tgt_w, tgt_h)
         if vector and self._draw_page_vector(
                 painter, source, index, x, y, tgt_w, tgt_h, rotate):
             return
@@ -251,6 +324,8 @@ class PrintMixin:
             from PySide6.QtSvg import QSvgRenderer
 
             svg = source.page_svg(index)
+            if not svg_is_safe(svg):
+                return False
             renderer = QSvgRenderer(svg.encode("utf-8"))
             if not renderer.isValid():
                 return False

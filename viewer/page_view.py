@@ -96,9 +96,36 @@ class _GovFormClickOverlay(QPushButton):
 
 
 class _FormTextArea(QPlainTextEdit):
-    """複数行フォーム欄。フォーカスが外れたら committed を発火する。"""
+    """複数行フォーム欄。フォーカスが外れたら committed を発火する。
+
+    Tab は次の欄へ移る（Acrobat と同じ。以前はタブ文字が入って抜け出せなかった）。
+    欄の文字数の上限（/MaxLen）を守る。
+    """
 
     committed = Signal()
+
+    def __init__(self, parent=None, maxlen: int = 0) -> None:
+        super().__init__(parent)
+        self.setTabChangesFocus(True)
+        self._maxlen = int(maxlen or 0)
+        if self._maxlen:
+            self.textChanged.connect(self._schedule_limit)
+
+    def _schedule_limit(self) -> None:
+        # 入力の処理中に文字を消さない（IME の確定を壊さないよう次の周回で）
+        QTimer.singleShot(0, self._apply_limit)
+
+    def _apply_limit(self) -> None:
+        try:
+            text = self.toPlainText()
+        except RuntimeError:
+            return   # 欄が破棄済み
+        if len(text) <= self._maxlen:
+            return
+        cur = self.textCursor()
+        cur.setPosition(self._maxlen)
+        cur.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        cur.removeSelectedText()
 
     def focusOutEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         super().focusOutEvent(event)
@@ -347,9 +374,11 @@ class _CombLineEdit(QLineEdit):
     もカーソル位置のマスに下線付きで表示する。
     """
 
-    def __init__(self, maxlen: int, parent=None) -> None:
+    def __init__(self, maxlen: int, parent=None, align: int = 0) -> None:
         super().__init__(parent)
         self._cells = max(1, int(maxlen))
+        # 欄の寄せ（/Q）。金額欄は右寄せ（右のマスから詰める）で作られている
+        self._align = align
         self._preedit = ""
         self.setMaxLength(self._cells)
         self.setFrame(False)
@@ -361,10 +390,16 @@ class _CombLineEdit(QLineEdit):
         self._preedit = event.preeditString()
         self.update()
 
+    def _first_cell(self, n: int) -> int:
+        """n 文字を置くときの最初のマス（右寄せなら右に詰める）。"""
+        free = max(0, self._cells - n)
+        return {1: free // 2, 2: free}.get(self._align, 0)
+
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         # ネイティブのヒットテストは字間前提でズレるため、マス単位で決める
         cell = self.width() / self._cells
-        pos = int(event.position().x() / cell + 0.5) if cell > 0 else 0
+        start = self._first_cell(len(self.text()))
+        pos = int(event.position().x() / cell + 0.5) - start if cell > 0 else 0
         self.setCursorPosition(max(0, min(pos, len(self.text()))))
         event.accept()
 
@@ -390,10 +425,11 @@ class _CombLineEdit(QLineEdit):
         disp = text[:cur] + self._preedit + text[cur:]
         fm = p.fontMetrics()
         baseline = (r.height() + fm.ascent() - fm.descent()) / 2
+        start = self._first_cell(len(disp))
 
         # 選択範囲のマスを強調
         if self.hasSelectedText():
-            s = self.selectionStart()
+            s = self.selectionStart() + start
             e = s + len(self.selectedText())
             p.fillRect(QRect(round(s * cell), 1,
                              round((e - s) * cell), r.height() - 2),
@@ -402,16 +438,20 @@ class _CombLineEdit(QLineEdit):
         p.setPen(QColor(0x11, 0x11, 0x11))
         for i, ch in enumerate(disp[:self._cells]):
             w_ch = fm.horizontalAdvance(ch)
-            x = i * cell + (cell - w_ch) / 2
+            x = (start + i) * cell + (cell - w_ch) / 2
             p.drawText(int(x), int(baseline), ch)
             # プリエディット（未確定文字）には下線
             if self._preedit and cur <= i < cur + len(self._preedit):
                 y = min(int(baseline) + 2, r.height() - 3)
                 p.drawLine(int(x), y, int(x + w_ch), y)
 
+        # 入力中の欄だと分かるよう、枠を濃く太くする
+        if self.hasFocus():
+            p.setPen(QPen(QColor(0x1a, 0x73, 0xe8), 2))
+            p.drawRect(r.adjusted(1, 1, -1, -1))
         # カーソル（フォーカス時のみ・マスの左端に描く）
         if self.hasFocus() and not self.hasSelectedText():
-            cpos = min(cur + len(self._preedit), self._cells)
+            cpos = min(start + cur + len(self._preedit), self._cells)
             if cpos < self._cells:
                 cx = round(cpos * cell) + 2
             else:
@@ -419,6 +459,58 @@ class _CombLineEdit(QLineEdit):
             p.setPen(QPen(QColor(0x11, 0x11, 0x11), 1))
             p.drawLine(cx, 3, cx, r.height() - 4)
         p.end()
+
+
+class _FormCheckBox(QCheckBox):
+    """フォームのチェック欄。欄の四角のどこを押しても切り替わる。
+
+    Qt の QCheckBox は左端の小さな印だけが押せる場所で、PDF の四角の真ん中を
+    押しても反応しなかった。チェックの印も四角の中央に描く。
+    """
+
+    def hitButton(self, pos) -> bool:  # noqa: N802 (Qt 命名)
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect()
+        p.fillRect(r, QColor(225, 235, 255))
+        focus = self.hasFocus()
+        p.setPen(QPen(QColor(0x1a, 0x73, 0xe8) if focus else QColor(0x70, 0x96, 0xD8),
+                      2 if focus else 1))
+        p.drawRect(r.adjusted(0, 0, -1, -1))
+        if self.isChecked():
+            side = min(r.width(), r.height()) * 0.7
+            cx, cy = r.center().x(), r.center().y()
+            pen = QPen(QColor(0x11, 0x11, 0x11), max(1.5, side / 7))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            pts = [QPoint(int(cx - side * 0.40), int(cy + side * 0.02)),
+                   QPoint(int(cx - side * 0.10), int(cy + side * 0.32)),
+                   QPoint(int(cx + side * 0.42), int(cy - side * 0.34))]
+            p.drawPolyline(QPolygon(pts))
+        p.end()
+
+
+# 小さいカナ → 大きいカナ（フォームの ReplaceChisaiKana と同じ表）
+_SMALL_KANA = str.maketrans("ｧｨｩｪｫｬｭｮｯァィゥェォャュョッ", "ｱｲｳｴｵﾔﾕﾖﾂアイウエオヤユヨツ")
+
+
+def _clean_input(text: str, rules: dict | None) -> str:
+    """フォームの入力補助どおりに直した文字列（数字だけ・小さいカナを大きく）。"""
+    import unicodedata
+
+    if not rules:
+        return text
+    if rules.get("digits"):
+        # 全角数字は半角にして受け付ける（Acrobat は弾くだけだが、日本語入力の
+        # まま打っても入る方が親切）。数字以外は入れない
+        text = "".join(c for c in unicodedata.normalize("NFKC", text) if "0" <= c <= "9")
+    if rules.get("large_kana"):
+        text = text.translate(_SMALL_KANA)
+    return text
 
 
 class _AutoFitLineEdit(QLineEdit):
@@ -533,6 +625,7 @@ class _PageLabel(QLabel):
         self._stroke: list[QPoint] = []  # ペン用
         self._sel_moving = False
         self._move_started = False   # 押してから一定以上動かして、移動が始まった
+        self._edit_on_release = False  # テキストツールで既存の文字を押した（離せば編集）
         self._markup_press = False   # ハイライト等の上で押した（動かせば文字選択）
         self._markup_boxes: list = []  # ハイライト等のツールで塗られる文字の枠
         self._move_offset = QPoint()
@@ -587,11 +680,20 @@ class _PageLabel(QLabel):
             event.accept()
             return
         if tool == TOOL_TEXT:
-            # テキストツールで既存のテキスト注釈を押したら、新しく作らずに直す
+            # テキストツールで既存のテキスト注釈を押したら、新しく作らない。
+            # そのまま離せば直す（入力欄を開く）、押したまま動かせば移動する
+            # （Acrobat の「テキストを追加」と同じ。選択ツールに持ち替えずに済む）
             xref = self._view.hit_annot(self._index, pos)
             if xref is not None and self._view.is_freetext(self._index, xref):
-                self._view.edit_text_annot(self._index, xref)
+                self._view.set_selection(self._index, xref)
+                self._sel_moving = True
+                self._move_started = False
+                self._edit_on_release = True
+                self._start = pos
+                self._press = pos
+                self._move_offset = QPoint()
                 return
+            self._view.clear_selection()
         if tool == TOOL_NONE:
             # 選択中なら、まずリサイズハンドルの上か判定（文字に付いた注釈は
             # 枠で伸縮するものではないのでハンドルを出さない）
@@ -740,8 +842,13 @@ class _PageLabel(QLabel):
         if self._sel_moving:
             self._sel_moving = False
             end = event.position().toPoint()
+            edit, self._edit_on_release = self._edit_on_release, False
             if self._move_started:
                 self._view.move_selection(self._index, self._start, end)
+            elif edit:   # テキストツールでクリックしただけ → その場で直す
+                xref = self._view.current_annot_ref()
+                if xref is not None:
+                    self._view.edit_text_annot(*xref)
             self._move_started = False
             self._move_offset = QPoint()
             self.update()
@@ -1173,6 +1280,7 @@ class PageView(QScrollArea):
     link_activated = Signal(dict)    # ページ内リンクをクリック（document.links の要素）
     link_hovered = Signal(str)       # リンクの上にいる（行き先の説明。空文字=離れた）
     snapshot_copied = Signal(int, int)  # 範囲を画像としてコピーした (幅px, 高さpx)
+    status_message = Signal(str)     # ステータスバーに出す知らせ（失敗など）
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1275,6 +1383,7 @@ class PageView(QScrollArea):
     def set_document(self, doc: PdfDocument) -> None:
         self.dismiss_resume_offer()
         self._doc = doc
+        doc.add_renumber_listener(self._on_doc_renumbered)
         self._index = 0
         self._zoom = 1.0
         self._gesture_enabled = True   # 右ドラッグのジェスチャーを使うか
@@ -1567,8 +1676,10 @@ class PageView(QScrollArea):
     #: MuPDF が描くのに近いゴシック（どれも全角 1 em なので折り返しが揃う）
     _EDITOR_FAMILIES = {"helv": "Arial", "tiro": "Times New Roman",
                         "cour": "Courier New"}
-    # 「UI」の付く方はかなが詰まる（プロポーショナル）ので使わない
-    _EDITOR_JA = ["Yu Gothic", "Meiryo", "MS Gothic"]
+    # 和文は確定後と同じ MS ゴシック / MS 明朝（jpfonts が外観に書き込む字形）。
+    # 「UI」「P」の付く方はかなが詰まる（プロポーショナル）ので使わない
+    _EDITOR_JA = {"tiro": ["MS Mincho", "Yu Mincho"],
+                  "default": ["MS Gothic", "Yu Gothic", "Meiryo"]}
 
     def _begin_text_edit(self, index: int, at: tuple, *, click: bool = False,
                          box_w: float | None = None, min_h: float = 0.0) -> None:
@@ -1618,9 +1729,43 @@ class PageView(QScrollArea):
         self._begin_text_edit_existing(index, xref)
 
     def finish_text_edit(self) -> None:
-        """入力中の文字があれば確定させる（保存・印刷・タブを閉じる前に呼ぶ）。"""
+        """入力中の文字があれば確定させる（保存・印刷・タブを閉じる前に呼ぶ）。
+
+        テキスト注釈の入力欄と、カーソルがあるフォームの入力欄の両方。フォームの
+        欄は離れたときに書き込むので、カーソルを置いたまま Ctrl+S すると（上書き
+        の確認を切っていると）その欄だけ保存から漏れていた。
+        """
         if self._text_editor is not None:
             self._text_editor._finish()
+        self.commit_focused_field()
+
+    def commit_focused_field(self) -> None:
+        """カーソルがあるフォームの入力欄の値を書き込む（入力は続けられる）。"""
+        from PySide6.QtWidgets import QApplication
+
+        w = QApplication.focusWidget()
+        overlays = set(self._form_overlays)
+        while w is not None and w not in overlays:
+            w = w.parentWidget()
+        if isinstance(w, QLineEdit):
+            w.editingFinished.emit()
+        elif isinstance(w, _FormTextArea):
+            w.committed.emit()
+
+    def _on_doc_renumbered(self) -> None:
+        """文書のオブジェクト番号が付け直された（パスワード付きの保存など）。
+
+        入力欄・選択中の注釈は古い番号を覚えているので作り直す。入力欄の
+        処理の途中で呼ばれることもあるので、次の周回で行う。
+        """
+        def redo():
+            if not self._doc or not self._doc.is_open:
+                return
+            self.clear_selection()
+            if self._form_mode:
+                self._build_form_overlays()
+            self._after_annot(self._index)   # 注釈一覧などを読み直させる
+        QTimer.singleShot(0, redo)
 
     def _open_text_editor(self, index: int, origin: tuple, *, box_w=None,
                           min_h: float = 0.0, text: str = "", xref=None,
@@ -1660,7 +1805,7 @@ class PageView(QScrollArea):
         px = max(4.0, self.text_size * z)
         f = QFont(ed.font())
         f.setFamilies([self._EDITOR_FAMILIES.get(self.text_font, "Arial"),
-                       *self._EDITOR_JA])
+                       *self._EDITOR_JA.get(self.text_font, self._EDITOR_JA["default"])])
         # 端数まで合わせる（整数 px に丸めると 1 行で数 px ずれ、確定後の方が
         # 長く見える）。ヒンティングも切って MuPDF の字幅に寄せる。
         f.setPointSizeF(px * 72.0 / max(1, ed.logicalDpiY()))
@@ -2278,7 +2423,10 @@ class PageView(QScrollArea):
                     pass
         if self._form_mode:
             # 旧位置の overlay を即座に消し、ズームが落ち着いてから1回だけ
-            # 作り直す（毎ノッチ 270個を再生成して固まるのを防ぐ）。
+            # 作り直す（毎ノッチ 270個を再生成して固まるのを防ぐ）。入力中の
+            # 欄は控えておき、作り直したらそこへカーソルを戻す（以前は打った
+            # 文字の続きがどこにも入らず消えていた）。
+            self._remember_focused_field()
             self._clear_form_overlays()
             self._overlay_rebuild_timer.start()
         self.zoom_changed.emit(self._zoom)
@@ -2348,6 +2496,30 @@ class PageView(QScrollArea):
             self._rendered.clear()
             self._render_visible()
 
+    def _remember_focused_field(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        w = QApplication.focusWidget()
+        while w is not None and w not in self._form_overlays:
+            w = w.parentWidget()
+        if w is None:
+            return
+        pos = w.cursorPosition() if isinstance(w, QLineEdit) else None
+        self._refocus = (w.property("trv_page"), w.property("trv_field"), pos)
+
+    def _restore_focused_field(self) -> None:
+        target = getattr(self, "_refocus", None)
+        self._refocus = None
+        if not target:
+            return
+        page, name, pos = target
+        for ctl in self._form_overlays:
+            if ctl.property("trv_page") == page and ctl.property("trv_field") == name:
+                ctl.setFocus()
+                if pos is not None and isinstance(ctl, QLineEdit):
+                    ctl.setCursorPosition(min(pos, len(ctl.text())))
+                return
+
     def _clear_form_overlays(self) -> None:
         for w in self._form_overlays:
             w.setParent(None)
@@ -2355,11 +2527,14 @@ class PageView(QScrollArea):
         self._form_overlays.clear()
 
     def _build_form_overlays(self) -> None:
+        # 作り直しで入力中の欄が消えても、作り直した欄へカーソルを戻す
+        self._remember_focused_field()
         self._clear_form_overlays()
         if not self._form_mode or not self._doc or not self._doc.is_open:
             return
         for index in range(min(self._doc.page_count, len(self._labels))):
             self._build_page_overlays(index)
+        self._restore_focused_field()
 
     def _build_page_overlays(self, index: int) -> None:
         """指定ページの overlay を作って self._form_overlays に足す。
@@ -2371,6 +2546,10 @@ class PageView(QScrollArea):
             fields = self._doc.page_fields(index)
         except Exception:  # noqa: BLE001
             fields = []
+        # 選択欄（コンボ）と同じ位置に重なる文字欄は作らない。フォームが
+        # 「押されたら本物の選択欄へ渡す」ための見せかけの欄で、上に被さると
+        # 選択欄が押せなかった（都道府県）。
+        combo_rects = [f["rect"] for f in fields if f.get("kind") in ("combo", "list")]
         for field in fields:
             # 画面に出ない欄（PDF の Hidden=1 / 印刷のみ=3）は編集オーバー
             # レイを作らない。官公庁フォームの相棒 _PRINT 欄（印刷のみ）や
@@ -2379,6 +2558,12 @@ class PageView(QScrollArea):
             # （都道府県コンボのように稀に Hidden 指定でも操作が要る欄がある）。
             if (int(field.get("display", 0)) in (1, 3)
                     and field.get("kind") not in ("combo", "list")):
+                continue
+            rules = field.get("rules") or {}
+            if field.get("kind") not in ("combo", "list") and (
+                    rules.get("focus_to")
+                    or any(abs(r.x0 - field["rect"].x0) < 1 and abs(r.y0 - field["rect"].y0) < 1
+                           and abs(r.x1 - field["rect"].x1) < 1 for r in combo_rects)):
                 continue
             ctl = self._make_form_control(index, field, label)
             if ctl is not None:
@@ -2403,11 +2588,11 @@ class PageView(QScrollArea):
                 lambda checked=False, i=index, r=field["rect"]:
                 self._click_govform_cell(i, r))
         elif kind == "checkbox":
-            ctl = QCheckBox(label)
+            ctl = _FormCheckBox(label)
             checked = str(value) not in ("", "Off", "/Off", "No", "false", "False", "0")
             ctl.setChecked(checked)
             ctl.toggled.connect(
-                lambda on, i=index, x=xref: self._commit_field(i, x, on))
+                lambda on, i=index, x=xref, n=field["name"]: self._commit_field(i, x, on, n))
         elif kind in ("combo", "list"):
             ctl = _FormComboBox(label)
             ctl.setEditable(kind == "combo")
@@ -2416,27 +2601,33 @@ class PageView(QScrollArea):
                 ctl.addItem(str(value))
             ctl.setCurrentText(str(value))
             ctl.currentTextChanged.connect(
-                lambda text, i=index, x=xref: self._commit_combo(i, x, text))
+                lambda text, i=index, x=xref, n=field["name"]:
+                self._commit_combo(i, x, text, n))
         elif field.get("multiline"):  # 複数行のテキスト欄
-            ctl = _FormTextArea(label)
+            ctl = _FormTextArea(label, maxlen=field.get("maxlen") or 0)
             ctl.setPlainText(str(value))
             ctl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             ctl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             ctl.committed.connect(
-                lambda i=index, x=xref, c=ctl: self._commit_field(
-                    i, x, c.toPlainText()))
+                lambda i=index, x=xref, c=ctl, n=field["name"]: self._commit_field(
+                    i, x, c.toPlainText(), n))
         else:  # text / その他 → テキスト入力（radio は上の govform 分岐かここに来る）
             if field.get("comb") and field.get("maxlen"):
                 # コム欄: 1文字1マス。全角/半角が混ざってもマス中央に描画する
-                ctl = _CombLineEdit(field["maxlen"], label)
+                ctl = _CombLineEdit(field["maxlen"], label, align=field.get("align", 0))
             else:
                 ctl = _AutoFitLineEdit(label)
                 if field.get("maxlen"):
                     ctl.setMaxLength(field["maxlen"])
             ctl.setText(str(value))
             ctl.editingFinished.connect(
-                lambda i=index, x=xref, c=ctl: self._commit_field(i, x, c.text()))
+                lambda i=index, x=xref, c=ctl, n=field["name"]:
+                self._commit_field(i, x, c.text(), n))
         ctl.setGeometry(round(x0), round(y0), w, h)
+        # どの欄か（ズームで作り直したあと、入力中の欄へカーソルを戻すため）
+        ctl.setProperty("trv_field", field["name"])
+        ctl.setProperty("trv_page", index)
+        self._apply_field_rules(ctl, field)
 
         if isinstance(ctl, _GovFormClickOverlay):
             # クリック領域のみ。PDF 側の見た目を透かすため文字サイズ調整や
@@ -2484,6 +2675,9 @@ class PageView(QScrollArea):
                 "QLineEdit, QPlainTextEdit {"
                 " background: #e1ebff;"
                 " border: 1px solid #7096d8; padding: 0px 2px; color: #111; }"
+                # 入力中の欄は、ほかの青い欄と見分けがつくようにする
+                "QLineEdit:focus, QPlainTextEdit:focus {"
+                " background: #fffbe6; border: 2px solid #1a73e8; }"
                 "QCheckBox { background: #e1ebff; }")
             # 自動サイズの1行欄: 入力に応じて縮小し、枠からはみ出さない（Adobe同等）。
             # IME変換中（composing）はフォントを変更しない（変換内容の消失を防ぐ）。
@@ -2506,19 +2700,62 @@ class PageView(QScrollArea):
         ctl.show()
         return ctl
 
-    def _commit_field(self, index, xref, value) -> None:
-        if self._doc and self._doc.set_field_value(index, xref, value):
-            self.form_changed.emit()
+    def _apply_field_rules(self, ctl, field) -> None:
+        """フォームの入力補助と、書き換え禁止の欄を overlay に反映する。"""
+        if field.get("readonly"):
+            if isinstance(ctl, (QLineEdit, QPlainTextEdit)):
+                ctl.setReadOnly(True)
+            elif not isinstance(ctl, _GovFormClickOverlay):
+                ctl.setEnabled(False)
+        rules = field.get("rules") or {}
+        hint = rules.get("hint")
+        if hint:
+            # 入力の注意（Acrobat ではフォームが吹き出しで出す）。マウスを
+            # 載せたときと、欄に入ったときのステータスバーに出す
+            ctl.setToolTip(hint)
+            ctl.setProperty("trv_hint", hint)
+            ctl.installEventFilter(self)
+        if isinstance(ctl, QLineEdit) and (rules.get("digits") or rules.get("large_kana")):
+            def fix(_text="", c=ctl, r=rules):
+                QTimer.singleShot(0, lambda: self._clean_field_text(c, r))
+            ctl.textEdited.connect(fix)
 
-    def _commit_combo(self, index, xref, text) -> None:
+    @staticmethod
+    def _clean_field_text(ctl, rules) -> None:
+        """入力補助に合わない文字を直す（全角数字→半角・数字以外は入れない等）。"""
+        try:
+            if getattr(ctl, "composing", False):
+                return   # IME の変換中は触らない（確定後にもう一度来る）
+            text = ctl.text()
+        except RuntimeError:
+            return   # 欄が破棄済み
+        clean = _clean_input(text, rules)
+        if clean == text:
+            return
+        pos = len(_clean_input(text[:ctl.cursorPosition()], rules))
+        ctl.setText(clean)
+        ctl.setCursorPosition(min(pos, len(clean)))
+
+    def _commit_field(self, index, xref, value, name=None) -> None:
+        if not self._doc:
+            return
+        # 番号（xref）が保存などで付け直されていても、欄の名前で探して書き込む
+        if self._doc.set_field_value(index, xref, value, name=name):
+            self.form_changed.emit()
+        else:
+            # 黙って捨てない（以前は保存後の入力がこうして消えていた）
+            self.status_message.emit(
+                f"入力欄「{name or xref}」に値を書き込めませんでした")
+
+    def _commit_combo(self, index, xref, text, name=None) -> None:
         """コンボ選択: 値を確定し、官公庁フォームなら JS 連動（_PRINT 転写・
         枝ラベル表示切替）も再現してからページを再描画する。"""
         if not self._doc:
             return
-        committed = self._doc.set_field_value(index, xref, text)
+        committed = self._doc.set_field_value(index, xref, text, name=name)
         js_changed = False
         if self._doc.is_govform_js_eligible():
-            js_changed = self._doc.commit_govform_combo(index, xref, text)
+            js_changed = self._doc.commit_govform_combo(index, xref, text, name=name)
         if committed or js_changed:
             self.form_changed.emit()
         if js_changed:
@@ -2626,6 +2863,11 @@ class PageView(QScrollArea):
     AUTO_DIVISOR = 8     # 大きいほどゆっくり
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt 命名)
+        if event.type() == QEvent.Type.FocusIn and obj is not self.viewport():
+            hint = obj.property("trv_hint") if hasattr(obj, "property") else None
+            if hint:
+                self.status_message.emit(str(hint).replace("\n", " "))
+            return False
         if obj is self.viewport():
             et = event.type()
             # 押下・ダブルクリックの両方を拾う（連続中クリックの取りこぼし対策）

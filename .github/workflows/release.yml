@@ -70,6 +70,8 @@ jobs:
           python print_pages_test.py
           python compress_cache_test.py
           python text_edit_test.py
+          python jp_font_test.py
+          python acrobat_parity_test.py
 
       - name: ビルド（exe 化）
         run: python build_exe.py

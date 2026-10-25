@@ -158,7 +158,7 @@ def main() -> int:  # noqa: C901
         pm = dlg.preview.pixmap()
         return pm.height() / max(1, pm.width())
 
-    dlg._preview_index = 2                     # はがき のページ
+    dlg._preview_pos = 2                       # はがき のページ（刷る順で 3 番目）
     dlg.paper_combo.setCurrentIndex(0)         # プリンター既定（A4 想定）
     dlg._refresh()
     r_default = preview_ratio()

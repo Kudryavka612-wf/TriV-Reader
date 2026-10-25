@@ -479,11 +479,12 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         # フォント（テキスト注釈用）。リボンへ直接配置するためここでは作るだけ
         # （ツールバー経由で移設すると QWidgetAction の所有問題があるため）。
         self.text_font_combo = QComboBox()
-        for key, label in (("helv", "ゴシック(標準)"), ("tiro", "明朝(Times)"),
+        for key, label in (("helv", "ゴシック(標準)"), ("tiro", "明朝"),
                            ("cour", "等幅(Courier)")):
             self.text_font_combo.addItem(label, key)
         self.text_font_combo.setToolTip(
-            "テキスト注釈のフォント（英数字に適用。日本語は標準フォントで描画）")
+            "テキスト注釈のフォント（日本語はゴシック＝MS ゴシック、明朝＝MS 明朝。"
+            "英数字は Helvetica / Times / Courier）")
 
         # リボンでは「太さ」「不透明度」などのラベルを別に置かず、値の前に
         # 入れて幅を節約する（ツールチップに説明がある）。
@@ -2497,6 +2498,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             if not isinstance(t, DocTab):
                 continue
             doc = t.doc
+            t.page_view.commit_focused_field()   # 打っている途中の欄の値も入れる
             if not (doc.is_open and doc.modified and doc.path):
                 continue
             try:
