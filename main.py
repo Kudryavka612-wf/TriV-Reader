@@ -8,6 +8,71 @@ import getpass
 import os
 import sys
 
+
+def _selftest(out_path: str) -> None:
+    """配布用 exe がそのまま動くかを確かめて、結果を out_path に書く。
+
+    CI がビルドの後に `TriVReader.exe --selftest 結果.txt` で走らせる。凍結した
+    exe でしか起きない失敗（同梱漏れ・依存ライブラリの版の違い）は、ソースの
+    テストでは見つからない（v1.8.0 は起動直後に落ちた）。読み込みもここで
+    行うので、読み込みで落ちても止まる画面を出さずに結果を書いて終わる。
+    """
+    import tempfile
+    import traceback
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    os.environ.setdefault("TRIVREADER_SETTINGS_INI", "throwaway")
+    lines, code = [], 1
+    try:
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QColor, QImage, QPainter
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication([sys.argv[0]])
+        import fitz
+
+        from viewer import svg_print
+        from viewer.main_window import MainWindow
+        lines.append(f"PyMuPDF {fitz.VersionBind}")
+
+        path = os.path.join(tempfile.mkdtemp(prefix="trv_selftest_"), "selftest.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 100), "TriV-Reader 日本語の確認", fontsize=20,
+                                   fontname="japan")
+        doc.save(path)
+        doc.close()
+
+        w = MainWindow()
+        w.open_path(path)
+        app.processEvents()
+        img = w.doc.render_page_image(0, zoom=1.0)
+        lines.append(f"render {img.width()}x{img.height()}")
+        page = w.doc._doc.load_page(0)
+        canvas = QImage(200, 280, QImage.Format.Format_RGB888)
+        canvas.fill(QColor("white"))
+        p = QPainter(canvas)
+        ok = svg_print.draw_svg(p, page.get_svg_image(text_as_path=True),
+                                QRectF(0, 0, 200, 280))
+        p.end()
+        lines.append(f"vector print path {'ok' if ok else 'fell back'}")
+        from py_mini_racer import MiniRacer
+        lines.append(f"V8 {MiniRacer().eval('6 * 7')}")
+        w.doc.modified = False
+        w._force_quit = True
+        w.close()
+        app.processEvents()
+        lines.append("OK")
+        code = 0
+    except BaseException:  # noqa: BLE001  何で落ちても結果を書いて終わる
+        lines.append(traceback.format_exc())
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os._exit(code)
+
+
+if __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[1] == "--selftest":
+    _selftest(sys.argv[2])
+
 from PySide6.QtCore import QLibraryInfo, Qt, QTranslator
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket

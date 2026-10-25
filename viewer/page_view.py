@@ -2843,8 +2843,8 @@ class PageView(QScrollArea):
             def fix(_text="", c=ctl, r=rules):
                 QTimer.singleShot(0, lambda: self._clean_field_text(c, r))
             ctl.textEdited.connect(fix)
-        if field.get("required"):
-            # 入力の誤りの印は保存した PDF にも残る。知らせの文は開いている間だけ
+        if self._doc.field_marks.get(field["name"]):
+            # 入力の誤りの印（作り直しても残す。PDF には書かない）
             self._set_overlay_error(ctl, True, self._field_errors.get(
                 (ctl.property("trv_page"), field["name"])))
 

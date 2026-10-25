@@ -144,7 +144,10 @@ for label, text, ok, saved in results:
     print(f"{'PASS' if ok and saved == text else 'FAIL'} {label}: 欄={text!r} 書き込み={saved!r}",
           flush=True)
 ok = bool(results) and all(r[2] and r[3] == r[1] for r in results)
-# 入力したファイルは保存しないで閉じる（os._exit で抜けると終了時に落ちることがある）
+# 入力したファイルは保存しないで閉じる（os._exit で抜けると終了時に落ちることがある）。
+# カーソルが欄に残っていると閉じるときに書き込まれ「保存しますか」で止まるので先に
+w.page_view.finish_text_edit()
+pump(0.2)
 w.doc.modified = False
 w._force_quit = True
 w.close()

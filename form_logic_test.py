@@ -4,6 +4,7 @@
   途中のページから作っても Tab はページ順に回る
 - 欄が数百あるページでも、欄の読み込みが欄数の二乗にならない
 - 文字を全部消した欄が、消えたまま保存される（以前は消した文字が残った）
+- 欄を押しただけ（値はそのまま）では「保存されていない変更」にならない
 - フォームの JS が切り替える「入力できない欄」: 公金受取口座の利用で「2」を
   選ぶまで口座欄は入力も〇の選択もできない。「1」に変えると口座欄を消して
   入力できなくする。口座を入れたまま空欄にすると、警告して「2」に戻す
@@ -118,6 +119,21 @@ def test_open_and_tab(app, w) -> None:
         cur = nxt
     check("Tab goes through the fields in page order", pages == sorted(pages)
           and len(pages) == len(foc), f"({len(pages)}/{len(foc)})")
+
+
+def test_click_only_is_not_a_change(app, w) -> None:
+    """欄を押しただけ（何も変えずに）では「保存されていない変更」にならない。"""
+    pv = w.page_view
+    w.doc.modified = False
+    name = next(c for c in pv._form_overlays if c.property("trv_field") == "FRM6010-01-013")
+    pv.ensureWidgetVisible(name)
+    name.setFocus()
+    pump(app, 0.05)
+    pv.finish_text_edit()          # 保存・タブを閉じる前と同じ
+    key(name, Qt.Key.Key_Tab)
+    pump(app, 0.3)
+    check("clicking into a field and leaving it unchanged is not an unsaved change",
+          not w.doc.modified)
 
 
 def test_clear_value(root) -> None:
@@ -427,6 +443,7 @@ def main() -> int:
         test_fast_widgets()
         test_clear_value(root)
         test_open_and_tab(app, w)
+        test_click_only_is_not_a_change(app, w)
         test_readonly_by_js(app, w)
         test_checks(app, w)
         test_clear_form(app, w)

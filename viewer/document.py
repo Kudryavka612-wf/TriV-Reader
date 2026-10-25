@@ -247,6 +247,8 @@ class PdfDocument:
         self._doc_scripts_cache: dict[str, str] | None = None
         # 直前のコンボ選択でフォームの JS が変えた欄（画面の入力欄に反映する）
         self.last_form_effects = None
+        # 欄の名前 → フォームの入力チェックの誤りの印（画面だけ。PDF には書かない）
+        self.field_marks: dict[str, bool] = {}
         # 文字選択用のレイアウト。ドラッグ中はマウスを動かすたびに参照される
         # ので、毎回 rawdict を解析すると重い。ページをまたぐ選択でも効くよう
         # 数ページ分を憶えておく。
@@ -436,6 +438,7 @@ class PdfDocument:
         self.modified = False
         self._authenticated = not self._doc.needs_pass
         self._doc_scripts_cache = None
+        self.field_marks = {}
         self._undo.clear()   # 別ファイルを開いたら注釈 Undo 履歴は無効
         self._redo.clear()
         # 保持する doc には「正しいパスワードでのみ」authenticate する。
@@ -1303,7 +1306,6 @@ class PdfDocument:
                 "display": int(getattr(w, "field_display", 0) or 0),
                 "align": _align(w),               # 0=左 / 1=中央 / 2=右
                 "readonly": bool(flags & READONLY),
-                "required": bool(flags & 2),   # 誤りの印（フォームの JS が立てる）
                 "password": bool(is_text and (flags & PASSWORD)),
                 "label": getattr(w, "field_label", None) or "",   # /TU（欄の説明）
                 # フォームの入力補助（数字だけ・小さいカナを大きく・入力の注意）
@@ -1353,6 +1355,12 @@ class PdfDocument:
         w = fastwidgets.widget(page, xref)
         if w is None:
             return False
+        if (w.field_type != fitz.PDF_WIDGET_TYPE_CHECKBOX
+                and str(w.field_value or "") == ("" if value is None else str(value))):
+            # 変わっていない。保存・タブを閉じる前にカーソルのある欄を書き込むので、
+            # ここで「変更あり」にすると、欄を押しただけで閉じるときに「保存
+            # しますか」と聞かれていた
+            return True
         try:
             if w.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
                 # field_value=True は、ON 状態名が非ASCII（日本語を
@@ -1494,19 +1502,20 @@ class PdfDocument:
         self.last_form_effects = effects
         scripts = self.doc_scripts()
         changed = govform_js.run_keystroke(
-            self._doc, index, xref, scripts, export, effects=effects)
+            self._doc, index, xref, scripts, export, effects=effects,
+            marks=self.field_marks)
         # 選んだら次の欄へ移る＝フォーカスを外したときの処理（例: 口座情報が
         # あるのに空欄を選んだら「2」に戻す）もここで走らせる
         own = name or govform_js._field_name(self._doc, xref)
         if govform_js.run_blur(self._doc, index, xref, scripts, effects=effects,
-                               checks=True):
+                               checks=True, marks=self.field_marks):
             changed = True
             if own in effects.values:
                 # 欄自身の値が戻されたら、印刷用の欄・有効/無効もその値に合わせる
                 govform_js.run_keystroke(
                     self._doc, index, xref, scripts,
                     self.govform_combo_export_value(index, xref, effects.values[own]),
-                    effects=effects)
+                    effects=effects, marks=self.field_marks)
         if changed:
             self.modified = True
         return changed
@@ -1521,6 +1530,7 @@ class PdfDocument:
         if not self._doc:
             return 0
         self._push_doc_undo("フォームのクリア", None)
+        self.field_marks.clear()
         init = govform_js.initial_field_states(self.doc_scripts())
         n = 0
         for page in self._doc:
@@ -1591,7 +1601,8 @@ class PdfDocument:
         self.last_form_effects = effects
         scripts = self.doc_scripts()
         changed = checks and govform_js.run_blur(self._doc, index, xref, scripts,
-                                                 effects=effects, checks=True)
+                                                 effects=effects, checks=True,
+                                                 marks=self.field_marks)
         # 年は「05」のように 2 桁にそろえる。フォームの JS は元号を選ぶ前だけ
         # 0 を足す作りで、選んだ後に「5」と入れると左のマスに「5」だけが刷られ
         # た（欄の注意書きは「数値2桁です」）。ここでは元号に関係なくそろえる

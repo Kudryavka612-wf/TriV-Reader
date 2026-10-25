@@ -78,6 +78,23 @@ jobs:
       - name: ビルド（exe 化）
         run: python build_exe.py
 
+      - name: できた exe が起動するか確認（落ちる exe を配らない）
+        # ソースのテストが通っても、凍結した exe でだけ落ちることがある（同梱漏れ・
+        # 依存の版。v1.8.0 は起動直後に落ちた）。exe 自身に読み込み・表示・ベクター
+        # 印刷の描画・V8 を試させ、結果のファイルで判断する。エラー画面で止まったら
+        # 時間切れで落とす。
+        run: |
+          $exe = Join-Path $env:USERPROFILE "TriVReader_dist\dist\TriVReader\TriVReader.exe"
+          $out = Join-Path $env:RUNNER_TEMP "selftest.txt"
+          $p = Start-Process -FilePath $exe -ArgumentList "--selftest", "`"$out`"" -PassThru
+          if (-not $p.WaitForExit(180000)) {
+            $p.Kill()
+            Write-Error "exe が 3 分以内に終わらない（起動時のエラー画面で止まっている）"
+            exit 1
+          }
+          if (Test-Path $out) { Get-Content $out -Encoding UTF8 }
+          if ($p.ExitCode -ne 0) { Write-Error "exe の起動確認に失敗（終了コード $($p.ExitCode)）"; exit 1 }
+
       - name: リリースノートを用意（注釈付きタグの本文を使う）
         # 日本語が化けないよう、git の出力を PowerShell に通さず bash で
         # そのままファイルへ書く（Windows ランナーのコンソールは UTF-8 では

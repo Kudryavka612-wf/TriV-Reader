@@ -596,7 +596,7 @@ def apply_readonly(doc: "fitz.Document", xref: int, readonly: bool) -> bool:
 
 def run_blur(doc: "fitz.Document", page_index: int, widget_xref: int,
              doc_scripts: dict[str, str], effects: "FieldEffects | None" = None,
-             checks: bool = False) -> bool:
+             checks: bool = False, marks: dict | None = None) -> bool:
     """フォーカスを外したときのアクション（/AA/Bl）を走らせる。
 
     入力欄の有効/無効や値を変えるもの（例: 口座情報があるのに空欄を選んだら
@@ -609,7 +609,7 @@ def run_blur(doc: "fitz.Document", page_index: int, widget_xref: int,
             return False
         return _run_action_impl(doc, page_index, widget_xref, doc_scripts,
                                 entry_script, change_value=None,
-                                full=True, effects=effects)
+                                full=True, effects=effects, marks=marks)
     except Exception:  # noqa: BLE001
         return False
 
@@ -817,7 +817,8 @@ def run_click(doc: "fitz.Document", page_index: int, widget_xref: int,
 
 def run_keystroke(doc: "fitz.Document", page_index: int, widget_xref: int,
                   doc_scripts: dict[str, str], change_value: str,
-                  effects: "FieldEffects | None" = None) -> bool:
+                  effects: "FieldEffects | None" = None,
+                  marks: dict | None = None) -> bool:
     """コンボ選択時の Keystroke(/AA/K)を実行し、値/表示の変化を PDF へ反映する。
 
     change_value は選択されたエクスポート値（event.changeEx 相当）。
@@ -834,7 +835,7 @@ def run_keystroke(doc: "fitz.Document", page_index: int, widget_xref: int,
             try:
                 return _run_action_impl(doc, page_index, widget_xref, doc_scripts,
                                         entry_script, change_value=change_value,
-                                        full=True, effects=effects)
+                                        full=True, effects=effects, marks=marks)
             except ImportError:
                 pass
         native = _native_keystroke(doc, page_index, widget_xref, doc_scripts,
@@ -982,7 +983,8 @@ def _native_keystroke(doc: "fitz.Document", page_index: int, widget_xref: int,
 def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
                      doc_scripts: dict[str, str], entry_script: str,
                      change_value, full: bool = False,
-                     effects: "FieldEffects | None" = None) -> bool:
+                     effects: "FieldEffects | None" = None,
+                     marks: dict | None = None) -> bool:
     from py_mini_racer import MiniRacer  # 使う時だけ import（起動時コストを避ける）
 
     if not is_eligible(doc_scripts):
@@ -1034,6 +1036,8 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
         if not w.field_name:
             continue
         bridge = FieldBridge.from_widget(w)
+        if marks is not None:   # 誤りの印は文書（PDF）ではなく marks に持つ
+            bridge.required = bool(marks.get(bridge.name, False))
         before_display[bridge.name] = bridge.display
         before_value[bridge.name] = bridge.valueAsString
         bridges.append(bridge)
@@ -1176,8 +1180,12 @@ def _run_action_impl(doc: "fitz.Document", page_index: int, widget_xref: int,
             if effects is not None:
                 effects.readonly[name] = bool(new_ro)
         if full and bool(new_req) != before_req.get(name, False):
-            # 誤りの印（Acrobat では赤い枠）。保存した PDF にも残る（Acrobat と同じ）
-            if _apply_field_flag(doc, w.xref, 2, bool(new_req)):
+            # 誤りの印（Acrobat では赤い枠）。marks があればそこに持ち、PDF には
+            # 書かない（空の必須欄を通り過ぎただけで「保存されていない変更」に
+            # なっていた）
+            if marks is not None:
+                marks[name] = bool(new_req)
+            elif _apply_field_flag(doc, w.xref, 2, bool(new_req)):
                 changed = True
             if effects is not None:
                 effects.required[name] = bool(new_req)
