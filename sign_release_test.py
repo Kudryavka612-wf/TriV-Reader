@@ -52,7 +52,7 @@ $cert = $req.CreateSelfSigned([DateTimeOffset]::UtcNow.AddDays(-1), [DateTimeOff
     exe = shutil.which("powershell") or shutil.which("pwsh") or "powershell"
     r = subprocess.run([exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                         "-File", ps_path], capture_output=True, text=True, errors="replace",
-                       env={**os.environ, "TRV_OUT": path, "TRV_PW": password})
+                       env={**{k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}, "TRV_OUT": path, "TRV_PW": password})
     os.remove(ps_path)
     if r.returncode != 0 or not os.path.isfile(path):
         raise RuntimeError("試験用の証明書を作れません:\n" + r.stdout + r.stderr)
@@ -62,7 +62,7 @@ def has_signature(path: str) -> bool:
     exe = shutil.which("powershell") or "powershell"
     r = subprocess.run([exe, "-NoProfile", "-NonInteractive", "-Command",
                         "(Get-AuthenticodeSignature -LiteralPath $env:TRV_F).SignerCertificate -ne $null"],
-                       capture_output=True, text=True, env={**os.environ, "TRV_F": path})
+                       capture_output=True, text=True, env={**{k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}, "TRV_F": path})
     return r.stdout.strip() == "True"
 
 

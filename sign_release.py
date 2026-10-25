@@ -88,6 +88,7 @@ def find_signtool() -> str | None:
 
 
 def _powershell(script: str, env: dict) -> subprocess.CompletedProcess:
+    # PSModulePath は外す: pwsh 7 から呼ばれると 5.1 が自分のモジュール（署名のコマンド）を読めない
     exe = shutil.which("powershell") or shutil.which("pwsh") or "powershell"
     with tempfile.TemporaryDirectory(prefix="trv_sign_") as d:
         path = os.path.join(d, "run.ps1")
@@ -96,7 +97,7 @@ def _powershell(script: str, env: dict) -> subprocess.CompletedProcess:
         return subprocess.run(
             [exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            env={**os.environ, **env})
+            env={**{k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}, **env})
 
 
 def sign(files: list[str], pfx: str, password: str, timestamp: str = DEFAULT_TIMESTAMP,
