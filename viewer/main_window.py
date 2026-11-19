@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import sys
 
-from PySide6.QtCore import QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -117,9 +117,66 @@ def _warm_up_v8() -> None:
     threading.Thread(target=load, name="trv-v8-warmup", daemon=True).start()
 
 
+# 開いているウィンドウ。タブを外へ出すと、同じアプリの中に 2 つ目以降の
+# ウィンドウ（secondary）ができる。トレイ・単一起動の受け口・前回のファイルの
+# 記録・更新は、最初のウィンドウ（secondary でないもの）が受け持つ。
+# 別プロセスにしないのは、更新の入れ替え役が終了を待つのは 1 つの PID だけで、
+# 別プロセスが exe を掴んだままだと新旧が混ざった入れ替えになるため。
+# 一覧は弱い参照で持つ（ここが握るとウィンドウが解放されない）。外へ出した
+# ウィンドウは誰も参照を持たないので、閉じるまで _KEEP が握っておく。
+_WINDOWS: list = []   # weakref.ref のリスト（開いた順）
+_KEEP: list = []      # 外へ出したウィンドウ（閉じたら外す）
+
+
+def _alive(w) -> bool:
+    try:
+        import shiboken6
+        return shiboken6.isValid(w)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def all_windows() -> list:
+    """開いているウィンドウ（開いた順）。"""
+    out = []
+    for ref in list(_WINDOWS):
+        w = ref()
+        if w is None or not _alive(w):
+            _WINDOWS.remove(ref)
+        else:
+            out.append(w)
+    return out
+
+
+def secondary_windows() -> list:
+    """2 つ目以降のウィンドウ（タブを外へ出してできたもの）。"""
+    return [w for w in all_windows() if w._secondary]
+
+
+def primary_window():
+    """最初のウィンドウ（トレイ・更新を受け持つ）。無ければ None。"""
+    for w in all_windows():
+        if not w._secondary:
+            return w
+    return None
+
+
+def _forget_window(w) -> None:
+    for ref in list(_WINDOWS):
+        if ref() is w:
+            _WINDOWS.remove(ref)
+    if w in _KEEP:
+        _KEEP.remove(w)
+
+
 class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, secondary: bool = False) -> None:
         super().__init__()
+        self._secondary = secondary
+        import weakref
+        _WINDOWS.append(weakref.ref(self))
+        if secondary:
+            _KEEP.append(self)
         self.setWindowTitle("TriV-Reader")
         self.resize(1180, 820)
         self.setAcceptDrops(True)
@@ -146,6 +203,11 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.tabs.tabBar().setUsesScrollButtons(True)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabCloseRequested.connect(self._close_tab)
+        # タブをウィンドウの外で離したら、新しいウィンドウで開く（離したイベントの
+        # 中でタブを消さないよう、次のループで）
+        self.tabs.tabBar().detach_requested.connect(
+            lambda i, p: QTimer.singleShot(
+                0, lambda: self.open_tab_in_new_window(i, p)))
         # ウェルカム ⇔ タブ群 を切り替える中央スタック
         self.center = QStackedWidget()
         self.center.addWidget(self.welcome)  # 0
@@ -208,7 +270,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             app.commitDataRequest.connect(self._on_commit_data,
                                           Qt.ConnectionType.DirectConnection)
         self._tray_notified = False
-        self._setup_tray()
+        if secondary:
+            self.tray = None   # トレイは最初のウィンドウだけ（アイコンが増えないように）
+        else:
+            self._setup_tray()
         self._build_ribbon()  # Foxit 風リボンを最上部に（従来のバーは隠す）
         self._register_shortcuts()
         self.tabs.tabBar().apply_theme(self.act_dark.isChecked())
@@ -1476,7 +1541,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         if path:
             self.open_path(path)
 
-    def open_path(self, path: str) -> None:
+    def open_path(self, path: str, page: int | None = None) -> None:
+        """PDF を開く。page を渡すとそのページから出す（前回の続きの案内は出さない）。"""
         # 相対パスは CWD を動かす前に解決しておく。開いたフォルダを掴んだままに
         # すると Windows ではそのフォルダを削除/移動できなくなるので、開くたびに
         # カレントディレクトリを安全な場所へ戻す（ファイルダイアログが CWD を
@@ -1532,9 +1598,12 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         # 初回表示直後はビューポートの幅がまだ確定していないことがあるので、
         # レイアウトが落ち着いた次のループでもう一度当て直す。
         QTimer.singleShot(0, lambda z=remembered_zoom: self._apply_default_zoom(z))
-        resume = self._remembered_page(path)
+        resume = self._remembered_page(path) if page is None else 0
         mode = prefs.resume_mode(self.settings)
-        if resume and mode == "always":
+        if page:
+            # 別のウィンドウから移してきた: 見ていたページのまま出す
+            QTimer.singleShot(0, lambda t=tab, n=page: self._show_page_of(t, n))
+        elif resume and mode == "always":
             # 倍率が決まってレイアウトが落ち着いてから移動する
             QTimer.singleShot(0, lambda t=tab, n=resume: self._resume_to(t, n))
         elif resume and mode == "ask":
@@ -1562,6 +1631,75 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
                     QTimer.singleShot(
                         800, lambda: d.is_open and self._check_unsupported_govform(d))
             QTimer.singleShot(0, _finish_form_setup)
+
+    def _show_page_of(self, tab, page: int) -> None:
+        """タブのページを移す（閉じられていたら何もしない）。"""
+        if self.tabs.indexOf(tab) < 0 or not tab.doc.is_open:
+            return
+        target = min(page, tab.doc.page_count - 1)
+        if target > 0:
+            tab.page_view.set_page(target)
+            if tab is self._active_tab():
+                self.thumbnails.select_page(target)
+                self._update_status()
+
+    # --- タブを新しいウィンドウで開く -----------------------------------
+    def open_tab_in_new_window(self, index: int, global_pos=None) -> "MainWindow | None":
+        """タブの文書を新しいウィンドウで開き直し、このウィンドウからは閉じる。
+
+        タブ（ウィジェット）ごと移すと、ビューワーの合図がこのウィンドウにつながった
+        ままになるので、同じファイルを新しいウィンドウで開き直す。そのため保存して
+        いない変更があれば、先に保存してもらう（捨てて移すことはしない）。
+        """
+        tab = self.tabs.widget(index)
+        if not isinstance(tab, DocTab) or not tab.doc.is_open:
+            return None
+        if self.tabs.count() < 2:
+            return None   # 1 つだけならウィンドウそのものと同じ
+        name = self.tabs.tabText(index)
+        path = tab.doc.path
+        if not path:
+            QMessageBox.information(
+                self, "新しいウィンドウで開く",
+                f"「{name}」はまだファイルに保存されていません。保存してから移してください。")
+            return None
+        tab.page_view.finish_text_edit()   # 打ちかけの文字も「未保存の変更」に含める
+        if tab.doc.modified:
+            self.tabs.setCurrentIndex(index)
+            ret = QMessageBox.question(
+                self, "新しいウィンドウで開く",
+                f"「{name}」に保存されていない変更があります。\n"
+                "保存してから新しいウィンドウで開きますか？",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save)
+            if ret != QMessageBox.StandardButton.Save:
+                return None
+            self.save()
+            if tab.doc.modified:   # 保存が取りやめられた
+                return None
+        page = tab.page_view.index
+        win = MainWindow(secondary=True)
+        # テーマは今の表示に合わせる（設定に残る値は終了時のものなので古いことがある）
+        if win.act_dark.isChecked() != self.act_dark.isChecked():
+            win.act_dark.setChecked(self.act_dark.isChecked())
+        if self.isMaximized() or self.isFullScreen():
+            win.resize(1180, 820)
+        else:
+            win.resize(self.size())
+        if global_pos is not None:
+            win.move(global_pos - QPoint(min(200, win.width() // 3), 15))
+        else:
+            win.move(self.pos() + QPoint(40, 40))
+        win.show()
+        win.open_path(path, page=page)
+        if win.tabs.count() == 0:   # 開けなかった（パスワードの取りやめなど）
+            win._force_quit = True
+            win.close()
+            return None
+        self._close_tab(self.tabs.indexOf(tab))   # 保存済みなので確認は出ない
+        win.raise_()
+        win.activateWindow()
+        return win
 
     def _offer_resume(self, tab, page: int) -> None:
         """前回見ていたページへ飛ぶかを尋ねる案内を出す（閉じられていたら何もしない）。"""
@@ -1775,6 +1913,9 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self._forget_tab_history(tab)
         self.tabs.removeTab(index)
         tab.deleteLater()
+        # 保存などのファイル選択で作業フォルダが動いていると、閉じたあとも
+        # そのフォルダが「使用中」で消せない。閉じるたびに安全な場所へ戻す
+        storage.ensure_safe_cwd()
         if self.tabs.count() == 0:
             # 最後のタブを閉じたら左のサムネ/しおり表示も消す（表示が残らないように）
             self.thumbnails.load(self._empty_doc)
@@ -2618,14 +2759,19 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
 
     # --- 起動時の復元 / 更新確認 -----------------------------------------
     def _save_session(self) -> None:
-        """開いているファイルを憶えておく（次回起動時の復元用）。"""
-        paths = [t.doc.path for i in range(self.tabs.count())
-                 if isinstance(t := self.tabs.widget(i), DocTab) and t.doc.path]
+        """開いているファイルを憶えておく（次回起動時の復元用）。
+
+        外へ出したウィンドウのファイルも含める（次回は 1 つのウィンドウにまとめて開く）。
+        """
+        wins = [self] + [w for w in secondary_windows() if w is not self]
+        paths = [t.doc.path for w in wins for i in range(w.tabs.count())
+                 if isinstance(t := w.tabs.widget(i), DocTab) and t.doc.path]
         self.settings.setValue("session/open_files", paths)
-        for i in range(self.tabs.count()):
-            t = self.tabs.widget(i)
-            if isinstance(t, DocTab):
-                self._remember_page(t)
+        for w in wins:
+            for i in range(w.tabs.count()):
+                t = w.tabs.widget(i)
+                if isinstance(t, DocTab):
+                    self._remember_page(t)
 
     # --- 前回見ていたページ ---------------------------------------------
     # ファイルごとに「最後に見ていたページ」を憶えて、次に開いたとき続きから
@@ -2866,6 +3012,13 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         if hasattr(self, "ribbon"):
             self.ribbon.refresh_min_widths()  # 再スタイル後もラベルを省略させない
         self.tabs.tabBar().apply_theme(on)   # タブのスクロール矢印をテーマ色で
+        # テーマはアプリ全体で 1 つ。ほかのウィンドウも揃える（揃っていれば何もしない
+        # ので行き来しない）。新しく開くウィンドウが古い値で始めないよう、すぐ残す
+        self.settings.setValue("dark", on)
+        for w in all_windows():
+            if w is not self and hasattr(w, "act_dark") \
+                    and w.act_dark.isChecked() != on:
+                w.act_dark.setChecked(on)
 
     # --- ページ番号 ----------------------------------------------------
     def add_page_numbers_dialog(self) -> None:
@@ -3324,6 +3477,16 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         # ボタンを押せる状態にしておかない）
         self._update_undo_actions()
 
+    def changeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        # Windows のファイル選択（保存・書き出し・フォルダ選択など）は、選んだ
+        # フォルダへプロセスの作業フォルダを移すことがある。移ったままだと、PDF を
+        # 閉じたあとも（トレイ常駐で裏に残る間ずっと）そのフォルダが「使用中」に
+        # なって消せない。選択が終わってウィンドウに戻るたびに安全な場所へ戻す
+        # （同じ場所なら何もしない軽い処理）。
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            storage.ensure_safe_cwd()
+        super().changeEvent(event)
+
     # --- 終了確認 -------------------------------------------------------
     def _on_commit_data(self, _manager=None) -> None:
         """OS がシャットダウン／ログオフを始めた（closeEvent より先に呼ばれる）。"""
@@ -3331,9 +3494,11 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         forced = self._force_quit or self._session_ending
-        # 通常の×でタブがあるときは「現在のタブ / 全て / キャンセル」を尋ねる。
+        # 通常の×でタブが 2 つ以上あるときは「現在のタブ / 全て / キャンセル」を尋ねる。
+        # タブが 1 つなら「現在のタブ」と「全て」が同じなので尋ねずに閉じる（未保存の
+        # 変更があれば、それは _close_tab が尋ねる）。
         # （トレイの「終了」からの呼び出し _force_quit ではダイアログを出さない）
-        if (not forced and self.tabs.count() > 0
+        if (not forced and self.tabs.count() > 1
                 and prefs.value(self.settings, "confirm_close")):
             box = QMessageBox(self)
             box.setWindowTitle("ウィンドウを閉じる")
@@ -3359,8 +3524,22 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             # b_all → このまま全タブを閉じる処理へ進む
 
         # 開いているファイルは、タブを閉じる前に憶えておく（閉じたあとに憶えると、
-        # 何も開いていないことになり、前回のファイルを開き直す設定が何も復元しない）
-        self._save_session()
+        # 何も開いていないことになり、前回のファイルを開き直す設定が何も復元しない）。
+        # 外へ出したウィンドウは記録しない（最初のウィンドウが全部まとめて記録する。
+        # 外のウィンドウだけ閉じたときに、最初のウィンドウの分を消さないように）
+        if not self._secondary:
+            self._save_session()
+        # 本当にアプリを終えるなら、外へ出したウィンドウを先に閉じる（未保存の変更は
+        # それぞれで尋ねる。取りやめられたら終了しない）。トレイへ隠すだけなら残す
+        will_quit = not self._secondary and (forced or not self._tray_resident_enabled())
+        if will_quit:
+            for w in secondary_windows():
+                w._force_quit = True   # 「どのタブを閉じますか」は聞かない
+                if not w.close():
+                    w._force_quit = False
+                    self._force_quit = False
+                    event.ignore()
+                    return
         # 全タブを閉じる（各タブの未保存は _close_tab が確認。中断されたら閉じない）
         while self.tabs.count() > 0:
             before = self.tabs.count()
@@ -3374,6 +3553,15 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         # 保存される。先に全画面を終える
         if self.act_fullscreen.isChecked():
             self.act_fullscreen.setChecked(False)
+
+        # 外へ出したウィンドウは、閉じるだけ（アプリは終えない・設定も書かない。
+        # 位置や表示の設定は最初のウィンドウのものを残す）
+        if self._secondary:
+            event.accept()
+            _forget_window(self)
+            self.deleteLater()
+            storage.ensure_safe_cwd()
+            return
 
         # トレイ常駐が有効で通常の×なら、終了せずトレイへ隠す（通知は出さない）
         if not forced and self._tray_resident_enabled():

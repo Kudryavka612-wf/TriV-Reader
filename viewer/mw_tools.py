@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import subprocess
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QShortcut,
 )
@@ -189,6 +189,9 @@ class DocTabBar(QTabBar):
     TAB_MIN = 110
     TAB_MAX = 260
 
+    # タブをウィンドウの外までドラッグして離した（タブの番号, 離した画面上の位置）
+    detach_requested = Signal(int, QPoint)
+
     def tabSizeHint(self, index: int) -> QSize:  # noqa: N802 (Qt 命名)
         s = super().tabSizeHint(index)
         s.setWidth(max(self.TAB_MIN, min(s.width(), self.TAB_MAX)))
@@ -205,12 +208,39 @@ class DocTabBar(QTabBar):
     # 効かず、描画イベントを横取りしてテーマの文字色でシェブロンを描く。
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._press_index = -1
+        self._press_global = QPoint()
         self._arrow_painters: list[_ScrollArrowPainter] = []
         for btn in self.findChildren(QToolButton):
             side = {"ScrollLeftButton": "left",
                     "ScrollRightButton": "right"}.get(btn.objectName())
             if side:
                 self._arrow_painters.append(_ScrollArrowPainter(btn, side))
+
+    # --- タブをウィンドウの外へ出す ---------------------------------------
+    # 並べ替え（setMovable）はそのまま Qt に任せ、離した位置がウィンドウの外なら
+    # 知らせるだけにする。押したタブは押した時点で選択中になり、並べ替えの間も
+    # 選択中のまま動くので、離したときの currentIndex が動かしていたタブ。
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_index = self.tabAt(event.position().toPoint())
+            self._press_global = event.globalPosition().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        pressed = self._press_index
+        self._press_index = -1
+        super().mouseReleaseEvent(event)   # 並べ替えのアニメーションを先に終える
+        if event.button() != Qt.MouseButton.LeftButton or pressed < 0:
+            return
+        pos = event.globalPosition().toPoint()
+        if (pos - self._press_global).manhattanLength() < QApplication.startDragDistance():
+            return   # ただのクリック
+        if self.window().frameGeometry().contains(pos):
+            return   # ウィンドウの中で離した＝並べ替え
+        index = self.currentIndex()
+        if index >= 0:
+            self.detach_requested.emit(index, pos)
 
     def apply_theme(self, dark: bool) -> None:
         from . import theme
@@ -614,6 +644,10 @@ class ToolsMixin:
         tab = self.tabs.widget(idx)
         path = getattr(getattr(tab, "doc", None), "path", None)
         menu = QMenu(self)
+        a_window = menu.addAction("新しいウィンドウで開く")
+        # タブが 1 つだけならウィンドウそのものと同じなので出さない（押せなくする）
+        a_window.setEnabled(bool(path) and self.tabs.count() > 1)
+        menu.addSeparator()
         a_explorer = menu.addAction("エクスプローラーで表示")
         a_copy = menu.addAction("ファイルのパスをコピー")
         a_users = menu.addAction("このフォルダを使っているアプリを調べる…")
@@ -626,7 +660,9 @@ class ToolsMixin:
         a_others.setEnabled(self.tabs.count() > 1)
         a_all = menu.addAction("すべてのタブを閉じる")
         chosen = menu.exec(bar.mapToGlobal(pos))
-        if chosen is a_explorer:
+        if chosen is a_window:
+            self.open_tab_in_new_window(idx)
+        elif chosen is a_explorer:
             self.show_in_explorer(path)
         elif chosen is a_users:
             self.find_folder_users(os.path.dirname(path))

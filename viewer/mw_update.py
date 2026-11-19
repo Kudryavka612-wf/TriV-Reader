@@ -380,9 +380,14 @@ class UpdateMixin:
         # quit() は aboutToQuit をその場で（closeEvent の中で）出すので、close() の前につなぐ
         app = QApplication.instance()
         app.aboutToQuit.connect(_apply)
-        self._force_quit = True   # 確認とトレイへの退避を飛ばす（未保存の変更は聞く）
-        if not self.close():      # 未保存の確認で取りやめられた
-            self._force_quit = False
+        # 外へ出したウィンドウから更新したときも、終えるのは最初のウィンドウ
+        # （外のウィンドウは閉じるだけでアプリを終えないため、入れ替え役が待ちきれる）。
+        # 最初のウィンドウは、外のウィンドウを先に閉じてから終わる
+        from .main_window import primary_window
+        target = (primary_window() or self) if getattr(self, "_secondary", False) else self
+        target._force_quit = True   # 確認とトレイへの退避を飛ばす（未保存の変更は聞く）
+        if not target.close():      # 未保存の確認で取りやめられた
+            target._force_quit = False
             app.aboutToQuit.disconnect(_apply)
             QMessageBox.information(
                 self, "更新",
