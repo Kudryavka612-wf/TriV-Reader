@@ -1,8 +1,9 @@
 """配布用リリース（zip ＋ update.json）を作成する。
 
 ビルド済みの onedir フォルダを zip 化し、自動更新用の update.json を出力する。
-出力した 2 ファイルを GitHub Releases などに公開し、その zip の公開URLを
-update.json の "url" に、update.json の公開URLをアプリの「更新元URL」に設定する。
+update.json には zip の sha256 を必ず載せる。配る前に tools/sign_update.py で
+update.json に署名し（update.json.sig）、zip・update.json・update.json.sig を
+GitHub Releases に公開する（CI では release.yml がここまで行う）。
 
 使い方:
     python make_release.py [onedirフォルダ] [--base-url https://.../download]
@@ -86,19 +87,27 @@ def main() -> int:
     mpath = os.path.join(out_dir, "update.json")
     with open(mpath, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
+    # 前回の署名が残っていると、新しい update.json と合わない署名を一緒に配ってしまう。
+    # 署名は tools/sign_update.py が、この update.json のバイト列に付け直す
+    try:
+        os.remove(mpath + ".sig")
+    except OSError:
+        pass
 
     print("=== 完了 ===")
     print("zip        :", zip_path)
     print("update.json:", mpath)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     print(f"""
-GitHub Releases 公開手順:
-  1. タグ {tag} でリリースを作成
-  2. このリリースに次の2ファイルを添付:
+GitHub Releases 公開手順（ふつうはタグの push で CI が全部行う）:
+  1. update.json に署名する（署名の無い更新は、公開鍵を入れたアプリが入れない）:
+       python tools/sign_update.py "{mpath}" --key-file <秘密鍵のファイル>
+  2. タグ {tag} でリリースを作成
+  3. このリリースに次の3ファイルを添付:
        - {zip_name}
        - update.json
-  3. version.py の GITHUB_REPO を "オーナー/リポジトリ" に設定（アプリ側の更新元）
-  ※ アプリは https://github.com/<repo>/releases/latest/download/update.json を見ます
+       - update.json.sig
+  ※ アプリは https://github.com/<repo>/releases/latest/download/update.json（と .sig）を見ます
 """)
     return 0
 

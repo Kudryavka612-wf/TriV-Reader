@@ -10,9 +10,11 @@ import os
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -20,6 +22,34 @@ from PySide6.QtWidgets import (
 from .util import exists_fast
 
 MAX_RECENT = 5  # カードで出す最近のファイル数
+
+
+class _ElidedLabel(QLabel):
+    """収まらない文字を中央の「…」で詰めて 1 行に描くラベル。
+
+    QLabel は収まらない文字を途中で切るだけで「…」にしない。フォルダ名は先頭
+    （ドライブ）と末尾（顧問先などの一番深いフォルダ）が見分けに要るので、中央を詰める。
+    """
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self._full = text
+        self.setMinimumWidth(1)
+
+    def minimumSizeHint(self):  # noqa: N802 (Qt 命名)
+        s = super().minimumSizeHint()
+        s.setWidth(1)
+        return s
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 (Qt 命名)
+        from PySide6.QtGui import QPainter
+
+        p = QPainter(self)
+        r = self.contentsRect()
+        text = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideMiddle, r.width())
+        p.setPen(self.palette().color(self.foregroundRole()))
+        p.drawText(r, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
+        p.end()
 
 
 class _RecentTile(QPushButton):
@@ -43,11 +73,11 @@ class _RecentTile(QPushButton):
         col = QVBoxLayout()
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(2)
-        name = QLabel(os.path.basename(path))
+        name = _ElidedLabel(os.path.basename(path))
         name.setObjectName("recentName")
-        folder = QLabel(os.path.dirname(path) or "")
+        folder = _ElidedLabel(os.path.dirname(path) or "")
         folder.setObjectName("recentDir")
-        # 長いパスでカードが横に伸びないよう、末尾を省略して 1 行に収める
+        # 長いパスでカードが横に伸びないよう、中央を「…」で詰めて 1 行に収める
         for lbl in (name, folder):
             lbl.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
             lbl.setMinimumWidth(1)
@@ -64,7 +94,24 @@ class WelcomeWidget(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        outer = QVBoxLayout(self)
+        # 中身はスクロールできる枠に入れる。最近使ったファイルが 5 件あると中身の
+        # 高さが約 770px あり、そのままだとウィンドウ全体の最小の高さになって
+        # （PDF を開いて裏に回っても、切り替え用の枠は隠れた画面の最小も数える）、
+        # 1366×768 のノート PC ではステータスバーや下端がタスクバーに隠れていた
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setObjectName("welcomeScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("#welcomeScroll { background: transparent; border: none; }")
+        scroll.viewport().setAutoFillBackground(False)
+        body = QWidget()
+        body.setObjectName("welcomeBody")
+        body.setAutoFillBackground(False)
+        scroll.setWidget(body)
+        root.addWidget(scroll)
+        outer = QVBoxLayout(body)
         outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         card = QWidget()

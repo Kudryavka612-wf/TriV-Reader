@@ -161,16 +161,50 @@ GitHub Actions で公開する場合、**注釈付きタグのメッセージが
 3. リリース生成: `python make_release.py --notes "更新内容"`
    - `GITHUB_REPO` から URL を自動生成、**SHA256 も自動計算**して
      `%USERPROFILE%\TriVReader_release\` に `TriVReader-<版>.zip` と `update.json` を出力。
-4. GitHub で **タグ `v<版>`（例 v1.1.0）のリリースを作成**し、上記 2 ファイルを添付。
-5. 完了。利用者は「ヘルプ > 更新を確認」で DL→検証→入替→再起動まで自動。
+4. 署名: `pip install "cryptography==50.0.0"` のうえで
+   `python tools\sign_update.py "$env:USERPROFILE\TriVReader_release\update.json" --key-file <秘密鍵のファイル>`
+   （`update.json.sig` ができる。下の「更新の署名」）。
+5. GitHub で **タグ `v<版>`（例 v1.1.0）のリリースを作成**し、zip・`update.json`・`update.json.sig` を添付。
+6. 完了。利用者は「ヘルプ > 更新を確認」で DL→検証→入替→再起動まで自動。
 
-> SHA256 を update.json に載せるので、アプリはダウンロードした zip を**改ざん検証**します。
+### 更新の署名（update.json.sig）
+update.json と zip は同じリリースから来るので、sha256 を載せるだけでは、リリースを
+書き換えられる人（漏れたトークン・アカウント名を引き継いだ人）が両方を差し替えられます。
+そこで update.json のバイト列に、配布元だけが持つ秘密鍵で **Ed25519 の署名**を付けます。
+
+- アプリ（`viewer/updater.py`）は、`viewer/version.py` の **`UPDATE_PUBLIC_KEY`** が入っていれば、
+  中身を読む前に update.json.sig を確かめます。署名が無い・合わない、更新元が https でない、
+  sha256 が無い・合わない、zip が `https://github.com/<GITHUB_REPO>/releases/download/...` に
+  無い、のどれでも「この更新は配布元の署名を確かめられないため入れませんでした」と出して入れません
+  （展開も試しの起動もしません）。設定の「更新元URL」を変えても、署名が要るのは同じです。
+- 検証は純 Python（`viewer/ed25519.py`。RFC 8032 の試験ベクトルで `ed25519_test.py` が確かめる）。
+  配る exe に部品は足しません。
+- `UPDATE_PUBLIC_KEY` が空のあいだは、これまでどおり（署名を見ない）です。
+
+**最初の 1 回（オーナーが行う）**
+1. 鍵を作る（秘密鍵はファイルにだけ書かれ、画面には公開鍵の 1 行だけ出ます）:
+   `python tools\make_signing_key.py D:\安全な場所\trivreader_update_key.txt`
+2. 出た `UPDATE_PUBLIC_KEY = "…"` の 1 行を `viewer/version.py` に貼ってコミットする。
+3. リポジトリの Settings > Secrets and variables > Actions > New repository secret で、
+   名前 **`UPDATE_SIGNING_KEY`**、値に秘密鍵のファイルの中身（Ed25519 の 32 バイトの seed を
+   base64 にした 44 文字の 1 行。PKCS#8 の PEM も可）を登録する。
+4. 秘密鍵のファイルは PC の外（USB メモリ等）に控えを残し、PC からは消す。失うと、配った版は
+   以後の更新を入れられなくなります（インストーラーで入れ直し）。
+
+CI（`release.yml`）は update.json を作ったあと `tools/sign_update.py` で署名し、
+`update.json.sig` も一緒に公開します。**`UPDATE_SIGNING_KEY` が無い・形が違う・
+`UPDATE_PUBLIC_KEY` と対でない、のどれでもリリース全体を失敗にします**（署名の無いものを配らない）。
+署名は CI の工程だけで pip で入れる `cryptography` が行い、できた署名をアプリと同じ純 Python の検証でも確かめます。
+
+> 公開鍵を貼ったあとは、`release.py --local-publish`（update.json.sig を付けない）で出した版は
+> どの PC も入れません。手元から出すときも上の手順 4 で署名してください。
 
 ### 仕組み / 安全性
 - バージョン比較で新しい時のみ更新。zip は HTTPS で取得し onedir 一式を入れ替え。
+  通信が 30 秒途切れたら諦めます（`updater.DOWNLOAD_TIMEOUT`）。https 以外への転送には付いていきません。
 - 入れ替えは「アプリ終了を待つ→robocopy で上書き→再起動」を行うヘルパー(.cmd)で実施。
   **ユーザーデータ（TriVReader_data, *.ini）は保持**します（robocopy /E、/XD・/XF で除外）。
-- 改ざん防止を強化したい場合は zip の SHA256 を update.json に載せて検証する拡張も可能です。
+  終了待ちで tasklist 自体が失敗したときは「終わった」とみなさず、待ちきれたら何も書き換えずに諦めます。
 
 ## 2. .pdf に関連付ける（管理者不要・現在のユーザーのみ）
 
@@ -214,7 +248,9 @@ python make_installer.py            # 既存ビルドから Setup.exe を生成
 - 出力: `%USERPROFILE%\TriVReader_release\TriVReader-Setup-<版>.exe`（約 60MB）
 - 中身は `installer\TriVReader.iss`（Inno Setup スクリプト）。バージョンは
   `viewer/version.py` の `APP_VERSION` から自動で取り込みます。
-- インストール先は `%LOCALAPPDATA%\Programs\TriV-Reader`（UAC なし）。
+- インストール先は `%LOCALAPPDATA%\Programs\TriV-Reader`（UAC なし）。「すべてのユーザー」
+  （Program Files・管理者）は選べません（自動更新が Program Files に書けず、黙って失敗し続けるため）。
+  以前「すべてのユーザー」で入れた版が残っていると、管理者にアンインストールを頼むよう知らせます。
 - 利用者はインストール時のチェックで「デスクトップアイコン」「.pdf 関連付け」を選べます。
 - 配布: できあがった Setup.exe を相手に渡すだけ。GitHub Releases に添付しても可。
 - アンインストール:

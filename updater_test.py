@@ -10,6 +10,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 from viewer import updater
+# このテストは署名の無い file:// の更新を使う。署名の確かめは signed_update_test.py で見る
+updater._ver.UPDATE_PUBLIC_KEY = ""
 
 TMP = tempfile.gettempdir()
 

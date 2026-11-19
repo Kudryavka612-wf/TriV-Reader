@@ -25,9 +25,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QRadioButton,
+    QFrame,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
 from .mw_print import paper_for_page, place_on_paper, restore_paper, select_pages, set_paper
@@ -128,7 +131,13 @@ class PrintDialog(QDialog):
         root = QHBoxLayout(self)
 
         # ── 左: 設定 ────────────────────────────────────────────
-        left = QVBoxLayout()
+        # 設定の列は高さが約 720px あり、1366×768 の画面では一番下の［印刷］が
+        # 画面の外に出ていた。設定はスクロールできる枠に入れ、［印刷］［キャンセル］は
+        # 枠の外の下端に固定して、いつでも見えるようにする
+        left_box = QWidget()
+        left_box.setAutoFillBackground(False)
+        left = QVBoxLayout(left_box)
+        left.setContentsMargins(0, 0, 0, 0)
         form = QFormLayout()
         self.printer_combo = QComboBox()
         default = QPrinterInfo.defaultPrinter()
@@ -320,8 +329,19 @@ class PrintDialog(QDialog):
         bb.button(QDialogButtonBox.StandardButton.Cancel).setText("キャンセル")
         bb.accepted.connect(self._on_accept)
         bb.rejected.connect(self.reject)
-        left.addWidget(bb)
-        root.addLayout(left, 0)
+        scroll = QScrollArea()
+        scroll.setWidget(left_box)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        # 横には縮めない（縦のスクロールバーが出ても中身が欠けない幅）
+        scroll.setMinimumWidth(left_box.sizeHint().width()
+                               + scroll.verticalScrollBar().sizeHint().width() + 4)
+        col = QVBoxLayout()
+        col.addWidget(scroll, 1)
+        col.addWidget(bb)
+        root.addLayout(col, 0)
 
         # ── 右: プレビュー ──────────────────────────────────────
         # ダイアログを広げたぶんプレビューも大きくなる（300px 固定だと、
@@ -329,7 +349,9 @@ class PrintDialog(QDialog):
         right = QVBoxLayout()
         self.preview = QLabel()
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(self.PREVIEW_W, int(self.PREVIEW_W * 1.4142))
+        # 高さの最小は控えめに（A4 比の 424px だと、それだけで小さい画面に収まらない）。
+        # 描くときは縦横比を保つので、低くしても絵は崩れない
+        self.preview.setMinimumSize(self.PREVIEW_W, 320)
         self.preview.setSizePolicy(QSizePolicy.Policy.Expanding,
                                    QSizePolicy.Policy.Expanding)
         self.preview.setStyleSheet("background: #888; border: 1px solid #666;")
@@ -350,7 +372,15 @@ class PrintDialog(QDialog):
         nav.addStretch(1)
         right.addLayout(nav)
         root.addLayout(right, 1)
-        self.resize(900, 700)
+        # 既定は設定の列がスクロールなしで全部見える高さ。ただし画面の使える高さに
+        # 収める（タスクバーとタイトルバーの分を引く）。小さい画面では左がスクロールになる
+        m = root.contentsMargins()
+        h = max(700, left_box.sizeHint().height() + col.spacing()
+                + bb.sizeHint().height() + m.top() + m.bottom() + 4)
+        scr = (parent.screen() if parent is not None else None) or self.screen()
+        if scr is not None:
+            h = min(h, scr.availableGeometry().height() - 60)
+        self.resize(900, max(420, h))
 
         # 配線: 設定変更でプレビュー更新
         btn_prev.clicked.connect(lambda: self._step_preview(-1))
@@ -736,8 +766,10 @@ class PrintDialog(QDialog):
         paper_w_pt = max(1.0, paper.width())
         paper_h_pt = max(1.0, paper.height())
         # プレビュー画布：ラベルの中に収まる最大の大きさ（縦横比は用紙どおり）
-        avail_w = max(self.PREVIEW_W, self.preview.width() - 16)
-        avail_h = max(int(self.PREVIEW_W * 1.4142), self.preview.height() - 16)
+        # 下限はプレビュー欄の最小の大きさに合わせる（ここを A4 縦の高さで決め打ちすると、
+        # 欄が低いときに絵が欄より大きくなり上下が切れる）
+        avail_w = max(120, self.preview.width() - 16)
+        avail_h = max(120, self.preview.height() - 16)
         pw = int(min(avail_w, avail_h * paper_w_pt / paper_h_pt))
         ph = max(1, int(pw * paper_h_pt / paper_w_pt))
         canvas = QPixmap(pw, ph)

@@ -47,8 +47,11 @@ def main() -> int:
     w.open_path(SAMPLE)
     settle(app)
     opened = w.minimumSizeHint().width()
+    # ようこそ画面は v1.12.0 から縮められる（以前は 627px で止まった）。開いたあとに
+    # 状態バーの分だけ少し広がるのはよいが、ふつうの狭いウィンドウ（400px）を
+    # 押し広げるほど大きくはしない
     check("opening a PDF does not raise the window's minimum width",
-          opened <= empty + 20, f"(empty {empty}px -> opened {opened}px)")
+          opened <= max(empty + 20, 400), f"(empty {empty}px -> opened {opened}px)")
     check("the window can stay narrow after opening a PDF (fits a laptop / half screen)",
           w.width() <= 700 and opened <= 700, f"(width {w.width()}px)")
 

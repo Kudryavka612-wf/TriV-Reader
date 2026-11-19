@@ -13,7 +13,7 @@ from contextlib import contextmanager
 import fitz  # PyMuPDF
 from PySide6.QtGui import QImage, QPixmap
 
-from . import fastwidgets, govform_js, jpfonts
+from . import fastwidgets, field_ap, govform_js, jpfonts
 
 # 埋め込みの無い和文を、中国語の字形でなく Windows の和文フォントで描く
 jpfonts.install()
@@ -281,6 +281,10 @@ class PdfDocument:
         self._undo_bytes = 0    # doc スナップショットの合計サイズ
         self._undo_group = 0    # >0 の間は 1 操作としてまとめる
         self._group_pushed = False
+        # 直前の取り消し・やり直しで注釈が変わったページ（複数ページの 1 操作のとき全部）
+        self.last_history_pages: list[int] = []
+        # 入力欄の値を変えたか（保存のとき、古い値を持つ XFA を外すかの判断に使う）
+        self._form_values_changed = False
 
     # --- 変更フラグと表示キャッシュ -------------------------------------
     # 「中身が変わった＝描いてあるものも変わった」ので、modified を立てる箇所
@@ -365,6 +369,7 @@ class PdfDocument:
             # 開くパスワードの無い暗号化（編集・印刷の制限だけ）はそのまま引き継ぐ。
             # needs_pass は読まない（認証済みの文書では鍵を壊す）
             kwargs.setdefault("encryption", fitz.PDF_ENCRYPT_KEEP)
+        self._prepare_form_for_saving()
         if (int(kwargs.get("garbage", 0) or 0) < 2
                 or kwargs.get("encryption") == fitz.PDF_ENCRYPT_KEEP):
             # 暗号化を引き継ぐ文書は複製すると外れてしまう。直接保存し、番号が変わった
@@ -423,6 +428,10 @@ class PdfDocument:
         tmp = path + ".tmp_save"
         try:
             write(tmp)
+            # 置き換える前に、一時ファイルの中身をディスクまで書き切る。書いた直後は
+            # OS のキャッシュにあるだけのことがあり、置き換えた直後に電源が落ちる・
+            # USB を抜くと、元のファイルは消えて中身の無い（壊れた）ファイルが残る
+            PdfDocument._flush_to_disk(tmp)
             os.replace(tmp, path)
         except BaseException:
             try:
@@ -430,6 +439,17 @@ class PdfDocument:
             except OSError:
                 pass
             raise
+
+    @staticmethod
+    def _flush_to_disk(path: str) -> None:
+        """path のファイルをディスクまで書き切る（flush + fsync）。
+
+        PDF は MuPDF・pikepdf が自分で書いて閉じるので、開き直して fsync する。
+        Windows の fsync（FlushFileBuffers）は書き込みで開いたファイルにしか効かない。
+        """
+        with open(path, "r+b") as f:
+            f.flush()
+            os.fsync(f.fileno())
 
     def _save_to(self, path: str, **kwargs) -> None:
         """開いている文書を path に保存する（元のファイルを壊さない書き方）。"""
@@ -529,6 +549,10 @@ class PdfDocument:
         self.field_marks = {}
         self._undo.clear()   # 別ファイルを開いたら注釈 Undo 履歴は無効
         self._redo.clear()
+        self._undo_bytes = 0
+        self._form_values_changed = False
+        if not self._doc.needs_pass:
+            self._sync_checkbox_states()
         # 保持する doc には「正しいパスワードでのみ」authenticate する。
         # 誤パスワードの照合は check_password（使い捨て）で行うこと。
         if self._doc.needs_pass and password:
@@ -572,6 +596,7 @@ class PdfDocument:
             self._authenticated = True
             if needs:
                 self._adopt_decrypted(password)
+                self._sync_checkbox_states()
         return ok
 
     def close(self) -> None:
@@ -994,7 +1019,8 @@ class PdfDocument:
             page = self._doc.load_page(i)
             marks = [fitz.Rect(a.rect) for a in page.annots(types=(fitz.PDF_ANNOT_REDACT,))]
             if marks:
-                self._blank_fields_under(page, marks)
+                if self._blank_fields_under(page, marks):
+                    self._form_values_changed = True
                 # 範囲にかかる、本文を持つ注釈（付箋・コメント付きの注釈）も消す。
                 # apply_redactions は範囲に全部収まる注釈しか消さない
                 for a in list(page.annots()):
@@ -1006,6 +1032,8 @@ class PdfDocument:
             # apply_redactions の戻りは版により bool/None。件数は annots から数える。
             n += 1 if applied else 0
         self.modified = True
+        # 取り消しても、墨消しのあとに入れた値は残す（基準＝墨消しした直後の状態）
+        self._set_history_reference("墨消しの適用")
         return n
 
     def _blank_fields_under(self, page, marks: list) -> int:
@@ -1512,14 +1540,27 @@ class PdfDocument:
             maxlen = int(getattr(w, "text_maxlen", 0) or 0)
             flags = int(getattr(w, "field_flags", 0) or 0)
             PASSWORD = 1 << 13    # 伏せ字の欄
+            is_button = w.field_type in (fitz.PDF_WIDGET_TYPE_RADIOBUTTON,
+                                         fitz.PDF_WIDGET_TYPE_CHECKBOX)
+            on_state = self._on_state(w.xref) if is_button else ""
+            value = w.field_value if w.field_value is not None else ""
+            extra = {}
+            if w.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+                # このチェックボックスが ON か（欄の値が自分の ON の名前と同じとき）
+                extra["checked"] = self._button_checked(w.xref, on_state)
+            elif w.field_type in (fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX):
+                # 値（/V）は選択肢のエクスポート値。画面に出す表示名
+                extra["display_value"] = field_ap.display_text(
+                    w, "" if value is None else str(value))
             out.append({
                 "xref": w.xref,
                 "name": w.field_name or "",
                 "kind": self._widget_kind(w.field_type),
                 "ftype": w.field_type,   # 生の種類（ラジオと押しボタンは、kind では同じ "radio"）
-                "on_state": (self._on_state(w.xref)
-                             if w.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON else ""),
-                "value": w.field_value if w.field_value is not None else "",
+                # ON 状態の名前（ラジオ・チェックボックス。書き出し値）
+                "on_state": on_state,
+                "value": value,
+                **extra,
                 "rect": w.rect,
                 "choices": choices,
                 "maxlen": maxlen,
@@ -1591,8 +1632,15 @@ class PdfDocument:
                 return False
             ok = self.select_radio(index, xref)
             if ok:
-                self.modified = True
+                self._mark_form_changed()
             return ok
+        if (w.field_type in (fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX)
+                and value is not None and not isinstance(value, bool)):
+            # 画面の選択欄は表示名（例「北海道」）を渡してくる。/V には Acrobat と同じく
+            # 選択肢のエクスポート値（例 "01"）を書く。外観は field_ap が表示名で作る。
+            # 以前は表示名を /V に書いていたので、Acrobat や受け取った先のシステムで
+            # 値が選択肢と一致しなかった
+            value = self._choice_export(w, str(value), prefer_face=True)
         if (w.field_type != fitz.PDF_WIDGET_TYPE_CHECKBOX
                 and str(w.field_value or "") == ("" if value is None else str(value))):
             # 変わっていない。保存・タブを閉じる前にカーソルのある欄を書き込むので、
@@ -1608,14 +1656,107 @@ class PdfDocument:
                 if not self._set_checkbox(w, bool(value)):
                     return False
             else:
-                w.field_value = "" if value is None else str(value)
                 # 外観（印刷・提出先で見える文字）はこちらで作る。欄に
                 # 収まらなければ外観の中だけ縮める（/DA は書き換えない）
-                jpfonts.update_widget(w)
-            self.modified = True
+                self._write_text_value(w, "" if value is None else str(value))
+            self._mark_form_changed()
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    def _write_text_value(self, w, value: str) -> None:
+        """文字欄・選択欄に値を書き、外観を作り直す。
+
+        選択欄は、外観を表示名で作ってから /V をエクスポート値にする。MuPDF が外観を
+        作る欄（回転した欄など。field_ap が作らない）は /V の文字をそのまま描くので、
+        エクスポート値のまま作らせると「北海道」ではなく「01」と印刷される。
+        """
+        face = field_ap.display_text(w, value)
+        w.field_value = face
+        jpfonts.update_widget(w)
+        if face != value:
+            self._doc.xref_set_key(jpfonts.field_xref(self._doc, w.xref), "V",
+                                   fitz.get_pdf_str(value))
+
+    def _mark_form_changed(self) -> None:
+        """入力欄の値が変わった（変更あり。保存のとき古い XFA を外す）。"""
+        self._form_values_changed = True
+        self.modified = True
+
+    @staticmethod
+    def _choice_export(w, text: str, prefer_face: bool = False) -> str:
+        """選択欄の文字 text を、選択肢のエクスポート値に直す（当たらなければそのまま）。
+
+        prefer_face=True は画面で選んだ表示名から（表示名が先）、False は /V に入って
+        いる値の整え直し（すでにエクスポート値ならそのまま）。
+        """
+        pairs = []
+        for c in (getattr(w, "choice_values", None) or []):
+            if isinstance(c, (list, tuple)) and c:
+                pairs.append((str(c[0]), str(c[1] if len(c) > 1 else c[0])))
+            else:
+                pairs.append((str(c), str(c)))
+        exports = [e for e, _f in pairs]
+        if not prefer_face and text in exports:
+            return text
+        for export, face in pairs:
+            if face == text:
+                return export
+        return text
+
+    def _combo_values_as_export(self, index: int, names=None) -> int:
+        """ページの選択欄の /V に表示名が入っていたら、エクスポート値に直す。直した数。
+
+        フォームの JS が選択欄に値を入れる道（govform_js）は表示名で書くので、その
+        あとで整える。外観は表示名のまま（field_ap が値から表示名を引く）。
+        """
+        n = 0
+        page = self._doc.load_page(index)
+        for w in fastwidgets.widgets(page):
+            if w.field_type not in (fitz.PDF_WIDGET_TYPE_COMBOBOX,
+                                    fitz.PDF_WIDGET_TYPE_LISTBOX):
+                continue
+            if names is not None and (w.field_name or "") not in names:
+                continue
+            cur = w.field_value
+            if not isinstance(cur, str) or not cur:
+                continue
+            export = self._choice_export(w, cur)
+            if export != cur:
+                try:
+                    self._doc.xref_set_key(jpfonts.field_xref(self._doc, w.xref), "V",
+                                           fitz.get_pdf_str(export))
+                    n += 1
+                except Exception:  # noqa: BLE001
+                    continue
+        return n
+
+    def _prepare_form_for_saving(self) -> None:
+        """保存の前に、入力欄まわりを提出先で正しく読める形に整える。
+
+        値を変えた文書だけ:
+        - 選択欄の /V をエクスポート値にそろえる（JS が表示名で書いた分も）。
+        - 古い XFA を外す。XFA と AcroForm の両方を持つフォーム（ハイブリッド）を
+          Acrobat は XFA のデータで表示するので、AcroForm にだけ書いた値が見えず、
+          配られたときの古い値が出ていた。XFA を外せば Acrobat は AcroForm の値を
+          使う（XFA を扱えないほかの編集ソフトと同じやり方）。
+        """
+        if not self._doc or not self._form_values_changed:
+            return
+        try:
+            for i in range(self._doc.page_count):
+                self._combo_values_as_export(i)
+        except Exception:  # noqa: BLE001  整えられなくても保存は止めない
+            pass
+        try:
+            cat = self._doc.pdf_catalog()
+            if self._doc.xref_get_key(cat, "AcroForm/XFA")[0] != "null":
+                self._doc.xref_set_key(cat, "AcroForm/XFA", "null")
+                # XFA で描く指定が残ると、Acrobat が XFA を探して白紙になることがある
+                if self._doc.xref_get_key(cat, "NeedsRendering")[0] != "null":
+                    self._doc.xref_set_key(cat, "NeedsRendering", "null")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_state(self, xref: int) -> str:
         """チェック・ラジオの ON 状態の名前（/AP/N にある "Off" 以外の名前。無ければ ""）。"""
@@ -1636,40 +1777,161 @@ class PdfDocument:
         if not on:
             return False
         field = jpfonts.field_xref(self._doc, xref)
-        kids = [xref]
-        kd = self._doc.xref_get_key(field, "Kids")
-        if kd and kd[0] == "array":
-            kids = [int(m) for m in re.findall(r"(\d+)\s+0\s+R", kd[1])] or [xref]
+        kids = self._field_widget_xrefs(field) or [xref]
+        ff = self._doc.xref_get_key(field, "Ff")
+        unison = ff[0] == "int" and bool(int(ff[1]) & (1 << 25))   # RadiosInUnison
         for k in kids:
-            self._doc.xref_set_key(k, "AS", "/" + on if k == xref else "/Off")
+            same = k == xref or (unison and self._on_state(k) == on)
+            self._doc.xref_set_key(k, "AS", "/" + on if same else "/Off")
         self._doc.xref_set_key(field, "V", "/" + on)
         return True
+
+    def _xref_list(self, xref: int, key: str) -> list[int]:
+        """配列（/Kids など）に並ぶ参照の xref。配列そのものが間接参照でもたどる。"""
+        v = self._doc.xref_get_key(xref, key)
+        text = ""
+        if v[0] == "array":
+            text = v[1]
+        elif v[0] == "xref":
+            try:
+                text = self._doc.xref_object(int(v[1].split()[0]), compressed=True)
+            except Exception:  # noqa: BLE001
+                text = ""
+        return [int(m) for m in re.findall(r"(\d+)\s+0\s+R", text)]
+
+    def _field_widget_xrefs(self, field: int) -> list[int]:
+        """欄 field（名前 /T のある辞書）の見た目を持つウィジェットすべて。
+
+        別のページに置かれた同じ欄のウィジェットも入る（欄の /Kids をたどる）。/T を
+        持つ子は別の欄なので入れない。欄とウィジェットが一体なら自分だけ。
+        """
+        out: list[int] = []
+        stack, seen = [field], set()
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            kids = self._xref_list(x, "Kids")
+            if kids:
+                for k in reversed(kids):
+                    if k not in seen and self._doc.xref_get_key(k, "T")[0] != "string":
+                        stack.append(k)
+            elif self._doc.xref_get_key(x, "Subtype")[1] == "/Widget":
+                out.append(x)
+        return out
+
+    def _set_button_state(self, field: int, value: str) -> None:
+        """チェックボックス・ラジオの欄に値を書き、全部のウィジェットの見た目を合わせる。
+
+        value は ON の名前（先頭の / なし）か "Off"。各ウィジェットは、自分の ON の
+        名前が欄の値と同じときだけ ON にする（Acrobat と同じ）。別のページに置かれた
+        同じ欄のウィジェットも合わせる。
+        """
+        value = value or "Off"
+        self._doc.xref_set_key(field, "V", "/" + value)
+        for k in self._field_widget_xrefs(field):
+            on = self._on_state(k)
+            want = "/" + on if on and on == value else "/Off"
+            if self._doc.xref_get_key(k, "AS")[1] != want:
+                self._doc.xref_set_key(k, "AS", want)
+
+    def _button_checked(self, xref: int, on_state: str) -> bool:
+        """チェックボックスのウィジェット xref が ON か（欄の値＝自分の ON の名前）。
+
+        欄に値（/V）が無いフォームは、見た目（/AS）で判断する。
+        """
+        v = self._doc.xref_get_key(jpfonts.field_xref(self._doc, xref), "V")
+        if v[0] in ("name", "string"):
+            val = v[1][1:] if v[0] == "name" else v[1]
+            if val in ("", "Off"):
+                return False
+            return val == on_state if on_state else True
+        a = self._doc.xref_get_key(xref, "AS")
+        return a[0] == "name" and a[1] != "/Off"
 
     def _set_checkbox(self, w, on: bool) -> bool:
         """チェックボックスの ON/OFF を /AS・/V を直接書いて反映する。
 
         ON にするときは外観辞書(/AP/N)にある "Off" 以外の状態名を使う。
-        /V は欄（名前 /T のある辞書。jpfonts.field_xref）に、/AS は見た目を持つ
-        ウィジェットに書く。
+        /V は欄（名前 /T のある辞書。jpfonts.field_xref）に書く。/AS は欄のすべての
+        ウィジェットに、自分の ON の名前が /V と同じものだけ ON で書く。以前は押した
+        ウィジェットにだけ書いていたので、同じ名前で書き出し値の違う二者択一
+        （男=/M・女=/F）で女を選ぶと /V=F なのに男も ON の見た目のまま残り、両方に
+        チェックが入って印刷された（別のページの同じ欄も古い見た目のままだった）。
         """
         xref = w.xref
         if on:
-            apn = self._doc.xref_get_key(xref, "AP/N")
-            if not apn or apn[0] != "dict":
+            value = self._on_state(xref)
+            if not value:
                 return False
-            keys = re.findall(r"/([^ /<>]+)\s+\d+\s+0\s+R", apn[1])
-            on_states = [k for k in keys if k != "Off"]
-            if not on_states:
-                return False
-            name = "/" + on_states[0]
         else:
-            name = "/Off"
+            value = "Off"
         # /V は欄（名前 /T のある辞書）に書く。「親があれば親」と決め打ちすると、欄と
         # 一体のウィジェットの上にある /T 付きの途中ノードに書いてしまい、本人の値は
         # Off のまま、兄弟のチェックボックスが全部 ON と読める
-        self._doc.xref_set_key(jpfonts.field_xref(self._doc, xref), "V", name)
-        self._doc.xref_set_key(xref, "AS", name)
+        self._set_button_state(jpfonts.field_xref(self._doc, xref), value)
         return True
+
+    def _iter_checkbox_fields(self):
+        """文書のチェックボックスの欄（名前 /T のある、子の欄を持たない辞書）の xref。"""
+        RADIO, PUSH = 1 << 15, 1 << 16
+        stack = [(x, "", 0) for x in reversed(self._xref_list(self._doc.pdf_catalog(),
+                                                              "AcroForm/Fields"))]
+        seen = set()
+        while stack:
+            x, ft, ff = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            v = self._doc.xref_get_key(x, "FT")
+            if v[0] == "name":
+                ft = v[1]
+            f = self._doc.xref_get_key(x, "Ff")
+            if f[0] == "int":
+                ff = int(f[1])
+            children = [k for k in self._xref_list(x, "Kids")
+                        if self._doc.xref_get_key(k, "T")[0] == "string"]
+            if children:
+                stack.extend((k, ft, ff) for k in reversed(children))
+                continue
+            if (ft == "/Btn" and not ff & (RADIO | PUSH)
+                    and self._doc.xref_get_key(x, "T")[0] == "string"):
+                yield x
+
+    def _sync_checkbox_states(self) -> int:
+        """開いたとき、二者択一のチェックボックスの見た目（/AS）を値（/V）に合わせる。
+
+        以前の版で保存したファイルは、男=/M・女=/F の二者択一で /V=F なのに男の
+        /AS も /M のまま（両方チェック済みに見え、そのまま印刷される）。同じ欄に
+        書き出し値の違うウィジェットが 2 つ以上あり、/V がそのどれかのときだけ直す
+        （1 つだけのチェックボックスは /V と /AS のどちらが正しいか決められない）。
+        変更ありにはしない（中身＝値は変わらない）。直した数を返す。
+        """
+        n = 0
+        try:
+            for field in self._iter_checkbox_fields():
+                v = self._doc.xref_get_key(field, "V")
+                if v[0] != "name":
+                    continue
+                kids = self._field_widget_xrefs(field)
+                states = {self._on_state(k) for k in kids} - {""}
+                if len(kids) < 2 or len(states) < 2:
+                    continue
+                value = v[1][1:]
+                if value != "Off" and value not in states:
+                    continue
+                for k in kids:
+                    on = self._on_state(k)
+                    want = "/" + on if on and on == value else "/Off"
+                    if self._doc.xref_get_key(k, "AS")[1] != want:
+                        self._doc.xref_set_key(k, "AS", want)
+                        n += 1
+        except Exception:  # noqa: BLE001  読めないフォームはそのまま開く
+            return n
+        if n:
+            self._invalidate_view_caches()
+        return n
 
     # --- 官公庁フォームの「丸で選択」 JS トグル（限定対応） -------------
     def doc_scripts(self) -> dict[str, str]:
@@ -1726,7 +1988,7 @@ class PdfDocument:
             return False
         changed = govform_js.run_click(self._doc, index, xref, self.doc_scripts())
         if changed:
-            self.modified = True
+            self._mark_form_changed()
         return changed
 
     def govform_combo_export_value(self, index: int, xref: int, display_text: str):
@@ -1784,7 +2046,9 @@ class PdfDocument:
                     self.govform_combo_export_value(index, xref, effects.values[own]),
                     effects=effects, marks=self.field_marks)
         if changed:
-            self.modified = True
+            # JS が選択欄に入れた値は表示名で書かれるので、エクスポート値に直す
+            self._combo_values_as_export(index, set(effects.values))
+            self._mark_form_changed()
         return changed
 
     def clear_form(self) -> int:
@@ -1815,7 +2079,10 @@ class PdfDocument:
                         changed = True   # 入力チェックの誤りの印も消す
                 n += bool(changed)
         if n:
-            self.modified = True
+            self._mark_form_changed()
+        # 取り消しで戻すのは「クリアで消えた値」だけにする。クリアのあとに入れた値は
+        # 取り消しても残す（以前は黙って消えた）。比べる基準＝クリアした直後の状態
+        self._set_history_reference("フォームのクリア")
         return n
 
     def _reset_widget_value(self, w) -> bool:
@@ -1831,21 +2098,30 @@ class PdfDocument:
             default = default.lstrip("/")
         try:
             if kind in (fitz.PDF_WIDGET_TYPE_CHECKBOX, fitz.PDF_WIDGET_TYPE_RADIOBUTTON):
-                on = default not in ("", "Off")
-                if (str(w.field_value or "") not in ("", "Off", "False", "false")) == on:
+                # 欄の値（/V）ごと既定値に。二者択一（男=/M・女=/F）やラジオは、既定値の
+                # 側だけ ON（ほかのウィジェットの見た目も合わせる）
+                field = jpfonts.field_xref(self._doc, w.xref)
+                states = {self._on_state(k) for k in self._field_widget_xrefs(field)} - {""}
+                want = "Off" if default in ("", "Off") else default
+                if want != "Off" and want not in states:
+                    want = ((self._on_state(w.xref) or "Off")
+                            if kind == fitz.PDF_WIDGET_TYPE_CHECKBOX else "Off")
+                cur = self._doc.xref_get_key(field, "V")
+                cur = cur[1][1:] if cur[0] == "name" else (cur[1] if cur[0] == "string" else "")
+                if (cur or "Off") == want and not any(
+                        self._doc.xref_get_key(k, "AS")[1] not in ("/Off", "null")
+                        and self._on_state(k) != want
+                        for k in self._field_widget_xrefs(field)):
                     return False
-                if kind == fitz.PDF_WIDGET_TYPE_CHECKBOX:
-                    return self._set_checkbox(w, on)
-                w.field_value = on
-                w.update()
+                self._set_button_state(field, want)
                 return True
             if kind in (fitz.PDF_WIDGET_TYPE_TEXT, fitz.PDF_WIDGET_TYPE_COMBOBOX,
                         fitz.PDF_WIDGET_TYPE_LISTBOX):
-                default = govform_js.combo_display(w, default)   # 表示の文字で持つ
+                # 選択欄はエクスポート値で持つ（/DV もふつうはエクスポート値）
+                default = self._choice_export(w, default)
                 if str(w.field_value or "") == default:
                     return False
-                w.field_value = default
-                jpfonts.update_widget(w)
+                self._write_text_value(w, default)
                 return True
         except Exception:  # noqa: BLE001  戻せない欄は飛ばす
             return False
@@ -1884,7 +2160,9 @@ class PdfDocument:
                 effects.values[w.field_name or name or ""] = "0" + value
                 changed = True
         if changed:
-            self.modified = True
+            if effects.values:
+                self._combo_values_as_export(index, set(effects.values))
+            self._mark_form_changed()
         return changed
 
     def field_is_readonly(self, index: int, xref: int) -> bool:
@@ -2396,7 +2674,9 @@ class PdfDocument:
             return
         if self._undo_group > 0:
             self._group_pushed = True
-        self._append_history(("doc", index, data, label))
+        entry = ("doc", index, data, label)
+        self._append_history(entry)
+        self._last_doc_entry = entry
 
     @contextmanager
     def undo_group(self, label: str):
@@ -2430,9 +2710,9 @@ class PdfDocument:
     def _drop_oldest(self) -> bool:
         if not self._undo:
             return False
-        kind, _idx, payload, _label = self._undo.pop(0)
-        if kind == "doc":
-            self._undo_bytes -= len(payload)
+        entry = self._undo.pop(0)
+        if entry[0] == "doc":
+            self._undo_bytes -= len(entry[2])
         return True
 
     def _clear_history(self) -> None:
@@ -2446,75 +2726,160 @@ class PdfDocument:
         self._invalidate_view_caches()
         self._modified = True   # setter を通すと履歴まで巻き込むので直接立てる
 
-    #: 入力値・しおり・文書情報を変えない（変えても、取り消しで戻すべきでない）ページ操作。
-    #: これらを取り消しても、そのあとに入れた入力値・しおり・文書情報は残す。「フォームの
-    #: クリア」と「墨消しの適用」は値そのものを変える操作なので、取り消せば値が戻るのが正しい
+    #: 入力値・しおり・文書情報を変えないページ操作。取り消しても、そのあとに入れた入力値・
+    #: しおり・文書情報は残す（比べる基準＝操作の前の状態。値は変えないので直後と同じ）
     _VALUE_KEEPING_OPS = frozenset({
         "ページの回転", "透かしの追加", "ヘッダー/フッターの追加", "白紙ページの挿入",
         "ページの複製", "余白のトリミング", "ページの移動", "ページの並べ替え",
         "ページの削除", "PDF の結合", "画像の取り込み", "傾き補正", "ページ番号の追加"})
+    # 「フォームのクリア」「墨消しの適用」は値そのものを変える操作。取り消せば、その操作が
+    # 消した値は戻る。ただし、操作のあとに利用者が入れ直した欄はそのまま残す（以前は
+    # 黙って消えた）。比べる基準は操作の直後の状態で、操作が終わったところで履歴に
+    # 付ける（_set_history_reference）。
 
     @staticmethod
-    def _field_values(doc) -> dict:
-        """文書の入力欄の値 {欄の名前: (種類, 値)}。ボタン・署名は含めない。"""
+    def _button_value(doc, xref: int) -> str:
+        """チェックボックス・ラジオの欄の値（/V の名前。先頭の / なし。無ければ ""）。"""
+        v = doc.xref_get_key(jpfonts.field_xref(doc, xref), "V")
+        if v[0] == "name":
+            return v[1][1:]
+        return v[1] if v[0] == "string" else ""
+
+    @classmethod
+    def _field_values(cls, doc) -> dict:
+        """文書の入力欄の値 {欄の名前: (種類, 値)}。ボタン・署名は含めない。
+
+        チェックボックス・ラジオは欄の /V（ON の名前）で持つ。同じ名前で書き出し値の
+        違うチェックボックス（男=/M・女=/F）や、ラジオのどれが選ばれているかまで戻せる。
+        """
         out: dict = {}
         skip = (fitz.PDF_WIDGET_TYPE_BUTTON, fitz.PDF_WIDGET_TYPE_SIGNATURE)
+        buttons = (fitz.PDF_WIDGET_TYPE_CHECKBOX, fitz.PDF_WIDGET_TYPE_RADIOBUTTON)
         for page in doc:
             for w in fastwidgets.widgets(page):
                 if w.field_name and w.field_type not in skip:
-                    out[w.field_name] = (w.field_type, str(w.field_value or ""))
+                    if w.field_type in buttons:
+                        val = cls._button_value(doc, w.xref)
+                    else:
+                        val = str(w.field_value or "")
+                    out[w.field_name] = (w.field_type, val)
         return out
 
-    def _later_changes(self, base_bytes: bytes) -> dict:
-        """取り消して base_bytes の状態に戻すとき、そのあとに入れた変更（履歴に入らないもの）。
+    @staticmethod
+    def _widget_flags(doc) -> dict:
+        """入力欄の表示・書き換え禁止の状態 {xref: (欄の名前, /F, 欄の /Ff)}。
+
+        官公庁フォームの「〇で選択」は、選んだ側を表示・ほかを非表示にする（/F）。
+        フォームの JS は欄を書き換え禁止にもする（/Ff）。これも値と同じく戻す。
+        """
+        out: dict = {}
+        for page in doc:
+            for w in fastwidgets.widgets(page):
+                if not w.field_name:
+                    continue
+                field = jpfonts.field_xref(doc, w.xref)
+                out[w.xref] = (w.field_name, doc.xref_get_key(w.xref, "F")[1],
+                               doc.xref_get_key(field, "Ff")[1])
+        return out
+
+    def _doc_state(self, doc) -> dict:
+        """取り消しで比べる、履歴に入らない状態（入力欄の値・表示・しおり・文書情報）。"""
+        return {"values": self._field_values(doc), "flags": self._widget_flags(doc),
+                "meta": dict(doc.metadata or {}),
+                "toc": [(t[0], t[1]) for t in doc.get_toc(simple=True)],
+                "pages": doc.page_count}
+
+    def _state_of_bytes(self, data: bytes) -> dict:
+        base = fitz.open("pdf", data)
+        try:
+            return self._doc_state(base)
+        finally:
+            base.close()
+
+    def _set_history_reference(self, label: str) -> None:
+        """直前に積んだページ操作の履歴に、操作の直後の状態を付ける。
+
+        取り消すときは、これと今を比べて「操作のあとに利用者が変えたもの」を見つけ、
+        戻した文書へ書き直す（操作で消えた値だけが戻り、あとから入れた値は残る）。
+        """
+        entry = getattr(self, "_last_doc_entry", None)
+        if not self._undo or self._undo[-1] is not entry or entry[3] != label:
+            return
+        try:
+            state = self._doc_state(self._doc)
+        except Exception:  # noqa: BLE001  付けられなければ、従来どおり丸ごと戻す
+            return
+        self._undo[-1] = entry[:4] + (state,)
+        self._last_doc_entry = self._undo[-1]
+
+    def _later_changes(self, base: dict) -> dict:
+        """取り消して戻すとき、基準 base（_doc_state）のあとに入れた変更（履歴に入らないもの）。
 
         ページ操作の履歴は文書全体のバイト列。入力欄の値・しおり・文書情報の変更は履歴に
         入らないので、そのまま戻すと、ページを回したあとに入力した欄の値やしおりが、確認なしに
         消えていた（さらに何か編集すると、やり直しも消える）。
         """
-        base = fitz.open("pdf", base_bytes)
-        try:
-            base_vals = self._field_values(base)
-            base_meta = dict(base.metadata or {})
-            base_toc = [(t[0], t[1]) for t in base.get_toc(simple=True)]
-            base_pages = base.page_count
-        finally:
-            base.close()
-        cur_vals = self._field_values(self._doc)
-        fields = {n: v for n, v in cur_vals.items()
+        cur = self._doc_state(self._doc)
+        base_vals = base["values"]
+        fields = {n: v for n, v in cur["values"].items()
                   if n in base_vals and base_vals[n] != v}
-        meta = dict(self._doc.metadata or {})
+        base_flags = base.get("flags") or {}
+        flags = {x: v for x, v in cur["flags"].items()
+                 if x in base_flags and base_flags[x][0] == v[0] and base_flags[x] != v}
+        meta = cur["meta"]
         toc_full = self._doc.get_toc(simple=False)
-        toc_changed = [(t[0], t[1]) for t in toc_full] != base_toc
-        out = {"fields": fields, "meta": meta if meta != base_meta else None,
+        toc_changed = cur["toc"] != base["toc"]
+        out = {"fields": fields, "flags": flags,
+               "meta": meta if meta != base["meta"] else None,
                "toc": None, "toc_lost": False}
         if toc_changed:
-            if self._doc.page_count == base_pages:
+            if self._doc.page_count == base["pages"]:
                 out["toc"] = toc_full     # ページ数が同じなら、ページ番号もそのまま使える
             else:
                 out["toc_lost"] = True    # ページの数が違うと、番号を対応づけられない
         return out
 
-    def _reapply_changes(self, carried: dict) -> None:
-        """_later_changes で控えた変更を、戻した文書へ書き直す。"""
+    def _reapply_changes(self, carried: dict) -> int:
+        """_later_changes で控えた変更を、戻した文書へ書き直す。書き直した欄の数を返す。"""
         fields = carried.get("fields") or {}
-        if fields:
-            done = set()
+        flags = carried.get("flags") or {}
+        done = set()
+        if fields or flags:
             for page in self._doc:
                 for w in fastwidgets.widgets(page):
+                    flag = flags.get(w.xref)
+                    if flag is not None and flag[0] == w.field_name:
+                        try:
+                            _name, f, ff = flag
+                            if self._doc.xref_get_key(w.xref, "F")[1] != f:
+                                self._doc.xref_set_key(w.xref, "F", f)
+                            field = jpfonts.field_xref(self._doc, w.xref)
+                            if self._doc.xref_get_key(field, "Ff")[1] != ff:
+                                self._doc.xref_set_key(field, "Ff", ff)
+                            done.add(w.field_name)
+                        except Exception:  # noqa: BLE001
+                            pass
                     want = fields.get(w.field_name)
-                    if want is None or w.field_name in done:
+                    if want is None or ("v", w.field_name) in done:
                         continue
                     typ, val = want
                     try:
-                        if typ == fitz.PDF_WIDGET_TYPE_CHECKBOX:
-                            self._set_checkbox(w, val not in ("", "Off"))
+                        if typ in (fitz.PDF_WIDGET_TYPE_CHECKBOX,
+                                   fitz.PDF_WIDGET_TYPE_RADIOBUTTON):
+                            # 書き出し値で戻す（男=/M・女=/F のどちらか、どのラジオか）。
+                            # 以前はチェックボックスは同じ名前の最初の 1 つを ON にし、
+                            # ラジオは戻さずに黙って捨てていた
+                            if w.field_type not in (fitz.PDF_WIDGET_TYPE_CHECKBOX,
+                                                    fitz.PDF_WIDGET_TYPE_RADIOBUTTON):
+                                continue
+                            self._set_button_state(
+                                jpfonts.field_xref(self._doc, w.xref), val or "Off")
                         elif typ in (fitz.PDF_WIDGET_TYPE_TEXT, fitz.PDF_WIDGET_TYPE_COMBOBOX,
                                      fitz.PDF_WIDGET_TYPE_LISTBOX):
-                            w.field_value = val
-                            jpfonts.update_widget(w)
+                            self._write_text_value(w, val)
                         else:
                             continue
+                        done.add(("v", w.field_name))
                         done.add(w.field_name)
                     except Exception:  # noqa: BLE001  1 欄の失敗で取り消し全体を止めない
                         continue
@@ -2528,29 +2893,56 @@ class PdfDocument:
                 self._doc.set_toc(carried["toc"])
             except Exception:  # noqa: BLE001
                 pass
+        return len({n for n in done if isinstance(n, str)})
 
     def _apply_entry(self, entry: tuple, opposite: list) -> tuple:
-        """entry の状態へ戻し、戻す前の状態を opposite に積む。"""
-        kind, index, payload, label = entry
+        """entry の状態へ戻し、戻す前の状態を opposite に積む。
+
+        entry は (kind, index, payload, label[, 基準の状態])。ページ操作（"doc"）は、
+        基準の状態があればそれと、無ければ（値を変えない操作なら）payload の状態と
+        今を比べ、そのあとに入れた値・しおりなどを戻した文書へ書き直す。
+        """
+        kind, index, payload, label = entry[:4]
+        ref = entry[4] if len(entry) > 4 else None
         self.undo_notice = ""
         if kind == "doc":
+            self.last_history_pages = []
             current = self._doc.tobytes()
             carried = None
-            if label in self._VALUE_KEEPING_OPS:
+            if ref is not None or label in self._VALUE_KEEPING_OPS:
                 try:
-                    carried = self._later_changes(payload)
+                    carried = self._later_changes(
+                        ref if ref is not None else self._state_of_bytes(payload))
                 except Exception:  # noqa: BLE001  控えられなくても、取り消し自体はする
                     carried = None
             self._restore_doc_bytes(payload)
+            kept = 0
             if carried:
-                self._reapply_changes(carried)
+                kept = self._reapply_changes(carried)
                 if carried.get("toc_lost"):
                     self.undo_notice = ("ページの数が変わる操作を戻したので、そのあとに追加・変更した"
                                         "しおりは戻りませんでした")
-            opposite.append(("doc", index, current, label))
+                elif kept and label not in self._VALUE_KEEPING_OPS:
+                    self.undo_notice = f"{label}のあとに入力した {kept} 欄はそのまま残しました"
+            if kept:
+                self._form_values_changed = True
+            try:   # やり直すときの基準＝いま戻した直後の状態
+                after = self._doc_state(self._doc)
+            except Exception:  # noqa: BLE001
+                after = None
+            opposite.append(("doc", index, current, label)
+                            + ((after,) if after is not None else ()))
+        elif isinstance(payload, dict):
+            # 複数のページにまたがる 1 操作（全てハイライト）: ページ → 注釈の記述
+            current = {i: self._annot_snapshot(i) for i in payload}
+            for i, snap in payload.items():
+                self._restore_snapshot(i, snap)
+            self.last_history_pages = sorted(payload)
+            opposite.append(("annot", index, current, label))
         else:
             current = self._annot_snapshot(index)
             self._restore_snapshot(index, payload)
+            self.last_history_pages = [index]
             opposite.append(("annot", index, current, label))
         return (kind, index, label)
 
@@ -3010,6 +3402,7 @@ class PdfDocument:
         if self.path and _same_path(self.path, out_path):
             raise ValueError("開いているファイルとは別名で保存してください")
         self._japanize_before_saving()
+        self._prepare_form_for_saving()
         work = fitz.open("pdf", self._doc.tobytes())
         try:
             work.bake(annots=annots, widgets=widgets)
@@ -3310,15 +3703,27 @@ class PdfDocument:
 
     def add_search_highlights(self, hits: list, color=(1.0, 0.86, 0.18)) -> int:
         """検索ヒット [(page_index, rect), ...] をまとめてハイライト注釈にする。"""
-        if not self._doc:
+        if not self._doc or not hits:
             return 0
+        # 取り消し 1 回で全部消えるよう、かかるページ全部の注釈を 1 つの履歴に控える。
+        # 以前は履歴に積んでいなかったので、Ctrl+Z でこのハイライトは消えず、その前の
+        # 操作が取り消された
+        pages = sorted({index for index, _rect in hits})
+        try:
+            snaps = {i: self._annot_snapshot(i) for i in pages}
+        except Exception:  # noqa: BLE001
+            snaps = None
+        if snaps is not None:
+            if len(pages) == 1:
+                self._append_history(("annot", pages[0], snaps[pages[0]], "注釈"))
+            else:
+                self._append_history(("annot", pages[0], snaps, "全てハイライト"))
         for index, rect in hits:
             page = self._doc.load_page(index)
             annot = page.add_highlight_annot(rect)
             annot.set_colors(stroke=color)
             annot.update()
-        if hits:
-            self.modified = True
+        self.modified = True
         return len(hits)
 
     # --- ページ番号（標準テキストとして焼き込み） ---------------------
@@ -3596,6 +4001,7 @@ class PdfDocument:
             raise RuntimeError("ドキュメントが開かれていません")
 
         stats = {"images": 0, "recompressed": 0, "skipped": 0, "canceled": False}
+        self._prepare_form_for_saving()
         # 開いている文書自体は劣化させたくないので作業用コピーで処理する
         work = fitz.open("pdf", self._doc.tobytes(deflate=True))
         try:
@@ -3650,19 +4056,12 @@ class PdfDocument:
             try:
                 if self.path and _same_path(self.path, out_path):
                     # 自分自身への上書き。置き換えが成功してから開き直す
-                    # （失敗しても、開いている文書は無事なままにする）。
-                    tmp = out_path + ".tmp_save"
-                    work.save(tmp, **kwargs)
+                    # （失敗しても、開いている文書は無事なままにする）。書き込みの
+                    # 途中で失敗したときも .tmp_save を残さない（以前は save の失敗で
+                    # 残っていた）。置き換える前にディスクまで書き切る
+                    self._replace_atomically(out_path, lambda t: work.save(t, **kwargs))
                     work.close()
                     work = None
-                    try:
-                        os.replace(tmp, out_path)
-                    except OSError:
-                        try:
-                            os.remove(tmp)
-                        except OSError:
-                            pass
-                        raise
                     with open(out_path, "rb") as f:
                         data = f.read()
                     self._doc.close()

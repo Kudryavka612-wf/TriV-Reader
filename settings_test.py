@@ -217,6 +217,10 @@ def test_session(app: QApplication, w: MainWindow, root: str) -> None:
     saved = w.settings.value("session/open_files", [], list) or []
     check(bool(saved), f"開いているファイルを記録する（{len(saved)}件）")
 
+    # w2 は「次に起動したアプリ」のつもり。w を一覧に残すと、同じファイルを
+    # 二重に開かないよう w のタブへ切り替えるだけになる
+    from viewer import main_window as mw
+    mw._forget_window(w)
     w2 = MainWindow()
     w2.settings = w.settings
     w2.restore_session()

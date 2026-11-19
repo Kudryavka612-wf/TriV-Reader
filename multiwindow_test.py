@@ -151,6 +151,84 @@ def main() -> int:
               str(asked))
         w.doc.modified = False
 
+        # --- 移す前の保存が別名になったら、別名の方を開く ------------------------
+        e = os.path.join(root, "e.pdf")
+        e2 = os.path.join(root, "e_別名.pdf")
+        make_pdf(e)
+        w.open_path(e)
+        pump(app)
+        ei = w.tabs.currentIndex()
+        et = w.tabs.widget(ei)
+        et.doc.modified = True
+        answers[:] = [QMessageBox.StandardButton.Save]
+        real_save = w.save
+
+        def save_as_other():   # 上書きに失敗して「名前を付けて保存」に回ったまね
+            et.doc.save_as(e2)
+            et.doc.modified = False
+        w.save = save_as_other
+        try:
+            moved = w.open_tab_in_new_window(ei)
+        finally:
+            w.save = real_save
+        pump(app, 30)
+        check("未保存→別名で保存: 新しいウィンドウは別名の方を開く",
+              moved is not None and tab_paths(moved) == [os.path.normcase(e2)],
+              str(tab_paths(moved) if moved else None))
+        if moved is not None:
+            moved._force_quit = True
+            moved.close()
+            pump(app)
+
+        # --- 同じファイルは 2 つのウィンドウで開かない ------------------------
+        w.open_path(b)   # b は外のウィンドウ（new）で開いている
+        pump(app)
+        check("二重に開かない: 外のウィンドウで開いているファイルは、そちらへ切り替える",
+              os.path.normcase(b) not in tab_paths(w) and tab_paths(new) == [os.path.normcase(b)],
+              f"{tab_paths(w)} / {tab_paths(new)}")
+        w.open_path(b.upper())   # 大文字・小文字違いも同じファイル
+        pump(app)
+        check("二重に開かない: 大文字・小文字が違っても同じファイル",
+              len(tab_paths(w)) == 2, str(tab_paths(w)))
+        w.activate_and_open(b)   # エクスプローラーから開いたとき（最初のウィンドウに届く）
+        pump(app)
+        check("エクスプローラーから: 外のウィンドウのタブへ切り替え、二重に開かない",
+              len(tab_paths(w)) == 2 and tab_paths(new) == [os.path.normcase(b)])
+        w.hide()   # トレイに隠れている最初のウィンドウで、すでに開いているファイル
+        w.activate_and_open(tab_paths(w)[0])
+        pump(app)
+        check("エクスプローラーから: トレイに隠れたウィンドウで開いていれば、そのウィンドウを出す",
+              w.isVisible() and len(tab_paths(w)) == 2, str(w.isVisible()))
+
+        # --- 設定は全部のウィンドウに効く -------------------------------------
+        from viewer import settings_dialog as prefs
+        before_g = prefs.value(w.settings, "gesture/enabled")
+        w.settings.setValue("gesture/enabled", not before_g)
+        w.apply_preferences_everywhere(annot_changed=False)
+        pump(app)
+        check("設定: 外のウィンドウにも効く（ジェスチャー）",
+              new.page_view._gesture_enabled == (not before_g),
+              f"{new.page_view._gesture_enabled} vs {not before_g}")
+        w.settings.setValue("gesture/enabled", before_g)
+        w.apply_preferences_everywhere(annot_changed=False)
+
+        # --- 最大化していても、新しいウィンドウは通常の大きさ --------------------
+        w.settings.setValue("geometry", None)
+        w.showMaximized()
+        pump(app)
+        w.open_path(e)
+        pump(app)
+        mx = w.open_tab_in_new_window(w.tabs.currentIndex())
+        pump(app, 30)
+        check("最大化中に出す: 新しいウィンドウは最大化しない",
+              mx is not None and not mx.isMaximized())
+        if mx is not None:
+            mx._force_quit = True
+            mx.close()
+        w.showNormal()
+        w.resize(1000, 700)
+        pump(app)
+
         # --- タブが 1 つだけなら移さない ------------------------------------
         check("1 タブ: ウィンドウと同じなので移さない", new.open_tab_in_new_window(0) is None
               and new.tabs.count() == 1)

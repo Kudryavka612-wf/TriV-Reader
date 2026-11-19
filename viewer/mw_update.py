@@ -25,6 +25,33 @@ class _Cancelled(Exception):
     """待ち画面でキャンセルされた。"""
 
 
+# 報告の見出しのうち、PDF の名前・場所を書く行（document.write_govform_diagnostic）
+_NAME_KEYS = {"ファイル名", "ファイル", "ファイルのパス", "パス", "保存場所", "file", "path"}
+
+
+def _strip_document_names(text: str, doc_path: str) -> str:
+    """報告の文面から、PDF のファイル名・フォルダ名を取り除く。
+
+    「ファイル名: …」のような見出しの行は消し、本文に紛れた名前（フルパス・
+    ファイル名・拡張子なしの名前・フォルダ）は (省略) に置き換える。
+    """
+    kept = []
+    for line in text.split("\n"):
+        key = line.split(":", 1)[0].strip().lower() if ":" in line else None
+        if key is not None and key in _NAME_KEYS:
+            continue
+        kept.append(line)
+    text = "\n".join(kept)
+    if doc_path:
+        base = os.path.basename(doc_path)
+        names = {doc_path, os.path.normpath(doc_path), os.path.abspath(doc_path),
+                 base, os.path.splitext(base)[0], os.path.dirname(doc_path),
+                 os.path.dirname(os.path.abspath(doc_path))}
+        for name in sorted((n for n in names if n and len(n) >= 2), key=len, reverse=True):
+            text = text.replace(name, "(省略)")
+    return text
+
+
 class UpdateMixin:
     """更新の確認と、未対応フォームの匿名レポート。MainWindow に混ぜて使う。"""
 
@@ -51,9 +78,13 @@ class UpdateMixin:
             self._maybe_send_govform_telemetry(doc)
 
     def _telemetry_url(self) -> str:
-        """テレメトリ送信先（version.py の定数を設定で上書き可）。空=送信しない。"""
-        from .version import TELEMETRY_URL
-        return self.settings.value("telemetry_url", "", str) or TELEMETRY_URL
+        """テレメトリ送信先（version.py の定数だけ）。空=送信しない（事務所の版は空）。
+
+        以前は設定の telemetry_url で上書きでき、設定ファイルを書き換えれば送信先を
+        足せた。事務所の外へは送らない決まりなので、上書きは見ない。
+        """
+        from . import version
+        return str(version.TELEMETRY_URL or "")
 
     def _maybe_send_govform_telemetry(self, doc) -> None:
         """同意済みなら、未対応フォームの匿名レポートを自動送信する。
@@ -134,9 +165,8 @@ class UpdateMixin:
                 self, "未対応フォーム機能の報告",
                 "このフォームに未対応の入力補助は見つかりませんでした。")
             return
+        # 既定のファイル名に PDF の名前を使わない（顧問先名・氏名が入っているため）
         base = "TriVReader_未対応フォーム機能.txt"
-        if self.doc.path:
-            base = os.path.splitext(os.path.basename(self.doc.path))[0] + "_未対応機能.txt"
         out, _ = QFileDialog.getSaveFileName(
             self, "報告用に保存", os.path.join(self._last_dir(), base),
             "テキスト (*.txt)")
@@ -144,15 +174,50 @@ class UpdateMixin:
             return
         try:
             from .version import APP_VERSION
-            written = self.doc.write_govform_diagnostic(out, app_version=APP_VERSION)
+            written = self._write_govform_report(out, APP_VERSION)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "報告用に保存", f"書き出しに失敗しました:\n{exc}")
+            from . import logsafe
+            QMessageBox.warning(self, "報告用に保存",
+                                f"書き出しに失敗しました:\n{logsafe.redact(str(exc), 300, 300)}")
             return
         QMessageBox.information(
             self, "報告用に保存",
             f"未対応の入力補助 {len(written)} 件を書き出しました:\n{out}\n\n"
             "このファイルを開発元へお送りいただくと、対応追加を検討できます。\n"
-            "（フォーム側の定義のみを含み、入力した値は含まれません）")
+            "含まれるのは、未対応の関数名・フォーム側のスクリプトの定義・ページ数・"
+            "アプリと部品の版だけです。\n入力した値、PDF のファイル名や保存場所は含まれません。"
+            "送る前に中身をご確認ください。")
+
+    def _write_govform_report(self, out: str, app_version: str) -> list[str]:
+        """報告用テキストを書き出す。PDF のファイル名・パスは書かない。
+
+        報告の本文は document.write_govform_diagnostic が作り、見出しにファイル名を
+        入れる。そのまま利用者の選んだ場所に書かないよう、いったん一時ファイルに
+        書かせ、ファイル名の行と、本文に紛れたファイル名・パスを伏せてから書く。
+        """
+        import tempfile
+
+        from . import logsafe
+
+        fd, tmp = tempfile.mkstemp(prefix="trv_report_", suffix=".txt")
+        os.close(fd)
+        try:
+            written = self.doc.write_govform_diagnostic(tmp, app_version=app_version)
+            if not written:
+                return written
+            with open(tmp, encoding="utf-8") as f:
+                text = f.read()
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        text = _strip_document_names(text, getattr(self.doc, "path", "") or "")
+        # フォームのスクリプトは // がコメントなので、//server の形は見ない
+        text = logsafe.redact_paths(text, slash_unc=False)
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(text)
+        return written
 
     def check_update_on_startup(self) -> None:
         """設定が有効なら、起動直後に静かに更新を確認する。"""
@@ -177,15 +242,24 @@ class UpdateMixin:
         def _worker() -> None:
             try:
                 self._pending_update = updater.check(url, timeout=8)
+            except updater.UpdateRejected:
+                self._pending_update = None
+                self._update_rejected = True   # 署名を確かめられない更新は勧めない
             except Exception:  # noqa: BLE001
                 self._pending_update = None  # ネットワーク不通で起動を邪魔しない
 
         self._pending_update = None
+        self._update_rejected = False
         threading.Thread(target=_worker, daemon=True).start()
         QTimer.singleShot(9000, self._notify_pending_update)
 
     def _notify_pending_update(self) -> None:
+        from . import updater
+
         info = getattr(self, "_pending_update", None)
+        if getattr(self, "_update_rejected", False):
+            self.statusBar().showMessage(updater.REJECT_MESSAGE, 15000)
+            return
         if info:
             self.statusBar().showMessage(
                 f"新しいバージョン {info.get('version', '')} があります"
@@ -208,11 +282,20 @@ class UpdateMixin:
         cur = updater.manifest_url(self.settings)
         url, ok = QInputDialog.getText(
             self, "更新元URLを設定",
-            "update.json の公開URL（GitHub Releases 等）:", text=cur
+            "update.json の公開URL（https のみ。空にすると既定に戻します）:", text=cur
         )
-        if ok:
-            self.settings.setValue("update_url", url.strip())
-            self.statusBar().showMessage("更新元URLを保存しました", 3000)
+        if not ok:
+            return
+        url = url.strip()
+        # https 以外（http・ファイルの場所）は受け付けない。https でも、署名を確かめる
+        # 版では配布元の署名が無い update.json は入れない（updater.check）
+        if url and not updater.is_https(url):
+            QMessageBox.warning(
+                self, "更新元URLを設定",
+                "更新元URLは https:// で始まるものだけ使えます。保存しませんでした。")
+            return
+        self.settings.setValue("update_url", url)
+        self.statusBar().showMessage("更新元URLを保存しました", 3000)
 
     def _pump(self, text: str | None, fn, dialog: QProgressDialog | None = None):
         """fn() を別スレッドで走らせ、終わるまで画面を動かし続けて結果を返す。
@@ -276,6 +359,10 @@ class UpdateMixin:
                               lambda: updater.check(url, include_skipped=True))
         except _Cancelled:
             return
+        except updater.UpdateRejected as exc:
+            # 署名を確かめられない更新は、入れるかを聞かない
+            self._show_update_rejected(exc)
+            return
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "更新の確認", f"確認できませんでした:\n{exc}")
             return
@@ -309,21 +396,19 @@ class UpdateMixin:
             QApplication.processEvents()
             return not dlg.wasCanceled()
 
+        # 署名で確かめた sha256 と合った zip だけを受け取る（合わなければ消して
+        # UpdateRejected）。通信が途切れたら updater.DOWNLOAD_TIMEOUT 秒で諦める
         try:
-            zip_path = updater.download(info["url"], progress=progress)
+            zip_path = updater.download_verified(info, progress=progress)
+        except updater.UpdateRejected as exc:
+            dlg.close()
+            self._show_update_rejected(exc)
+            return
         except Exception as exc:  # noqa: BLE001
             dlg.close()
             QMessageBox.warning(self, "更新", f"ダウンロードに失敗しました:\n{exc}")
             return
         dlg.close()
-        # 改ざん検証（update.json に sha256 があれば照合）
-        if not updater.verify(zip_path, info.get("sha256", "")):
-            QMessageBox.critical(
-                self, "更新",
-                "ダウンロードしたファイルの検証(SHA256)に失敗しました。\n"
-                "更新を中止します。",
-            )
-            return
         # 入れ替える前に、新しい版がこの PC で起動できるかを試す（壊れた版を
         # 入れてしまうと、起動できず自動更新でも直せなくなる）
         wait = QProgressDialog("新しい版を展開しています…", None, 0, 0, self)
@@ -336,6 +421,10 @@ class UpdateMixin:
             src_dir = self._pump(None, lambda: updater.extract(zip_path), dialog=wait)
             wait.setLabelText("新しい版がこの PC で動くかを確かめています…")
             ok, detail = updater.trial_run(src_dir, poll=QApplication.processEvents)
+        except updater.UpdateRejected as exc:   # 確かめていない zip（試しの起動もしない）
+            wait.close()
+            self._show_update_rejected(exc)
+            return
         except Exception as exc:  # noqa: BLE001
             ok, detail = False, str(exc)
         wait.close()
@@ -354,6 +443,14 @@ class UpdateMixin:
                 f"（詳しい内容: {last}）")
             return
         self._apply_update_and_quit(zip_path, src_dir)
+
+    def _show_update_rejected(self, exc) -> None:
+        """署名・中身を確かめられなかった更新を知らせる（入れるかは聞かない）。"""
+        reason = getattr(exc, "reason", "")
+        QMessageBox.warning(
+            self, "更新を入れませんでした",
+            f"{exc}\n今の版のままお使いいただけます。"
+            + (f"\n\n（理由: {reason}）" if reason else ""))
 
     def _apply_update_and_quit(self, zip_path: str, src_dir: str) -> None:
         """アプリを本当に終了して、更新を入れ替える。

@@ -4,8 +4,11 @@
 フォーム指紋）だけ。利用者が入力した値・氏名・住所・口座番号や、ファイル名
 などの個人情報は一切含めない（build_payload を参照）。
 
+事務所の版では version.TELEMETRY_URL を空にしてあり、何も送らない（送信先は
+設定で上書きできない。send_async は TELEMETRY_URL 以外へは送らない）。
+
 前提（すべて満たす時だけ送る）:
-  1. 配布者が version.TELEMETRY_URL に受け口 URL を設定している
+  1. 配布者が version.TELEMETRY_URL に受け口 URL（https）を設定している
   2. ユーザーが明示的に同意している（既定オフ）
   3. 実際に未対応フォームを開いた
 送信は非ブロッキング（デーモンスレッド）で、失敗しても無害に握りつぶす。
@@ -76,8 +79,15 @@ def mark_sent(settings, fp: str) -> None:
 
 
 def send_async(url: str, payload: dict) -> None:
-    """payload を JSON で url に POST する（別スレッド・失敗は無害に無視）。"""
-    if not url:
+    """payload を JSON で url に POST する（別スレッド・失敗は無害に無視）。
+
+    送るのは、配布版に書き込んだ送信先（version.TELEMETRY_URL・https）と同じ url の
+    ときだけ。空なら（事務所の版は空）何も送らない。設定などで別の url を渡されても
+    送らない。
+    """
+    from . import version
+    allowed = str(version.TELEMETRY_URL or "").strip()
+    if not url or not allowed or url != allowed or not allowed.lower().startswith("https://"):
         return
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 

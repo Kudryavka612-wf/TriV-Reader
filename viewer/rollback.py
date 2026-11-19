@@ -153,6 +153,43 @@ def spawn_helper(path: str, script: str, env: dict[str, str]) -> None:
                      close_fds=True)
 
 
+def tasks_snapshot_path(pid: int) -> str:
+    """入れ替え役が tasklist の結果を書き出す一時ファイル（wait_exit_script）。"""
+    return os.path.join(tempfile.gettempdir(), f"trivreader_tasks_{pid}_{os.getpid()}.txt")
+
+
+def wait_exit_script(pid: int, max_wait: int, done_label: str, abort_label: str) -> str:
+    """入れ替え役の .cmd の「アプリが終わるまで待つ」部分（ASCII だけ）。
+
+    以前は `tasklist … | find` が見つからなければ「終わった」としていたので、
+    tasklist そのものが失敗すると（WMI の不調・実行の禁止など）、動いているアプリの
+    上に書き込んでいた。いまは一度の tasklist の結果（CSV）をファイルに書き、
+      - tasklist が失敗した、または この入れ替え役自身（cmd.exe）すら見えない
+        → 確かめられない。「まだ動いている」とみなして待つ
+      - "実行ファイル名","PID" の組が見える → まだ動いている。待つ
+      - どちらでもない → 終わった（done_label へ）
+    とし、max_wait 回（約 1 秒ずつ）待っても確かめられなければ abort_label へ
+    （何も書き換えない）。PID と名前の組で見るのは、終わった後に同じ PID が別の
+    プロセスに使い回されたときに待ち続けないため。呼び出し側は環境変数
+    TRV_TASKS（tasks_snapshot_path）と TRV_EXENAME を渡すこと。
+    """
+    sysdir = r"%SystemRoot%\System32"
+    pid = int(pid)
+    return f"""set _wait=0
+:waitloop
+{sysdir}\\tasklist.exe /NH /FO CSV > "%TRV_TASKS%" 2>nul
+if errorlevel 1 goto waitmore
+{sysdir}\\findstr.exe /L /I /C:"\\"cmd.exe\\"" "%TRV_TASKS%" >nul
+if errorlevel 1 goto waitmore
+{sysdir}\\findstr.exe /L /I /C:"\\"%TRV_EXENAME%\\",\\"{pid}\\"" "%TRV_TASKS%" >nul
+if errorlevel 1 goto {done_label}
+:waitmore
+set /a _wait+=1
+if %_wait% GEQ {int(max_wait)} goto {abort_label}
+{sysdir}\\ping.exe -n 2 127.0.0.1 >nul
+goto waitloop"""
+
+
 def _message(text: str, flags: int) -> int:
     if _TEST:
         return _IDYES
@@ -164,12 +201,36 @@ def _message(text: str, flags: int) -> int:
         return 0
 
 
+LOG_MAX_BYTES = 256 * 1024   # これを超えたら 1 世代だけ回す（startup_error.log.1）
+
+
+def _redact(text: str) -> str:
+    """記録・表示の前に、パス（顧問先名・氏名が入る）や番号を伏せる（logsafe）。
+
+    伏せる仕組みを読み込めないときは、伏せずに書くことはせず、中身を書かない。
+    """
+    try:
+        from .logsafe import redact
+        return redact(text)
+    except Exception:  # noqa: BLE001  起動できない状態でも記録は止めない
+        return "（記録を伏せる仕組みを読み込めなかったため、内容は書きません）"
+
+
+def log_path() -> str:
+    return os.path.join(state_dir(), "logs", "startup_error.log")
+
+
 def _log(text: str) -> None:
     try:
-        d = os.path.join(state_dir(), "logs")
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "startup_error.log"), "a", encoding="utf-8") as f:
-            f.write(text.rstrip() + "\n\n")
+        path = log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            if os.path.getsize(path) > LOG_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass   # まだ無い・回せない
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(_redact(text).rstrip() + "\n\n")
     except OSError:
         pass
 
@@ -181,7 +242,7 @@ def offer(what: str, version: str, detail: str) -> bool:
     True が返ったらすぐ終わること。
     """
     _log(f"{what}\n{detail}")
-    last = (detail.strip().splitlines() or [""])[-1][:300]
+    last = (_redact(detail).strip().splitlines() or [""])[-1][:300] if detail else ""
     tail = f"\n\n（詳しい内容: {last}）" if last else ""
     prev = previous()
     if prev and prev.get("version") != version:
@@ -199,6 +260,8 @@ def offer(what: str, version: str, detail: str) -> bool:
         f"{what}\n\n最新のインストーラーで入れ直すと直ることがあります。"
         "配布ページを開きますか？" + tail, _MB_YESNO | _MB_ICONWARNING)
     if ans == _IDYES and not _TEST:
+        # 配布ページをブラウザで開くだけ（何もダウンロード・実行しない。入れ直すのは
+        # 利用者が自分でインストーラーを選んだとき）。開くのは https の固定の URL だけ
         try:
             os.startfile(f"https://github.com/{GITHUB_REPO}/releases/latest")  # noqa: S606
         except OSError:
@@ -207,11 +270,13 @@ def offer(what: str, version: str, detail: str) -> bool:
 
 
 def restore_and_restart(target_dir: str | None = None, exe: str | None = None,
-                        wait_pid: int | None = None) -> None:
+                        wait_pid: int | None = None, max_wait: int = 60) -> None:
     """前の版をアプリのフォルダへ書き戻し、起動し直す（このプロセスの終了後に）。
 
     /MIR で書き戻すのは、壊れた版だけにあるファイルを残さないため（残ると前の版が
     それを読んでしまうことがある）。利用者のデータと設定のファイルは触らない。
+    max_wait 回（約 1 秒ずつ）待ってもアプリが終わったと確かめられなければ、何もせずに
+    諦める（wait_exit_script）。
     """
     target_dir = target_dir or app_dir()
     exe = exe or sys.executable
@@ -225,19 +290,14 @@ def restore_and_restart(target_dir: str | None = None, exe: str | None = None,
     # 遅延展開（!変数!）は使わない: パスに ! があると消えてしまう。ループは行ごとに
     # 読まれるので、%変数% のままで毎回の値になる
     script = f"""@echo off
-set _wait=0
-:waitloop
-{sysdir}\\tasklist.exe /FI "PID eq {pid}" /FI "IMAGENAME eq %TRV_EXENAME%" 2>nul | {sysdir}\\find.exe /I "%TRV_EXENAME%" >nul
-if errorlevel 1 goto restore
-set /a _wait+=1
-if %_wait% GEQ 60 goto aborted
-{sysdir}\\ping.exe -n 2 127.0.0.1 >nul
-goto waitloop
+{wait_exit_script(pid, max_wait, "restore", "aborted")}
 :restore
 {sysdir}\\robocopy.exe "%TRV_BACKUP%" "%TRV_APP%" /MIR /NFL /NDL /NJH /NJS /NP /R:5 /W:1 /XD {keep_dirs} /XF {keep_files} >nul
 {restart}:aborted
+del "%TRV_TASKS%" 2>nul
 del "%~f0"
 """
-    spawn_helper(helper, script, {"TRV_EXENAME": exe_name, "TRV_EXE": exe,
+    spawn_helper(helper, script, {"TRV_TASKS": tasks_snapshot_path(pid),
+                                  "TRV_EXENAME": exe_name, "TRV_EXE": exe,
                                   "TRV_BACKUP": backup_dir(),
                                   "TRV_APP": os.path.normpath(target_dir)})

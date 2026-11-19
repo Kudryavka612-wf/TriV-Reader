@@ -2530,7 +2530,11 @@ class PageView(QScrollArea):
         self.clear_selection()
         self.clear_text_selection()
         if kind == "annot" and index is not None:
-            self._after_annot(index)
+            # 複数のページにまたがる 1 操作（全てハイライト）は、そのページ全部を描き直す
+            pages = list(getattr(self._doc, "last_history_pages", None) or [index])
+            for i in pages:
+                if 0 <= i < len(self._labels):
+                    self._after_annot(i)
         # kind == "doc" の作り直しは呼び出し側（MainWindow._reload）に任せる。
         # ここで reload するとサムネイルや整理画面と食い違うため。
         return result
@@ -2888,17 +2892,28 @@ class PageView(QScrollArea):
                 self._commit_radio(i, x, n, s) if on else None)
         elif kind == "checkbox":
             ctl = _FormCheckBox(label)
-            checked = str(value) not in ("", "Off", "/Off", "No", "false", "False", "0")
+            # 同じ名前で書き出し値の違うチェックボックス（男=/M・女=/F の二者択一）は、
+            # 欄の値（/V）が自分の ON の名前と同じときだけチェック済み（Acrobat と同じ）。
+            # 以前は /V が Off 以外なら全部チェック済みに見えた
+            if "checked" in field:
+                checked = bool(field["checked"])
+            else:
+                checked = str(value) not in ("", "Off", "/Off", "No", "false", "False", "0")
+            ctl.setProperty("trv_on", field.get("on_state") or "")
             ctl.setChecked(checked)
             ctl.toggled.connect(
-                lambda on, i=index, x=xref, n=field["name"]: self._commit_field(i, x, on, n))
+                lambda on, i=index, x=xref, n=field["name"], c=ctl:
+                self._commit_checkbox(i, x, on, n, c))
         elif kind in ("combo", "list"):
             ctl = _FormComboBox(label)
             ctl.setEditable(kind == "combo")
             ctl.addItems(field["choices"])
-            if value and value not in field["choices"]:
-                ctl.addItem(str(value))
-            ctl.setCurrentText(str(value))
+            # /V は選択肢のエクスポート値（Acrobat が書く形。例 "01"）。表示名に直して選ぶ。
+            # 以前は "01" を余分な項目として足し、それを選んでいた
+            shown = str(field.get("display_value", value) or "")
+            if shown and shown not in field["choices"]:
+                ctl.addItem(shown)
+            ctl.setCurrentText(shown)
             ctl.currentTextChanged.connect(
                 lambda text, i=index, x=xref, n=field["name"]:
                 self._commit_combo(i, x, text, n))
@@ -2925,12 +2940,18 @@ class PageView(QScrollArea):
             if field.get("password"):
                 ctl.setEchoMode(QLineEdit.EchoMode.Password)   # 伏せ字の欄
             else:
-                # 入力候補（以前に入れた内容）。欄に入ったときに付け、確定で覚える
+                # 入力候補（以前に入れた内容）。欄に入ったときに付け、利用者が確定
+                # したとき（Enter・Tab・欄の外のクリック）だけ覚える。editingFinished
+                # では覚えない: 保存・自動保存・拡大縮小で打ちかけの文字を書き込む
+                # ときにも出る（commit_focused_field）ので、途中の値まで覚えていた。
+                # 候補の鍵は欄の名前だけ（ほかの欄で入れた値は出さない）。番号・
+                # 口座などの欄かどうかは、欄の説明（/TU）とフォームの JS の項目名でも見る
                 rules = field.get("rules") or {}
-                ctl.setProperty("trv_hkey", rules.get("label") or field.get("label")
-                                or field["name"])
+                ctl.setProperty("trv_hkey", field["name"] or "")
+                ctl.setProperty("trv_hnames", [str(rules.get("label") or ""),
+                                               str(field.get("label") or "")])
                 ctl.installEventFilter(self)
-                ctl.editingFinished.connect(lambda c=ctl: self._remember_entry(c))
+                ctl.returnPressed.connect(lambda c=ctl: self._remember_entry(c))
         ctl.setGeometry(round(x0), round(y0), w, h)
         # どの欄か（ズームで作り直したあと、入力中の欄へカーソルを戻すため）
         ctl.setProperty("trv_field", field["name"])
@@ -3164,7 +3185,8 @@ class PageView(QScrollArea):
         if form_history.enabled() and not ctl.isReadOnly():
             items = form_history.history().suggestions(
                 ctl.property("trv_hkey"),
-                ctl.maxLength() if ctl.maxLength() < 32767 else 0)
+                ctl.maxLength() if ctl.maxLength() < 32767 else 0,
+                *(ctl.property("trv_hnames") or []))
         comp = ctl.completer()
         if comp is None:
             if not items:
@@ -3179,6 +3201,12 @@ class PageView(QScrollArea):
         else:
             comp.model().setStringList(items)
 
+    #: 利用者が欄を確定して抜けたとみなすフォーカスの移り方（入力候補に覚える）。
+    #: ほかの移り方（プログラムからの setFocus/clearFocus＝OtherFocusReason、
+    #: ウィンドウの切り替え、候補の一覧が開いた）は、打ちかけのことがあるので覚えない
+    _USER_COMMIT_REASONS = (Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason,
+                            Qt.FocusReason.MouseFocusReason)
+
     @staticmethod
     def _remember_entry(ctl) -> None:
         from . import form_history
@@ -3186,7 +3214,7 @@ class PageView(QScrollArea):
             if not form_history.enabled() or ctl.isReadOnly():
                 return
             form_history.history().add(ctl.text(), ctl.property("trv_hkey") or "",
-                                       ctl.property("trv_field") or "")
+                                       *(ctl.property("trv_hnames") or []))
         except RuntimeError:
             pass   # 欄が破棄済み
 
@@ -3227,6 +3255,30 @@ class PageView(QScrollArea):
             # 黙って捨てない（以前は保存後の入力がこうして消えていた）
             self.status_message.emit(
                 f"入力欄「{name or xref}」に値を書き込めませんでした")
+
+    def _commit_checkbox(self, index, xref, on, name, ctl) -> None:
+        """チェックボックスを付ける／外す。同じ名前のほかのチェックボックス（別の
+        書き出し値の二者択一・別のページの同じ欄）の表示も、欄の値に合わせ直す。"""
+        self._commit_field(index, xref, on, name)
+        if not self._doc or not name:
+            return
+        try:
+            mine = ctl.property("trv_on") or ""
+        except RuntimeError:
+            return
+        value = mine if on else ""
+        for other in self._form_overlays:
+            try:
+                if (other is ctl or not isinstance(other, _FormCheckBox)
+                        or other.property("trv_field") != name):
+                    continue
+                want = bool(value) and other.property("trv_on") == value
+                if other.isChecked() != want:
+                    other.blockSignals(True)
+                    other.setChecked(want)
+                    other.blockSignals(False)
+            except RuntimeError:
+                continue   # 破棄済み
 
     def _commit_radio(self, index, xref, name, on_state) -> None:
         """ラジオボタンを選ぶ。同じグループの、画面に出ている他のボタンは外す。"""
@@ -3386,6 +3438,11 @@ class PageView(QScrollArea):
                 # 候補の一覧を閉じて戻ってきたときは触らない（一覧の処理の最中に
                 # 差し替えると落ちる）
                 self._attach_completer(obj)
+            return False
+        if (event.type() == QEvent.Type.FocusOut and isinstance(obj, QLineEdit)
+                and obj.property("trv_hkey")
+                and event.reason() in self._USER_COMMIT_REASONS):
+            self._remember_entry(obj)   # Tab・クリックで欄を抜けた（利用者の確定）
             return False
         if obj is self.viewport():
             et = event.type()

@@ -65,9 +65,12 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\TriV-Reader
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-; 管理者権限を要求しない（UAC なし・ユーザー領域へインストール）
+; 管理者権限を要求しない（UAC なし・ユーザー領域へインストール）。
+; 「すべてのユーザー（Program Files・管理者）」は選ばせない: 自動更新は利用者の権限で
+; アプリのフォルダへ書くので、Program Files に入れると更新が黙って失敗し続ける。
+; そのため PrivilegesRequiredOverridesAllowed は書かない（ダイアログでも /ALLUSERS でも
+; 切り替えられない）。管理者として起動されても、この利用者の領域に入れる。
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
 OutputDir={#OutputDir}
 OutputBaseFilename=TriVReader-Setup-{#MyAppVersion}
 Compression=lzma2/max
@@ -141,6 +144,30 @@ begin
   // インストール完了後、シェルに関連付け変更を通知（即座に反映させる）
   if CurStep = ssPostInstall then
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0);
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  Result := True;
+  // 念のため: 「すべてのユーザー」（管理者・Program Files）では入れない。
+  // [Setup] で切り替えられないようにしてあるので、ここに来ることはないはず
+  if IsAdminInstallMode() then
+  begin
+    if not WizardSilent() then
+      MsgBox('TriV-Reader は「この利用者だけ」に入れます（自動更新のため）。' + #13#10 +
+             '管理者としてではなく、ふつうに Setup を実行してください。', mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+  // 以前「すべてのユーザー」で入れた版（Program Files）が残っていると、2 つ並ぶ。
+  // そちらは自動更新できないので、消してもらうよう知らせる（入れるのは止めない）
+  if (not WizardSilent()) and
+     RegKeyExists(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
+                        '{' + '{#MyAppGuid}' + '}' + '_is1') then
+    MsgBox('「すべてのユーザー」向けに入れた古い TriV-Reader（Program Files）が残っています。' + #13#10 +
+           'そちらは自動更新できません。管理者に［設定 > アプリ］からのアンインストールを' +
+           '依頼してください。' + #13#10#13#10 +
+           'このまま、この利用者向けに入れます。', mbInformation, MB_OK);
 end;
 
 var

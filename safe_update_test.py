@@ -27,6 +27,8 @@ os.environ["LOCALAPPDATA"] = os.path.join(TMP, "localappdata")   # 控え・記�
 os.makedirs(os.environ["LOCALAPPDATA"], exist_ok=True)
 
 from viewer import rollback, updater  # noqa: E402
+# このテストは署名の無い file:// の更新を使う。署名の確かめは signed_update_test.py で見る
+updater._ver.UPDATE_PUBLIC_KEY = ""
 
 results: list[bool] = []
 

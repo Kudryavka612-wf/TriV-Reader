@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 from . import ocr
 from . import settings_dialog as prefs
 from .document import PdfDocument
-from .util import unique_path, parse_ranges
+from .util import parse_ranges, unique_path, user_error
 
 
 class ConvertMixin:
@@ -43,7 +43,7 @@ class ConvertMixin:
             else:
                 self.doc.export_text(out)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"書き出せませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"書き出せませんでした:\n{user_error(exc)}")
             return
         self.statusBar().showMessage(f"書き出しました: {out}", 4000)
 
@@ -73,7 +73,7 @@ class ConvertMixin:
         except Exception as exc:  # noqa: BLE001
             dlg.close()
             QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "エラー", f"傾き補正に失敗:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"傾き補正に失敗:\n{user_error(exc, saving=False)}")
             return
         finally:
             QApplication.restoreOverrideCursor()
@@ -109,7 +109,7 @@ class ConvertMixin:
             try:
                 tessdata = ocr.ensure_languages(["jpn", "eng"])
             except Exception as exc:  # noqa: BLE001
-                QMessageBox.critical(self, "エラー", f"OCR準備に失敗:\n{exc}")
+                QMessageBox.critical(self, "エラー", f"OCR準備に失敗:\n{user_error(exc, saving=False)}")
                 return
 
         dlg = QProgressDialog("バッチ処理中…", "キャンセル", 0, len(paths), self)
@@ -145,7 +145,7 @@ class ConvertMixin:
                 d.close()
                 done += 1
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{stem}: {exc}")
+                errors.append(f"{stem}: {user_error(exc)}")
         dlg.setValue(len(paths))
         msg = f"{done} 件を処理しました。\n出力先: {out_dir}"
         if errors:
@@ -174,7 +174,7 @@ class ConvertMixin:
         try:
             ta, tb = text_of(a), text_of(b)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"比較できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"比較できませんでした:\n{user_error(exc, saving=False)}")
             return
         diff = list(difflib.unified_diff(
             ta.splitlines(), tb.splitlines(),
@@ -258,7 +258,7 @@ class ConvertMixin:
             else:
                 stats = self.doc.compress_to_advanced(out, progress=progress, **opts)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"圧縮できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"圧縮できませんでした:\n{user_error(exc)}")
             return
         finally:
             QApplication.restoreOverrideCursor()
@@ -310,7 +310,7 @@ class ConvertMixin:
         try:
             self.doc.compress_to(out)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"最適化できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"最適化できませんでした:\n{user_error(exc)}")
             return
         after = os.path.getsize(out)
         msg = f"最適化して保存しました:\n{out}\n\nサイズ: {after:,} バイト"
@@ -330,7 +330,7 @@ class ConvertMixin:
         try:
             self.doc.export_pdfa(out)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"PDF/A 化できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"PDF/A 化できませんでした:\n{user_error(exc)}")
             return
         QMessageBox.information(
             self, "PDF/A 完了",
@@ -389,7 +389,7 @@ class ConvertMixin:
         try:
             outputs = self.doc.export_page_images(indices, out_dir, fmt, dpi, stem)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"書き出せませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"書き出せませんでした:\n{user_error(exc)}")
             return
         QMessageBox.information(
             self, "完了", f"{len(outputs)} 枚の画像を出力しました。\n{out_dir}"
@@ -398,7 +398,7 @@ class ConvertMixin:
     def images_to_pdf_dialog(self) -> None:
         """画像→PDF。複数画像から新しい PDF を作る（開いていなくても可）。"""
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "PDF にする画像を選択（複数可）", "",
+            self, "PDF にする画像を選択（複数可）", self._last_dir(),
             "画像 (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff)",
         )
         if not paths:
@@ -413,7 +413,7 @@ class ConvertMixin:
         try:
             PdfDocument.images_to_pdf(paths, out)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"作成できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"作成できませんでした:\n{user_error(exc)}")
             return
         ret = QMessageBox.question(
             self, "完了", f"PDF を作成しました:\n{out}\n\n今すぐ開きますか？"
@@ -426,7 +426,7 @@ class ConvertMixin:
         if not self.doc.is_open:
             return
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "ページとして追加する画像を選択（複数可）", "",
+            self, "ページとして追加する画像を選択（複数可）", self._last_dir(),
             "画像 (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff)",
         )
         if not paths:
@@ -434,7 +434,7 @@ class ConvertMixin:
         try:
             added = self.doc.insert_images_as_pages(paths)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"追加できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"追加できませんでした:\n{user_error(exc)}")
             return
         self._reload(self.doc.page_count - 1)
         self.statusBar().showMessage(f"{added} ページ（画像）を追加しました", 3000)
@@ -495,7 +495,7 @@ class ConvertMixin:
             done = self.doc.ocr_to(out, language, tessdata, dpi=300, progress=progress)
         except Exception as exc:  # noqa: BLE001
             dlg.close()
-            QMessageBox.critical(self, "OCR エラー", f"OCR に失敗しました:\n{exc}")
+            QMessageBox.critical(self, "OCR エラー", f"OCR に失敗しました:\n{user_error(exc, saving=False)}")
             return
         dlg.close()
         if not done:

@@ -304,9 +304,11 @@ def test_history(app, w) -> None:
     ev.setCommitString("山")
     app.sendEvent(other, ev)
     pump(app, 0.2)
-    check("the name is suggested in another name field",
-          comp is not None and comp.completionCount() >= 1
-          and comp.currentCompletion() == "山田太郎",
+    # v1.12.0 の決定: 候補は同じ名前の欄で入れたものだけ。別の欄（別の顧問先の
+    # 書類の別の欄など）には出さない
+    check("the name is NOT suggested in a different field",
+          comp is None or comp.completionCount() == 0
+          or "山田太郎" not in comp.model().stringList(),
           f"({comp and comp.model().stringList()}, focus={other.hasFocus()}, "
           f"text={other.text()!r}, n={comp and comp.completionCount()})")
     if comp is not None and comp.popup().isVisible():

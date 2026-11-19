@@ -38,6 +38,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from .util import user_error
+
 
 _WORKERS: set = set()   # 画面を閉じられても、走っている調べは終わるまで捨てない
 _QUIT_HOOKED = False
@@ -191,6 +193,8 @@ class DocTabBar(QTabBar):
 
     # タブをウィンドウの外までドラッグして離した（タブの番号, 離した画面上の位置）
     detach_requested = Signal(int, QPoint)
+    # 最大化中は、タブの列からこれだけ下へ引き下ろして離したら外へ出す
+    DETACH_PULL = 120
 
     def tabSizeHint(self, index: int) -> QSize:  # noqa: N802 (Qt 命名)
         s = super().tabSizeHint(index)
@@ -236,8 +240,16 @@ class DocTabBar(QTabBar):
         pos = event.globalPosition().toPoint()
         if (pos - self._press_global).manhattanLength() < QApplication.startDragDistance():
             return   # ただのクリック
-        if self.window().frameGeometry().contains(pos):
-            return   # ウィンドウの中で離した＝並べ替え
+        win = self.window()
+        if win.frameGeometry().contains(pos):
+            # 最大化・全画面だとウィンドウの外が（モニター 1 台では）無い。その
+            # ときは、タブの列から大きく下（ページの上）へ引き下ろして離したら
+            # 外へ出したことにする（ブラウザーと同じ）
+            if not (win.isMaximized() or win.isFullScreen()):
+                return   # ウィンドウの中で離した＝並べ替え
+            bar_bottom = self.mapToGlobal(QPoint(0, self.height())).y()
+            if pos.y() < bar_bottom + self.DETACH_PULL:
+                return
         index = self.currentIndex()
         if index >= 0:
             self.detach_requested.emit(index, pos)
@@ -714,8 +726,8 @@ class ToolsMixin:
                 continue
             before = self.tabs.count()
             self._close_tab(i)
-            if self.tabs.count() == before:   # キャンセルされた
-                i += 1
+            if self.tabs.count() == before:   # キャンセルされた＝ここで止める
+                return                        # （残りの未保存タブを続けて聞かない）
 
     def close_all_tabs(self) -> None:
         while self.tabs.count() > 0:
@@ -763,7 +775,7 @@ class ToolsMixin:
             self.doc.flatten_to(out, annots=cb_annots.isChecked(),
                                 widgets=cb_widgets.isChecked())
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"固定して保存できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"固定して保存できませんでした:\n{user_error(exc)}")
             return
         self.statusBar().showMessage(f"固定して保存しました: {out}", 5000)
         ret = QMessageBox.question(

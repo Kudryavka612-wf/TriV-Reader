@@ -178,6 +178,10 @@ def main() -> int:
         test_manual_zoom_stops_following(app, w)
         test_fit_height_follows(app, w)
         test_mixed_page_sizes(app, w, root)
+        # 次のテストは「別に起動したアプリ」のつもり。同じファイルを開いている w が
+        # ウィンドウの一覧に残っていると、二重に開かないようそちらが前に出てしまう
+        from viewer import main_window as mw
+        mw._forget_window(w)
         test_open_while_hidden(app, root)
         for i in range(w.tabs.count()):
             t = w.tabs.widget(i)

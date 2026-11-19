@@ -6,6 +6,11 @@
 
 ログ: %LOCALAPPDATA%\\trivreader\\logs\\error.log （ポータブル時は
 TriVReader_data\\logs）。512KB を超えたら 1 世代だけ error.log.1 へ回す。
+
+書く前に logsafe.redact で伏せる: フォルダ名・ファイル名には顧問先の会社名や
+氏名が入り、例外の文面には入力欄の値が入ることがあるため。パスは <パス>.pdf の
+ように拡張子だけ残し（アプリ自身・Python のソースの場所は読めるまま）、長い番号を
+伏せ、1 行と 1 件の長さに上限を付ける。
 """
 from __future__ import annotations
 
@@ -16,7 +21,7 @@ import threading
 import time
 import traceback
 
-from . import storage
+from . import logsafe, storage
 
 MAX_BYTES = 512 * 1024      # これを超えたら 1 世代だけ回す
 MAX_DIALOGS = 3             # この時間内にダイアログを出す上限（連発を防ぐ）
@@ -72,16 +77,20 @@ def _rotate(path: str) -> None:
 
 
 def write(text: str, context: str = "") -> str:
-    """1 件書き込んでログのパスを返す。書けなくても例外は投げない。"""
+    """1 件書き込んでログのパスを返す。書けなくても例外は投げない。
+
+    text と context は伏せてから書く（logsafe.redact）。
+    """
     path = log_path()
     _rotate(path)
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     head = f"===== {stamp} | {_environment()}"
     if context:
-        head += f" | {context}"
+        head += f" | {logsafe.redact(context, max_line=200, max_total=200)}"
+    body = logsafe.redact(text).rstrip()
     try:
         with _lock, open(path, "a", encoding="utf-8") as f:
-            f.write(f"{head} =====\n{text.rstrip()}\n")
+            f.write(f"{head} =====\n{body}\n")
     except OSError:
         pass
     return path
@@ -147,7 +156,8 @@ def _hook(etype, value, tb) -> None:
         return
     text = "".join(traceback.format_exception(etype, value, tb))
     path = write(text, "unhandled")
-    _notify(path, f"{etype.__name__}: {value}")
+    # 画面の要約も伏せる（そのまま写して送られることがあるため）
+    _notify(path, logsafe.redact(f"{etype.__name__}: {value}", max_line=300, max_total=300))
 
 
 def _thread_hook(args) -> None:

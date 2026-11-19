@@ -48,7 +48,7 @@ from .mw_convert import ConvertMixin
 from .mw_print import PrintMixin
 from .mw_tools import DocTabBar, ToolsMixin
 from .mw_update import UpdateMixin
-from .util import parse_ranges
+from .util import parse_ranges, user_error
 from .welcome import WelcomeWidget
 
 ZOOM_STEP = 1.25
@@ -958,8 +958,11 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         default_zoom_btn.setMenu(dz_menu)
         self.default_zoom_btn = default_zoom_btn
         g.add_widget(default_zoom_btn)
-        g = r.add_group(p, "回転")
-        g.add_stack([self.act_rotate_left, self.act_rotate_right])
+        # 「元に戻す」は注釈タブの右端にしか無く、ページの回転・削除などを画面から
+        # 戻せなかった（Ctrl+Z を知らない人が困る）。よく使うホームにも置く
+        g = r.add_group(p, "回転・戻す")
+        g.add_stack([self.act_rotate_left, self.act_rotate_right,
+                     self.act_undo, self.act_redo])
         g = r.add_group(p, "検索")
         g.add_action(self.act_find, big=True)  # 押すと検索ポップアップが出る
         r.end_page(p)
@@ -988,6 +991,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
 
         # ── ページ ──────────────────────────────────────────────
         p = r.add_page("ページ")
+        g = r.add_group(p, "戻す")   # ページの削除・並べ替えなどをその場で戻せるように
+        g.add_stack([self.act_undo, self.act_redo])
         g = r.add_group(p, "モード")
         g.add_action(self.act_organize, big=True)
         g.add_action(self.act_form, big=True)
@@ -1541,7 +1546,28 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         if path:
             self.open_path(path)
 
-    def open_path(self, path: str, page: int | None = None) -> None:
+    def _focus_open_file(self, path: str, ignore_tab=None, show: bool = False) -> bool:
+        """path をどこかのウィンドウで開いていれば、そのタブを前に出して True。
+
+        Windows のパスは大文字・小文字を区別しないので normcase で比べる。
+        ignore_tab は「今まさに別のウィンドウへ移そうとしているタブ」を数えないため。
+        show=True は外（エクスプローラー）から来たとき。自分のウィンドウでも
+        トレイに隠れていることがあるので、見つけたウィンドウを必ず前に出す。
+        """
+        key = os.path.normcase(os.path.abspath(path))
+        wins = [self] + [w for w in all_windows() if w is not self]
+        for win in wins:
+            for i in range(win.tabs.count()):
+                t = win.tabs.widget(i)
+                if (t is not ignore_tab and isinstance(t, DocTab) and t.doc.path
+                        and os.path.normcase(os.path.abspath(t.doc.path)) == key):
+                    win.tabs.setCurrentIndex(i)
+                    if show or win is not self:
+                        win._show_from_tray()   # 最小化・裏・トレイから前へ
+                    return True
+        return False
+
+    def open_path(self, path: str, page: int | None = None, ignore_tab=None) -> None:
         """PDF を開く。page を渡すとそのページから出す（前回の続きの案内は出さない）。"""
         # 相対パスは CWD を動かす前に解決しておく。開いたフォルダを掴んだままに
         # すると Windows ではそのフォルダを削除/移動できなくなるので、開くたびに
@@ -1550,12 +1576,11 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         path = os.path.abspath(path)
         storage.ensure_safe_cwd()
 
-        # 既に同じファイルを開いていれば、そのタブへ切り替える
-        for i in range(self.tabs.count()):
-            t = self.tabs.widget(i)
-            if isinstance(t, DocTab) and t.doc.path and os.path.abspath(t.doc.path) == os.path.abspath(path):
-                self.tabs.setCurrentIndex(i)
-                return
+        # 既に同じファイルを開いていれば（どのウィンドウでも）、そのタブへ切り替える。
+        # 2 つのウィンドウで同じファイルを開くと、後から保存した方がもう一方の入力を
+        # 黙って上書きする（自動保存なら数分ごとに上書きし合う）ため、二重には開かない
+        if self._focus_open_file(path, ignore_tab=ignore_tab):
+            return
 
         # 「前回の倍率を維持」モード用に、新規タブ初期化の副作用で上書きされる
         # 前に読み取っておく
@@ -1566,7 +1591,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         try:
             doc.open(path)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"開けませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"開けませんでした:\n{user_error(exc, saving=False)}")
             tab.deleteLater()
             return
         # 暗号化PDF: 使い捨て複製でパスワードを確定してから本体を開く
@@ -1677,8 +1702,15 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             self.save()
             if tab.doc.modified:   # 保存が取りやめられた
                 return None
+            # 上書きに失敗して「名前を付けて保存」に回ると、保存先が変わる。
+            # 先に取ったパスのままだと、編集前の元ファイルを開いてしまう
+            path = tab.doc.path
+            name = self.tabs.tabText(self.tabs.indexOf(tab))
         page = tab.page_view.index
         win = MainWindow(secondary=True)
+        # 保存されている「最大化」を引き継ぐと、離した位置ではなく元のウィンドウに
+        # 重なって全画面に出る。新しいウィンドウは通常の大きさで出す
+        win.setWindowState(Qt.WindowState.WindowNoState)
         # テーマは今の表示に合わせる（設定に残る値は終了時のものなので古いことがある）
         if win.act_dark.isChecked() != self.act_dark.isChecked():
             win.act_dark.setChecked(self.act_dark.isChecked())
@@ -1691,7 +1723,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         else:
             win.move(self.pos() + QPoint(40, 40))
         win.show()
-        win.open_path(path, page=page)
+        win.open_path(path, page=page, ignore_tab=tab)
         if win.tabs.count() == 0:   # 開けなかった（パスワードの取りやめなど）
             win._force_quit = True
             win.close()
@@ -1724,6 +1756,10 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         # 先にウィンドウを出す。非表示のまま開くとビューポートの幅が確定して
         # おらず、「幅に合わせる」が極端な倍率になる（トレイ常駐中にエクスプ
         # ローラから開いたときに、ファイルごとに表示がばらつく原因）。
+        # どこかのウィンドウで開いているなら、そのウィンドウを前に出すだけ（外へ
+        # 出したウィンドウなら、最初のウィンドウはトレイに隠れたままでよい）
+        if path and self._focus_open_file(os.path.abspath(path), show=True):
+            return
         self._show_from_tray()
         if path:
             self.open_path(path)
@@ -2179,9 +2215,20 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
     def _apply_redactions(self) -> None:
         if not self.doc.is_open:
             return
+        pending = sum(self.doc.pending_redactions(i) for i in range(self.doc.page_count))
+        if pending == 0:
+            QMessageBox.information(
+                self, "墨消しの適用",
+                "墨消しの範囲がまだありません。先に「墨消し」で消したい所を囲んでください。")
+            return
+        # 消すと戻せない操作なので、Enter だけで進まないよう既定は「いいえ」
         ret = QMessageBox.question(
             self, "墨消しの適用",
-            "登録済みの墨消し範囲の文字・画像・入力欄の値を完全に削除します。続行しますか？（Ctrl+Z で直後なら戻せますが、保存して閉じると元には戻せません）",
+            f"登録済みの墨消し範囲（{pending} か所）の文字・画像・入力欄の値を完全に"
+            "削除します。続行しますか？（Ctrl+Z で直後なら戻せますが、保存して閉じると"
+            "元には戻せません）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
         if ret != QMessageBox.StandardButton.Yes:
             return
@@ -2301,7 +2348,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             try:
                 self.doc.set_toc(dlg.result_toc())
             except Exception as exc:  # noqa: BLE001
-                QMessageBox.warning(self, "目次", f"目次を更新できませんでした:\n{exc}")
+                QMessageBox.warning(self, "目次", f"目次を更新できませんでした:\n{user_error(exc)}")
                 return
             self.toc_dock.load(self.doc.get_toc())
             self._update_title()
@@ -2397,7 +2444,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         try:
             self.doc.save_encrypted(out, pw)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"保護できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"保護できませんでした:\n{user_error(exc)}")
             return
         QMessageBox.information(self, "完了", f"AES-256 で保護して保存しました:\n{out}")
 
@@ -2416,7 +2463,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         try:
             self.doc.save_decrypted(out)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"解除できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"解除できませんでした:\n{user_error(exc)}")
             return
         QMessageBox.information(self, "完了", f"暗号化を解除して保存しました:\n{out}")
 
@@ -2639,8 +2686,20 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         # ダーク・見開き・パネルの表示などはリボンで切り替えられ、保存は終了時だけだった。
         # ダイアログは保存値から作るので、開く前に今の状態を書いておかないと、別の項目を
         # 変えて OK しただけで、リボンで切り替えた画面が古い値に巻き戻っていた
-        self._save_settings(session=False)
+        # 外へ出したウィンドウから開いたときも、書くのは最初のウィンドウの状態
+        # （外のウィンドウは設定を書かない約束。位置やパネルを外の値で上書きしない）
+        base = primary_window() if self._secondary else None
+        (base or self)._save_settings(session=False)
         prefs.SettingsDialog(self).exec()
+
+    def apply_preferences_everywhere(self, annot_changed: bool = True) -> None:
+        """設定はアプリ全体で 1 つ。開いているすべてのウィンドウへ反映する
+        （自動保存・ジェスチャー・注釈の既定などが、設定したウィンドウにしか
+        効かず、ほかのウィンドウが古い設定のまま動いていた）。"""
+        self.apply_preferences(annot_changed=annot_changed)
+        for w in all_windows():
+            if w is not self:
+                w.apply_preferences(annot_changed=annot_changed)
 
     def apply_preferences(self, annot_changed: bool = True) -> None:
         """設定の内容を、今開いているウィンドウへ反映する。
@@ -2855,11 +2914,14 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
     def _add_recent(self, path: str) -> None:
         self.settings.setValue("last_dir", os.path.dirname(path))
         recent = self.settings.value("recent", [], list) or []
-        recent = [p for p in recent if p != path]
+        key = os.path.normcase(os.path.abspath(path))   # 大文字・小文字違いを同じものに
+        recent = [p for p in recent if os.path.normcase(os.path.abspath(p)) != key]
         recent.insert(0, path)
         limit = max(0, prefs.value(self.settings, "recent/limit"))
         self.settings.setValue("recent", recent[:limit])
-        self._rebuild_recent_menu()
+        # 一覧は設定に 1 つ。ほかのウィンドウのメニューとウェルカム画面も作り直す
+        for w in [self] + [x for x in all_windows() if x is not self]:
+            w._rebuild_recent_menu()
 
     def _rebuild_recent_menu(self) -> None:
         self.recent_menu.clear()
@@ -2907,6 +2969,11 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self._apply_annot_defaults()
         self._setup_autosave()
         from . import form_history
+        # 入力の候補は v1.12.0 から既定オフ。以前の版で（既定のまま、または設定画面で
+        # 保存して）オンになっている人も、一度だけオフに戻す（使う人は設定でオンにする）
+        if not self.settings.value("migrate/form_history_off_v1", False, bool):
+            self.settings.setValue("form/autocomplete", False)
+            self.settings.setValue("migrate/form_history_off_v1", True)
         form_history.set_enabled(prefs.value(self.settings, "form/autocomplete"))
         # 匿名レポート送信トグル: 送信先URL未設定なら意味がないので隠す。
         # 設定済みなら現在の同意状態を反映する。
@@ -2940,6 +3007,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
                 break
         if active:
             self.settings.setValue("left_dock_active", active)
+        # 見開きボタンは「これから開くタブの既定」も兼ねる（新しいタブはボタンに従う）。
+        # 設定ダイアログにも今の状態を見せるため、ここで書く
         self.settings.setValue("view/facing_default", self.act_facing.isChecked())
         if hasattr(self, "ribbon"):
             self.settings.setValue("ribbon_collapsed", self.ribbon.is_collapsed())
@@ -3049,7 +3118,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         try:
             self.doc.add_page_numbers(pos_map[pos_label], fmt, start=start)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"追加できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"追加できませんでした:\n{user_error(exc)}")
             return
         self.page_view.reload(self.page_view.index)
         self.thumbnails.load(self.doc)
@@ -3199,7 +3268,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             for path in paths:  # 選んだ順に末尾へ追加
                 total += self.doc.insert_pdf(path)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"統合できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"統合できませんでした:\n{user_error(exc)}")
             if not total:
                 return
         self._reload(self.doc.page_count - 1)
@@ -3230,7 +3299,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
                 pos += n
                 total += n
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"挿入できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"挿入できませんでした:\n{user_error(exc)}")
             if not total:
                 return
         self._reload(at)
@@ -3268,7 +3337,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         try:
             self.doc.extract_to(indices, out)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"抽出できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"抽出できませんでした:\n{user_error(exc)}")
             return
         self.statusBar().showMessage(
             f"{len(indices)} ページを抽出しました: {out}", 4000
@@ -3292,7 +3361,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         try:
             outputs = self.doc.split_every(n, out_dir, stem)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"分割できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"分割できませんでした:\n{user_error(exc)}")
             return
         QMessageBox.information(
             self, "分割完了", f"{len(outputs)} 個のファイルを出力しました。\n{out_dir}"
@@ -3360,7 +3429,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             self._backup_if_enabled(path)
             self.doc.save_as(path)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "エラー", f"保存できませんでした:\n{exc}")
+            QMessageBox.critical(self, "エラー", f"保存できませんでした:\n{user_error(exc)}")
             return
         self.doc.path = path
         tab = self._active_tab()
@@ -3491,6 +3560,13 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
     def _on_commit_data(self, _manager=None) -> None:
         """OS がシャットダウン／ログオフを始めた（closeEvent より先に呼ばれる）。"""
         self._session_ending = True
+        # シャットダウンが取りやめられると、この旗が立ったままになり、そのあとは
+        # ×でトレイに隠れずにアプリが終わっていた。まだ動いていれば取りやめられた
+        # ので、しばらくしたら戻す（本当に終わるならその前にプロセスが終わる）
+        QTimer.singleShot(90_000, self._end_session_cancelled)
+
+    def _end_session_cancelled(self) -> None:
+        self._session_ending = False
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         forced = self._force_quit or self._session_ending

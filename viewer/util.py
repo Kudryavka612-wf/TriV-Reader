@@ -87,3 +87,21 @@ def exists_fast(path: str) -> bool:
     except Exception:  # noqa: BLE001
         pass
     return os.path.exists(path)
+
+
+def user_error(exc: Exception, saving: bool = True) -> str:
+    """例外を、画面に出せる日本語にする（friendly_error の上に、分からないものの受け皿を足す）。
+
+    friendly_error は知らない例外をそのまま返すので、PyMuPDF の英語や、一時ファイル名
+    （'.tmp_save' など）まで入った文言がそのまま出ていた。日本語を含まない文言は、
+    対処の分かる日本語の案内に置き換える。
+    """
+    from .document import friendly_error
+
+    msg = friendly_error(exc, saving=saving)
+    if msg and any(ord(ch) >= 0x3000 for ch in msg):
+        return msg   # 日本語になっている
+    if saving:
+        return ("処理できませんでした。ファイルをほかのアプリで開いていないか、"
+                "保存先に書き込めるかを確かめてください。")
+    return "処理できませんでした。PDF が壊れているか、この種類の PDF には使えない可能性があります。"

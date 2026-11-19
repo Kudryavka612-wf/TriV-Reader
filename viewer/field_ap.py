@@ -92,12 +92,92 @@ def _rotation(widget) -> int:
         return 0
 
 
+def color_op(color) -> str:
+    """文字色の命令。成分の数で色空間を決める（1=グレー g・3=RGB rg・4=CMYK k）。
+
+    以前は何でも RGB として先頭 3 つを使っていたため、グレー（0.5 g）は
+    「0.5 0 0」＝暗い赤に、CMYK の黒（0 0 0 1 k）は「0 0 0」になっていた。
+    CMYK は RGB に直さずそのまま k で書く（印刷で K 1 色の黒のまま刷れる）。
+    """
+    try:
+        comps = [max(0.0, min(1.0, float(c))) for c in (color or ())]
+    except (TypeError, ValueError):
+        comps = []
+    if len(comps) == 1:
+        return f"{comps[0]:.3f} g"
+    if len(comps) == 4:
+        return " ".join(f"{c:.3f}" for c in comps) + " k"
+    rgb = (comps + [0.0, 0.0, 0.0])[:3]
+    return " ".join(f"{c:.3f}" for c in rgb) + " rg"
+
+
+_DA_COLOR_RE = re.compile(
+    r"((?:[-+]?(?:\d+\.?\d*|\.\d+)\s+){1,4})(g|rg|k)(?![A-Za-z])")
+
+
+def da_color(da: str):
+    """/DA の文字列から文字色を取り出す（最後の g / rg / k）。無ければ None。
+
+    PyMuPDF の text_color は g と rg しか読まず、k（CMYK）の欄は黒扱いになる。
+    """
+    found = None
+    for m in _DA_COLOR_RE.finditer(da or ""):
+        nums = m.group(1).split()
+        need = {"g": 1, "rg": 3, "k": 4}[m.group(2)]
+        if len(nums) >= need:
+            try:
+                found = tuple(float(n) for n in nums[-need:])
+            except ValueError:
+                continue
+    return found
+
+
+def _widget_color(widget):
+    """欄の文字色。/DA は欄 → 親 → 文書（AcroForm）の順に引き継がれる。"""
+    doc = widget.parent.parent
+    xref = widget.xref
+    try:
+        for _ in range(8):
+            da = doc.xref_get_key(xref, "DA")
+            if da[0] == "string":
+                col = da_color(da[1])
+                if col is not None:
+                    return col
+                break
+            parent = doc.xref_get_key(xref, "Parent")
+            if parent[0] != "xref":
+                da = doc.xref_get_key(doc.pdf_catalog(), "AcroForm/DA")
+                if da[0] == "string":
+                    col = da_color(da[1])
+                    if col is not None:
+                        return col
+                break
+            xref = int(parent[1].split()[0])
+    except Exception:  # noqa: BLE001  読めなければ PyMuPDF の解釈に任せる
+        pass
+    return widget.text_color or (0, 0, 0)
+
+
+def display_text(widget, value: str) -> str:
+    """選択欄（コンボ・リスト）は、値（/V＝エクスポート値）を表示名に直す。
+
+    Acrobat は /V に選択肢のエクスポート値（例 "01"）を書き、画面と印刷には
+    表示名（例「北海道」）を出す。どの選択肢にも当たらない値（自由入力）はそのまま。
+    """
+    if widget.field_type not in (fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX):
+        return value
+    for c in (getattr(widget, "choice_values", None) or []):
+        if isinstance(c, (list, tuple)) and c and str(c[0]) == value:
+            return str(c[1] if len(c) > 1 else c[0])
+    return value
+
+
 def build(value: str, w: float, h: float, fontsize: float, *, comb: int = 0,
           multiline: bool = False, align: int = 0, color=(0, 0, 0)) -> tuple[str, float]:
     """欄の外観の描画命令（PDF の内容ストリーム）と、実際に使った文字サイズ。"""
     ops: list[str] = []
     avail_w = max(1.0, w - 2 * PAD)
-    rgb = " ".join(f"{max(0.0, min(1.0, float(c))):.3f}" for c in (list(color) + [0, 0, 0])[:3])
+    rgb = color_op(color)
 
     if comb:
         cell = w / comb
@@ -141,7 +221,7 @@ def build(value: str, w: float, h: float, fontsize: float, *, comb: int = 0,
 
     body = "\n".join(ops)
     content = (f"/Tx BMC\nq\n1 1 {w - 2:.3f} {h - 2:.3f} re W n\nBT\n/FJ {fs:.2f} Tf\n"
-               f"{rgb} rg\n{body}\nET\nQ\nEMC\n")
+               f"{rgb}\n{body}\nET\nQ\nEMC\n")
     return content, fs
 
 
@@ -170,8 +250,8 @@ def write(widget, serif: bool | None = None) -> bool:
     value = widget.field_value
     if isinstance(value, (list, tuple)):
         value = value[0] if value else ""
-    value = "" if value is None else str(value)
-    color = widget.text_color or (0, 0, 0)
+    value = display_text(widget, "" if value is None else str(value))
+    color = _widget_color(widget)
     if serif is None:
         serif = jpfonts.is_mincho(widget.text_font or "")
     content, _fs = build(value, w, h, float(widget.text_fontsize or 0), comb=comb,

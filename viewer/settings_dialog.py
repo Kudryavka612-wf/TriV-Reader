@@ -75,7 +75,9 @@ DEFAULTS: dict[str, object] = {
     # --- 詳細 ---
     "ocr/lang": "jpn+eng",
     # --- フォーム ---
-    "form/autocomplete": True,         # 以前に入れた内容を候補に出す
+    # 以前に入れた内容を候補に出す。既定はオフ（氏名・住所などを平文で残し、別の
+    # 顧問先の書類にも候補に出るため。使う人だけが設定でオンにする）
+    "form/autocomplete": False,
 }
 
 # マウスジェスチャーに割り当てられる操作（設定値 → 表示名）。
@@ -273,7 +275,9 @@ class SettingsDialog(QDialog):
         form.addRow("テーマ", self.cmb_theme)
         form.addRow("開いた時の表示倍率", self.cmb_zoom)
         form.addRow("ページの並べ方", self.cb_facing)
-        form.addRow("ツールバー", self.cb_compact)
+        # 「コンパクト表示」は旧ツールバー（リボンに置き換えて隠してある）にしか効かず、
+        # 切り替えても見た目が変わらなかった。効かない設定は出さない（値の読み書きは残す）
+        self.cb_compact.setVisible(False)
 
         box = QGroupBox("起動時に表示するパネル")
         v = QVBoxLayout(box)
@@ -494,7 +498,15 @@ class SettingsDialog(QDialog):
 
     def apply(self) -> None:
         self._store()
-        self.window.apply_preferences(annot_changed=self.annot_changed)
+        self._apply_to_windows(annot_changed=self.annot_changed)
+
+    def _apply_to_windows(self, annot_changed: bool = True) -> None:
+        # 設定はアプリ全体で 1 つ。開いているウィンドウすべてに効かせる
+        fn = getattr(self.window, "apply_preferences_everywhere", None)
+        if fn is None:
+            self.window.apply_preferences(annot_changed=annot_changed)
+        else:
+            fn(annot_changed=annot_changed)
 
     def _on_ok(self) -> None:
         self.apply()
@@ -504,12 +516,15 @@ class SettingsDialog(QDialog):
         if QMessageBox.question(
             self, "初期値に戻す",
             "設定を初期値に戻します。よろしいですか？\n"
-            "（最近使ったファイルやウィンドウ位置は消えません）",
+            "（最近使ったファイルやウィンドウ位置は消えません。この操作は［キャンセル］"
+            "では戻りません）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
             return
         reset_to_defaults(self.settings)
         self._load()
-        self.window.apply_preferences()
+        self._apply_to_windows()
 
     def _sync_gesture_rows(self, on: bool) -> None:
         """ジェスチャーを使わない設定なら、割り当ての選択も触れなくする。"""
