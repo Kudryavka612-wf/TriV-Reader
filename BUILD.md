@@ -131,7 +131,7 @@ python sign_release.py --pfx C:\path\to\cert.pfx "$env:USERPROFILE\TriVReader_re
 
 ## 1.10 自動アップデート（アプリ内で更新→再起動）
 
-アプリの「ヘルプ > 更新を確認」から、新しいビルドをダウンロードして
+アプリの「設定」タブの「更新を確認」（または画面上端の更新の帯）から、新しいビルドをダウンロードして
 入れ替え・再起動できます（onedir 配布・Windows 向け）。
 
 ### 初回設定（1回だけ）
@@ -165,7 +165,7 @@ GitHub Actions で公開する場合、**注釈付きタグのメッセージが
    `python tools\sign_update.py "$env:USERPROFILE\TriVReader_release\update.json" --key-file <秘密鍵のファイル>`
    （`update.json.sig` ができる。下の「更新の署名」）。
 5. GitHub で **タグ `v<版>`（例 v1.1.0）のリリースを作成**し、zip・`update.json`・`update.json.sig` を添付。
-6. 完了。利用者は「ヘルプ > 更新を確認」で DL→検証→入替→再起動まで自動。
+6. 完了。利用者は「設定」タブの「更新を確認」（または画面上端の更新の帯）で DL→検証→入替→再起動まで自動。
 
 ### 更新の署名（update.json.sig）
 update.json と zip は同じリリースから来るので、sha256 を載せるだけでは、リリースを

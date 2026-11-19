@@ -12,9 +12,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QFileDialog,
+    QFrame,
+    QHBoxLayout,
     QInputDialog,
+    QLabel,
     QMessageBox,
     QProgressDialog,
+    QPushButton,
 )
 
 from . import settings_dialog as prefs
@@ -23,6 +27,42 @@ from .version import APP_VERSION, TELEMETRY_URL
 
 class _Cancelled(Exception):
     """待ち画面でキャンセルされた。"""
+
+
+class UpdateBar(QFrame):
+    """「新しいバージョン X があります［今すぐ更新］［あとで］」を画面の上端に出す帯。
+
+    見た目は「前回の続き」の案内（#resumeBar）と揃える。ふだんは隠れている。
+    """
+
+    def __init__(self, on_update, on_later, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("resumeBar")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 6, 8, 6)
+        lay.setSpacing(8)
+        self.text = QLabel()
+        self.text.setObjectName("resumeText")
+        # 狭いウィンドウでは折り返す（1 行のままだと、帯の文の長さでウィンドウが
+        # それ以上縮められなくなる）
+        self.text.setWordWrap(True)
+        self.btn_update = QPushButton("今すぐ更新")
+        self.btn_update.setObjectName("primary")
+        self.btn_later = QPushButton("あとで")
+        for b in (self.btn_update, self.btn_later):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_update.clicked.connect(on_update)
+        self.btn_later.clicked.connect(on_later)
+        lay.addWidget(self.text, 1)
+        lay.addWidget(self.btn_update)
+        lay.addWidget(self.btn_later)
+        self.hide()
+
+    def show_version(self, version: str) -> None:
+        self.text.setText(f"新しいバージョン {version} があります")
+        self.setToolTip("更新すると、アプリが一度閉じて開き直します"
+                        "（保存していない変更は先に聞きます）")
+        self.show()
 
 
 # 報告の見出しのうち、PDF の名前・場所を書く行（document.write_govform_diagnostic）
@@ -74,7 +114,7 @@ class UpdateMixin:
         if names:
             self.statusBar().showMessage(
                 f"このフォームには未対応の入力補助が {len(names)} 件あります。"
-                "［リボン「表示」→ ヘルプ →「フォーム報告」］で書き出せます。", 8000)
+                "［リボン「設定」→ 困ったとき →「フォーム報告」］で書き出せます。", 8000)
             self._maybe_send_govform_telemetry(doc)
 
     def _telemetry_url(self) -> str:
@@ -219,51 +259,121 @@ class UpdateMixin:
             f.write(text)
         return written
 
+    # 常駐中に更新を確かめる間隔。トレイに常駐して何日も起動し直さない PC が多く、
+    # 起動時の 1 回だけでは新しい版に気づけなかった
+    UPDATE_POLL_MS = 4 * 60 * 60 * 1000
+
     def check_update_on_startup(self) -> None:
-        """設定が有効なら、起動直後に静かに更新を確認する。"""
-        if prefs.value(self.settings, "startup/check_update"):
-            QTimer.singleShot(3000, self._silent_update_check)
+        """設定が有効なら、起動の直後と、常駐している間は数時間おきに更新を確かめる。
+
+        確かめるのは最初のウィンドウだけ（外へ出したウィンドウは更新を受け持たない）。
+        設定をあとで切り替えても効くよう、タイマーは止めずに毎回設定を見る。
+        """
+        if getattr(self, "_secondary", False):
+            return
+        QTimer.singleShot(3000, self._silent_update_check)
+        if getattr(self, "_update_poll_timer", None) is None:
+            self._update_poll_timer = QTimer(self)
+            self._update_poll_timer.setInterval(self.UPDATE_POLL_MS)
+            self._update_poll_timer.timeout.connect(self._silent_update_check)
+            self._update_poll_timer.start()
 
     def _silent_update_check(self) -> None:
-        """更新があるときだけステータスバーで知らせる（無ければ黙る）。
+        """更新があるときだけ知らせる（無い・つながらないときは黙る）。
 
-        通信でUIを止めないようワーカースレッドで確認し、結果だけ後から拾う。
+        通信で画面を止めないよう別スレッドで確かめ、結果だけ後から拾う。
         """
         import threading
 
         from . import updater
 
+        if not prefs.value(self.settings, "startup/check_update"):
+            return
         if not updater.is_frozen():
             return
+        if getattr(self, "_update_checking", False):
+            return   # 前の確認がまだ終わっていない
         url = updater.manifest_url(self.settings)
         if not url:
             return
+        box: dict = {}
 
         def _worker() -> None:
             try:
-                self._pending_update = updater.check(url, timeout=8)
+                box["info"] = updater.check(url, timeout=8)
             except updater.UpdateRejected:
-                self._pending_update = None
-                self._update_rejected = True   # 署名を確かめられない更新は勧めない
+                box["rejected"] = True   # 署名を確かめられない更新は勧めない
             except Exception:  # noqa: BLE001
-                self._pending_update = None  # ネットワーク不通で起動を邪魔しない
+                pass   # ネットワーク不通などで作業を邪魔しない
+            finally:
+                box["done"] = True
 
-        self._pending_update = None
-        self._update_rejected = False
+        self._update_checking = True
         threading.Thread(target=_worker, daemon=True).start()
-        QTimer.singleShot(9000, self._notify_pending_update)
+        self._await_update_check(box, tries=0)
 
-    def _notify_pending_update(self) -> None:
+    def _await_update_check(self, box: dict, tries: int) -> None:
+        """別スレッドの確認が終わるのを待って知らせる（最長およそ 30 秒）。"""
+        if not box.get("done") and tries < 30:
+            QTimer.singleShot(1000, lambda: self._await_update_check(box, tries + 1))
+            return
+        self._update_checking = False
+        self._notify_pending_update(box.get("info"), box.get("rejected", False))
+
+    def _notify_pending_update(self, info, rejected: bool = False) -> None:
+        """新しい版があれば、画面上部の帯とトレイの吹き出しで知らせる。
+
+        入れるのは利用者が［今すぐ更新］を押したときだけ（作業中に勝手に閉じない）。
+        ［あとで］を押した版は、アプリを起動し直すまでは知らせない。
+        """
         from . import updater
 
-        info = getattr(self, "_pending_update", None)
-        if getattr(self, "_update_rejected", False):
+        if rejected:
             self.statusBar().showMessage(updater.REJECT_MESSAGE, 15000)
             return
-        if info:
-            self.statusBar().showMessage(
-                f"新しいバージョン {info.get('version', '')} があります"
-                "（リボン「表示」→ ヘルプ →「更新を確認」から更新できます）", 15000)
+        if not info or not info.get("version"):
+            return
+        version = str(info["version"])
+        self._pending_update = info
+        if version in getattr(self, "_update_dismissed", set()):
+            return
+        bar = getattr(self, "update_bar", None)
+        if bar is not None:
+            bar.show_version(version)
+        # 吹き出しは同じ版で 1 回だけ（数時間おきの確認のたびに出さない）。
+        # ウィンドウが見えているときは帯で足りるので、隠れているときだけ出す
+        if getattr(self, "_update_balloon_version", None) != version:
+            tray = getattr(self, "tray", None)
+            hidden = not self.isVisible() or self.isMinimized()
+            if tray is not None and hidden:
+                tray.showMessage(
+                    "TriV-Reader の更新",
+                    f"新しいバージョン {version} があります。ここを押すと更新できます。",
+                    self.windowIcon(), 15000)
+                self._update_balloon_version = version
+
+    def _update_now_from_notice(self) -> None:
+        """帯・吹き出しの［今すぐ更新］。いつもの「更新を確認」と同じ流れで入れる。"""
+        bar = getattr(self, "update_bar", None)
+        if bar is not None:
+            bar.hide()
+        self.check_for_update()
+
+    def _dismiss_update_notice(self) -> None:
+        info = getattr(self, "_pending_update", None) or {}
+        if info.get("version"):
+            if not hasattr(self, "_update_dismissed"):
+                self._update_dismissed = set()
+            self._update_dismissed.add(str(info["version"]))
+        bar = getattr(self, "update_bar", None)
+        if bar is not None:
+            bar.hide()
+
+    def _on_tray_message_clicked(self) -> None:
+        """トレイの吹き出しを押した: ウィンドウを出して、更新の流れへ。"""
+        self._show_from_tray()
+        if getattr(self, "_pending_update", None):
+            self._update_now_from_notice()
 
     # --- 更新 / バージョン情報 ----------------------------------------
     def show_about(self) -> None:
@@ -350,7 +460,7 @@ class UpdateMixin:
             QMessageBox.information(
                 self, "更新元が未設定",
                 "更新元URLが設定されていません。\n"
-                "［リボン「表示」→ ヘルプ →「更新元URL」］で update.json のURLを設定してください。",
+                "［リボン「設定」→ 設定… →「更新」タブの「更新の確認先 URL」］で update.json のURLを設定してください。",
             )
             return
         try:

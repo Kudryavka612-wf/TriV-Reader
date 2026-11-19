@@ -35,6 +35,8 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QSystemTrayIcon,
     QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
 from . import ocr, page_view, settings_dialog as prefs, storage, theme
@@ -213,7 +215,20 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         self.center.addWidget(self.welcome)  # 0
         self.center.addWidget(self.tabs)     # 1
         self.center.setCurrentWidget(self.welcome)
-        self.setCentralWidget(self.center)
+        # 上端に「新しいバージョンがあります」の帯（ふだんは隠れている）。
+        # 更新を受け持つのは最初のウィンドウだけなので、外のウィンドウには作らない
+        body = QWidget()
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(0)
+        self.update_bar = None
+        if not secondary:
+            from .mw_update import UpdateBar
+            self.update_bar = UpdateBar(self._update_now_from_notice,
+                                        self._dismiss_update_notice)
+            body_lay.addWidget(self.update_bar)
+        body_lay.addWidget(self.center, 1)
+        self.setCentralWidget(body)
 
         self.thumbnails = ThumbnailList()
         dock = QDockWidget("ページ", self)
@@ -915,7 +930,7 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         p = r.add_page("ホーム")
         g = r.add_group(p, "ファイル")
         g.add_action(self.act_open, big=True)
-        # 「設定」「既定に設定」は 表示 > ヘルプ にもあるので、ホームからは外して
+        # 「設定」「既定に設定」は 設定タブ にもあるので、ホームからは外して
         # 幅を節約する（既定ウィンドウ幅 1180px にホームが収まるように）。
         g.add_stack([self.act_save, self.act_save_as, self.act_print,
                      self.act_open_acrobat])
@@ -1043,11 +1058,23 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         g.add_stack([self.act_toggle_pagedock, toc_toggle, annot_toggle])
         g = r.add_group(p, "しおり")
         g.add_stack([self.act_add_bookmark, self.act_edit_toc])
-        g = r.add_group(p, "ヘルプ")
-        g.add_stack([self.act_shortcuts, self.act_settings,
-                     self.act_set_default_pdf, self.act_check_update,
-                     self.act_set_update_url, self.act_report_govform,
-                     self.act_open_log, self.act_folder_users, self.act_about])
+        r.end_page(p)
+
+        # ── 設定 ────────────────────────────────────────────────
+        # 以前は「表示」タブの「ヘルプ」に設定・更新・ログまで 9 つ詰めていて、
+        # ページの見え方と関係が無く探しにくかった。アプリそのものの操作はここへ集める。
+        # 「更新元URL」は管理者向けなので、リボンには出さず設定画面の中だけにする
+        p = r.add_page("設定")
+        g = r.add_group(p, "設定")
+        g.add_action(self.act_settings, big=True)
+        g.add_stack([self.act_set_default_pdf])
+        g = r.add_group(p, "更新")
+        g.add_action(self.act_check_update, big=True)
+        g = r.add_group(p, "困ったとき")
+        g.add_stack([self.act_shortcuts, self.act_open_log,
+                     self.act_folder_users, self.act_report_govform])
+        g = r.add_group(p, "情報")
+        g.add_action(self.act_about, big=True)
         r.end_page(p)
 
         # リボンを最上部に据え、従来のメニューバー/ツールバーは隠す
@@ -1794,6 +1821,8 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
         act_quit.triggered.connect(self._quit_app)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._on_tray_activated)
+        # 吹き出しは更新の知らせにだけ使う（押したら更新の流れへ）
+        self.tray.messageClicked.connect(self._on_tray_message_clicked)
         self.tray.show()
 
     def _tray_resident_enabled(self) -> bool:
@@ -2975,6 +3004,11 @@ class MainWindow(PrintMixin, ConvertMixin, UpdateMixin, ToolsMixin, QMainWindow)
             self.settings.setValue("form/autocomplete", False)
             self.settings.setValue("migrate/form_history_off_v1", True)
         form_history.set_enabled(prefs.value(self.settings, "form/autocomplete"))
+        # 更新の知らせは v1.12.1 から既定オン。以前の版で設定画面を OK しただけの人は
+        # 「オフ」が保存されているので、一度だけオンに戻す（要らない人は設定で切る）
+        if not self.settings.value("migrate/update_check_on_v1", False, bool):
+            self.settings.setValue("startup/check_update", True)
+            self.settings.setValue("migrate/update_check_on_v1", True)
         # 匿名レポート送信トグル: 送信先URL未設定なら意味がないので隠す。
         # 設定済みなら現在の同意状態を反映する。
         from . import telemetry

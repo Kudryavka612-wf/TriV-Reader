@@ -125,6 +125,14 @@ try:
     _SERVER_NAME = f"TriVReader-SingleInstance-{getpass.getuser()}"
 except Exception:  # noqa: BLE001
     _SERVER_NAME = "TriVReader-SingleInstance"
+# 設定を差し替えて動かすとき（テストの throwaway など）は、別の受け口を使う。
+# 同じ名前だと、テストで起動したアプリが PDF を利用者の本物のアプリへ渡したり、
+# 受け口を取り上げて本物のアプリの「2 つ目の起動を 1 つにまとめる」を壊したりした
+# （テスト中に本物の TriV-Reader が起動していて、テストが落ちた）
+if os.environ.get("TRIVREADER_SETTINGS_INI"):
+    import hashlib
+    _SERVER_NAME += "-isolated-" + hashlib.sha1(
+        os.environ["TRIVREADER_SETTINGS_INI"].encode("utf-8")).hexdigest()[:10]
 
 
 def _install_japanese(app: QApplication) -> list:

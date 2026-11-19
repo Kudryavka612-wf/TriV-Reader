@@ -10,7 +10,7 @@
     2) python release.py --notes "更新内容"
        （ポータブル版なら  python release.py --portable --notes "..."）
 
-これだけで GitHub にリリースが作成され、利用者の「ヘルプ > 更新を確認」で
+これだけで GitHub にリリースが作成され、利用者の「設定」タブの「更新を確認」（または画面上端の更新の帯）で
 自動更新されます。
 """
 from __future__ import annotations
@@ -92,7 +92,7 @@ def main() -> int:
             check=True,
         )
     print(f"\n=== 完了 === https://github.com/{repo}/releases/tag/{tag}")
-    print("利用者は「ヘルプ > 更新を確認」で自動更新されます。")
+    print("利用者は「設定」タブの「更新を確認」（または画面上端の更新の帯）で自動更新されます。")
     return 0
 
 

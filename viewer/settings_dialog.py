@@ -70,7 +70,7 @@ DEFAULTS: dict[str, object] = {
     "save/backup": False,              # 上書き前に .bak を残す
     "save/autosave_min": 0,            # 0 = 自動保存しない
     # --- 更新 ---
-    "startup/check_update": False,     # 起動時に更新を確認
+    "startup/check_update": True,      # 起動時と常駐中に更新を確認（v1.12.1 から既定オン）
     "update_url": "",
     # --- 詳細 ---
     "ocr/lang": "jpn+eng",
@@ -368,7 +368,7 @@ class SettingsDialog(QDialog):
     def _build_update(self) -> QWidget:
         w = QWidget()
         form = QFormLayout(w)
-        self.cb_check_update = QCheckBox("起動時に更新を確認する")
+        self.cb_check_update = QCheckBox("新しい版があれば知らせる（起動時と、常駐中は 4 時間おきに確かめる）")
         self.ed_update_url = QLineEdit()
         self.ed_update_url.setPlaceholderText(
             "空欄なら既定の配布元（GitHub Releases）を使います")

@@ -154,7 +154,17 @@ def test_sign_update(secret: str, pub: str) -> None:
     if have_cryptography():
         # 本物（CI と同じ）: 環境変数の秘密鍵で、コマンドとして
         write_manifest(manifest)
-        r = run_tool("sign_update.py", manifest, env={"UPDATE_SIGNING_KEY": secret})
+        # 別のプロセスで動かすので、上で差し替えた公開鍵は届かない（version.py には
+        # 本物の公開鍵が入っている）。道具に抜け道は作らず、同じ main() を、試しの
+        # 公開鍵に差し替えてから呼ぶ
+        wrapper = (
+            "import sys; sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[1] + '/tools');"
+            "from viewer import version as v; v.UPDATE_PUBLIC_KEY = sys.argv[2];"
+            "import sign_update; raise SystemExit(sign_update.main([sys.argv[3]]))")
+        r = subprocess.run([sys.executable, "-c", wrapper, ROOT, pub, manifest],
+                           capture_output=True, text=True, encoding="utf-8", timeout=120,
+                           env=dict(os.environ, PYTHONIOENCODING="utf-8",
+                                    UPDATE_SIGNING_KEY=secret))
         ok = r.returncode == 0 and os.path.exists(sig_path)
         sig = base64.b64decode(open(sig_path, "rb").read().strip()) if ok else b""
         check("[cryptography] the command signs with the key from UPDATE_SIGNING_KEY",

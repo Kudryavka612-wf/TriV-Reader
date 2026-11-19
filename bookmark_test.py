@@ -32,7 +32,7 @@ def check(name: str, ok, extra: str = "") -> None:
 
 
 def main() -> int:
-    app = QApplication(sys.argv)   # noqa: F841
+    app = QApplication(sys.argv)
     d = fitz.open()
     for i in range(4):
         d.new_page(width=400, height=600).insert_text((72, 100), f"p{i + 1}", fontsize=20)
@@ -78,6 +78,11 @@ def main() -> int:
         err = str(exc)
     check("jumping from level 1 straight to 3 is rejected with a clear message",
           "3 行目" in err and "レベル" in err, err)
+    # 画面部品は QApplication より先に片づける（片づけずに終えると、Python の終了処理の
+    # 順番しだいで、全部の検査が通ったあとにアクセス違反で落ちることがあった）
+    for widget in (dlg, dock):
+        widget.deleteLater()
+    app.processEvents()
     n = sum(results)
     print(f"\n==== {n}/{len(results)} checks passed ====")
     return 0 if n == len(results) else 1
