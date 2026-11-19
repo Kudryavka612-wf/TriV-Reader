@@ -137,7 +137,8 @@ def test_preview_is_vector(w: MainWindow) -> None:
     """印刷プレビューも本番と同じベクター描画で、中身が出ている。"""
     from viewer.print_dialog import PrintDialog
 
-    dlg = PrintDialog(w.doc, 0, w.settings)
+    # 本番（mw_print.py）と同じくウィンドウを親にする
+    dlg = PrintDialog(w.doc, 0, w.settings, w)
     pm = dlg._preview_pixmap(0, 0.5)
     check(not pm.isNull() and pm.width() > 100,
           f"プレビューが描ける（{pm.width()}x{pm.height()}）")
@@ -146,6 +147,10 @@ def test_preview_is_vector(w: MainWindow) -> None:
                 for x in range(0, img.width(), 5)
                 if img.pixelColor(x, y).value() < 250)
     check(inked > 20, f"白紙になっていない（描画された点 {inked}）")
+    # 閉じずに終えると、終了時にときどき落ちる（0xC0000005 / 0xC0000409。
+    # 全件合格でも終了コードが失敗になり、v1.10.0・v1.10.1 のリリースが止まった）。
+    # 本番の印刷は必ず閉じてから終わるので、ほかのテストと同じく閉じる。
+    dlg.reject()
 
     svg = w.doc.page_svg(0)
     check(svg.lstrip().startswith("<?xml") or "<svg" in svg[:200],
