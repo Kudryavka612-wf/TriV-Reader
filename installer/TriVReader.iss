@@ -88,7 +88,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "デスクトップにショートカットを作成する"; GroupDescription: "ショートカット:"
-Name: "associate"; Description: ".pdf ファイルを TriV-Reader に関連付ける"; GroupDescription: "ファイルの関連付け:"
+; 関連付けは既定で外す（事務所ではふだん Adobe で開き、加工のときだけ「プログラムから開く」で
+; TriV-Reader を選ぶ運用。付けたまま入れると PDF が Adobe で開かなくなったため）。
+Name: "associate"; Description: ".pdf ファイルを TriV-Reader に関連付ける"; GroupDescription: "ファイルの関連付け:"; Flags: unchecked
 
 [Files]
 ; onedir ビルド一式をインストール先へコピー
